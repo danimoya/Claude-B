@@ -1,0 +1,53 @@
+{
+  "name": "claude-b",
+  "version": "0.1.0",
+  "description": "Background-capable Claude Code with async workflows and REST API",
+  "type": "module",
+  "main": "dist/cli/index.js",
+  "bin": {
+    "cb": "./bin/cb"
+  },
+  "scripts": {
+    "dev": "tsup src/cli/index.ts src/daemon/index.ts --watch --format esm",
+    "build": "tsup src/cli/index.ts src/daemon/index.ts --format esm --dts --clean",
+    "test": "vitest",
+    "lint": "eslint src/",
+    "typecheck": "tsc --noEmit",
+    "start:daemon": "node dist/daemon/index.js"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.0",
+    "@fastify/jwt": "^9.0.0",
+    "@fastify/rate-limit": "^10.0.0",
+    "@fastify/websocket": "^11.0.0",
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "fastify": "^5.0.0",
+    "nanoid": "^5.0.7",
+    "node-pty": "^1.0.0",
+    "ora": "^8.1.0",
+    "strip-ansi": "^7.1.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.18.1",
+    "tsup": "^8.3.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "keywords": [
+    "claude",
+    "ai",
+    "cli",
+    "background",
+    "async",
+    "anthropic",
+    "claude-code"
+  ],
+  "author": "",
+  "license": "MIT"
+}
