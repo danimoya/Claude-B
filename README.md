@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/Claude-B.png" alt="Claude-B Logo" width="400">
+</p>
+
 # Claude-B
 
 > Run Claude Code in the background. Send prompts, do other work, check results later.
@@ -7,6 +11,8 @@ Claude-B is a background-capable wrapper around [Claude Code](https://claude.ai/
 - **Async workflows** - Send prompts, continue working, check results when ready
 - **Session management** - Multiple concurrent AI sessions
 - **Foreground attach** - Like `fg` in Linux, attach to see live output
+- **Auto-watch streaming** - Automatically streams output after sending prompts
+- **Status feedback** - Real-time processing/completed/error status messages
 - **REST API** - Control sessions from other machines (planned)
 - **Hooks** - Notifications and multi-host AI orchestration (planned)
 
@@ -196,6 +202,8 @@ pnpm test
 - [x] Session management
 - [x] Attach/detach (fg-style)
 - [x] Live output streaming
+- [x] Auto-watch with status feedback
+- [x] Async prompt processing
 - [ ] REST API for remote access
 - [ ] JWT authentication
 - [ ] Hooks and webhooks
