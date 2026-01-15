@@ -48,8 +48,10 @@ export class Session extends EventEmitter {
   private promptCount: number = 0;
   private attachedSockets: Set<Socket> = new Set();
   private watchingSockets: Set<Socket> = new Set();
-  private promptQueue: Array<{ prompt: string; resolve: (id: string) => void; reject: (err: Error) => void }> = [];
+  private promptQueue: Array<{ prompt: string; promptId: string }> = [];
   private isProcessing = false;
+  private isReady = false;
+  private readyResolvers: Array<() => void> = [];
 
   constructor(state: SessionState, configDir: string) {
     super();
@@ -98,6 +100,24 @@ export class Session extends EventEmitter {
     await appendFile(historyPath, JSON.stringify(entry) + '\n');
   }
 
+  private waitForReady(): Promise<void> {
+    if (this.isReady) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      this.readyResolvers.push(resolve);
+    });
+  }
+
+  private markReady(): void {
+    if (this.isReady) return;
+    this.isReady = true;
+    for (const resolver of this.readyResolvers) {
+      resolver();
+    }
+    this.readyResolvers = [];
+  }
+
   private async startClaudeProcess(): Promise<void> {
     if (this.process) {
       return; // Already running
@@ -107,7 +127,7 @@ export class Session extends EventEmitter {
 
     // Try to use PTY for full interactive support
     if (pty) {
-      this.process = pty.spawn('claude', [], {
+      this.process = pty.spawn('claude', ['--dangerously-skip-permissions'], {
         name: 'xterm-256color',
         cols: 120,
         rows: 40,
@@ -154,6 +174,12 @@ export class Session extends EventEmitter {
     this.outputBuffer.push(data);
     this.currentPromptOutput.push(data);
     this.broadcastOutput(data);
+
+    // Check if Claude Code is ready (showing the input prompt "❯")
+    // This indicates the startup is complete and it's ready for input
+    if (!this.isReady && data.includes('❯')) {
+      this.markReady();
+    }
 
     // Check for completion markers (Claude's response ended)
     // This is heuristic - we look for common patterns indicating the AI finished
@@ -215,6 +241,7 @@ export class Session extends EventEmitter {
 
   private handleProcessExit(code: number | null): void {
     this.process = null;
+    this.isReady = false; // Reset ready state for next process
 
     if (this.isProcessing) {
       this.status = 'idle';
@@ -236,18 +263,27 @@ export class Session extends EventEmitter {
     this.process = null;
     this.isProcessing = false;
 
-    // Reject any queued prompts
+    // Emit errors for any queued prompts and clear the queue
     while (this.promptQueue.length > 0) {
       const queued = this.promptQueue.shift();
-      queued?.reject(error);
+      if (queued) {
+        this.emit('prompt.error', { promptId: queued.promptId, error: error.message });
+      }
     }
   }
 
   async sendPrompt(prompt: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-      this.promptQueue.push({ prompt, resolve, reject });
-      this.processNextPrompt();
+    // Generate promptId immediately and return it
+    // The actual processing happens asynchronously
+    const promptId = nanoid(8);
+    this.promptQueue.push({ prompt, promptId });
+
+    // Start processing asynchronously (don't await)
+    this.processNextPrompt().catch((err) => {
+      console.error('Error processing prompt:', err);
     });
+
+    return promptId;
   }
 
   private async processNextPrompt(): Promise<void> {
@@ -255,9 +291,9 @@ export class Session extends EventEmitter {
       return;
     }
 
-    const { prompt, resolve, reject } = this.promptQueue.shift()!;
+    const { prompt, promptId } = this.promptQueue.shift()!;
 
-    const promptId = nanoid(8);
+    // promptId is now passed in from sendPrompt
     this.lastPromptId = promptId;
     this.promptCount++;
     this.status = 'busy';
@@ -273,58 +309,40 @@ export class Session extends EventEmitter {
     });
 
     try {
-      // For non-PTY mode, spawn a new process for each prompt
-      if (!pty) {
-        // Spawn fresh process for each prompt
-        const proc = spawn('claude', ['--print'], {
-          cwd: this.workingDir,
-          stdio: ['pipe', 'pipe', 'pipe'],
-          env: { ...process.env }
-        });
+      // Always use --print mode for programmatic access
+      // PTY mode doesn't work well with Claude's TUI for automated prompts
+      // Spawn fresh process for each prompt
+      const proc = spawn('claude', ['--print', '--dangerously-skip-permissions'], {
+        cwd: this.workingDir,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env }
+      });
 
-        this.process = proc;
+      this.process = proc;
 
-        proc.stdout?.on('data', (chunk: Buffer) => {
-          this.handleOutput(chunk.toString());
-        });
+      proc.stdout?.on('data', (chunk: Buffer) => {
+        this.handleOutput(chunk.toString());
+      });
 
-        proc.stderr?.on('data', (chunk: Buffer) => {
-          this.handleOutput(chunk.toString());
-        });
+      proc.stderr?.on('data', (chunk: Buffer) => {
+        this.handleOutput(chunk.toString());
+      });
 
-        proc.on('exit', (code) => {
-          this.handleProcessExit(code);
-        });
+      proc.on('exit', (code) => {
+        this.handleProcessExit(code);
+      });
 
-        proc.on('error', (error) => {
-          this.handleProcessError(error);
-          reject(error);
-        });
+      proc.on('error', (error) => {
+        this.handleProcessError(error);
+      });
 
-        // Write prompt and close stdin
-        proc.stdin?.write(prompt);
-        proc.stdin?.end();
-      } else {
-        // PTY mode - start process if needed and write prompt
-        await this.startClaudeProcess();
-
-        if (this.process && 'write' in this.process) {
-          (this.process as pty.IPty).write(prompt + '\n');
-        }
-
-        // Set timeout for completion detection
-        setTimeout(() => {
-          if (this.isProcessing && this.lastPromptId === promptId) {
-            this.completeCurrentPrompt();
-          }
-        }, 5000); // 5 second timeout for prompt completion detection
-      }
-
-      resolve(promptId);
+      // Write prompt and close stdin
+      proc.stdin?.write(prompt);
+      proc.stdin?.end();
     } catch (error) {
       this.isProcessing = false;
       this.status = 'idle';
-      reject(error instanceof Error ? error : new Error(String(error)));
+      this.emit('prompt.error', { promptId, error: error instanceof Error ? error.message : String(error) });
     }
   }
 
