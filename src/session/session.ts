@@ -231,6 +231,9 @@ export class Session extends EventEmitter {
       }).catch(() => {});
     }
 
+    // Notify watchers that processing completed
+    this.broadcastStatus('completed', { promptId: this.lastPromptId });
+
     this.emit('prompt.completed', { promptId: this.lastPromptId });
     this.notifyCompletion(0);
     this.currentPromptOutput = [];
@@ -246,6 +249,10 @@ export class Session extends EventEmitter {
     if (this.isProcessing) {
       this.status = 'idle';
       this.lastOutput = this.currentPromptOutput.join('');
+
+      // Notify watchers that processing completed
+      this.broadcastStatus('completed', { promptId: this.lastPromptId, exitCode: code });
+
       this.emit('prompt.completed', { promptId: this.lastPromptId, code });
       this.notifyCompletion(code);
       this.currentPromptOutput = [];
@@ -254,6 +261,7 @@ export class Session extends EventEmitter {
 
     // Process exited - for --print mode this is expected after each prompt
     // Restart for next prompt if needed
+    this.processNextPrompt();
   }
 
   private handleProcessError(error: Error): void {
@@ -308,6 +316,9 @@ export class Session extends EventEmitter {
       status: 'pending'
     });
 
+    // Notify watchers that processing started
+    this.broadcastStatus('processing', { promptId, prompt: prompt.slice(0, 100) });
+
     try {
       // Always use --print mode for programmatic access
       // PTY mode doesn't work well with Claude's TUI for automated prompts
@@ -346,6 +357,28 @@ export class Session extends EventEmitter {
     }
   }
 
+  private broadcastStatus(status: string, data?: Record<string, unknown>): void {
+    const message = JSON.stringify({ type: 'status', data: { status, ...data } }) + '\n';
+
+    // Send to attached sockets
+    for (const socket of this.attachedSockets) {
+      try {
+        socket.write(message);
+      } catch {
+        this.attachedSockets.delete(socket);
+      }
+    }
+
+    // Send to watching sockets
+    for (const socket of this.watchingSockets) {
+      try {
+        socket.write(message);
+      } catch {
+        this.watchingSockets.delete(socket);
+      }
+    }
+  }
+
   private broadcastOutput(content: string): void {
     const message = JSON.stringify({ type: 'output', data: { content } }) + '\n';
 
@@ -375,7 +408,11 @@ export class Session extends EventEmitter {
       : `Task failed with code ${code} (${this.name || this.id})`;
 
     try {
-      spawn('notify-send', ['Claude-B', message], { detached: true, stdio: 'ignore' }).unref();
+      const proc = spawn('notify-send', ['Claude-B', message], { detached: true, stdio: 'ignore' });
+      proc.on('error', () => {
+        // notify-send not available, silently ignore
+      });
+      proc.unref();
     } catch {
       // Notification not available, ignore
     }

@@ -77,6 +77,12 @@ export class DaemonClient extends EventEmitter {
           continue;
         }
 
+        // Handle status updates
+        if (message.type === 'status') {
+          this.emit('status', message.data);
+          continue;
+        }
+
         // Handle response to request
         if (message.id !== undefined) {
           const pending = this.pendingRequests.get(message.id);
@@ -165,6 +171,17 @@ export class DaemonClient extends EventEmitter {
     // Listen for output
     this.on('output', (data: { content: string }) => {
       process.stdout.write(data.content);
+    });
+
+    // Listen for status updates
+    this.on('status', (data: { status: string; promptId?: string }) => {
+      if (data.status === 'processing') {
+        process.stdout.write(`\x1b[33m[Processing prompt ${data.promptId || ''}...]\x1b[0m\n`);
+      } else if (data.status === 'completed') {
+        process.stdout.write(`\x1b[32m[Completed]\x1b[0m\n`);
+      } else if (data.status === 'error') {
+        process.stdout.write(`\x1b[31m[Error]\x1b[0m\n`);
+      }
     });
 
     // Handle Ctrl+C

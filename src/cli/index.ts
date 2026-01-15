@@ -531,7 +531,39 @@ async function sendPrompt(client: DaemonClient, prompt: string): Promise<void> {
   }
   const data = result.data as PromptData | undefined;
   console.log(chalk.green(`Prompt queued (ID: ${data?.promptId})`));
-  console.log(chalk.gray('Use "cb -l" to check status or "cb -w" to watch output'));
+  console.log(chalk.gray('Watching output (Ctrl+C to detach)...\n'));
+
+  // Start watching for output immediately
+  await client.send({ method: 'session.watch' });
+
+  // Listen for status updates
+  client.on('status', (statusData: { status: string; promptId?: string }) => {
+    if (statusData.status === 'processing') {
+      console.log(chalk.yellow(`[Processing prompt ${statusData.promptId || ''}...]`));
+    } else if (statusData.status === 'completed') {
+      console.log(chalk.green(`\n[Completed]`));
+    } else if (statusData.status === 'error') {
+      console.log(chalk.red(`\n[Error]`));
+    }
+  });
+
+  // Listen for output and display it
+  client.on('output', (outputData: { content: string }) => {
+    process.stdout.write(outputData.content);
+  });
+
+  // Handle Ctrl+C to detach
+  process.on('SIGINT', () => {
+    console.log(chalk.gray('\n\nDetaching... (use "cb -l" to check result or "cb -w" to resume watching)'));
+    client.send({ method: 'session.unwatch' }).finally(() => {
+      process.exit(0);
+    });
+  });
+
+  // Wait for completion or connection close
+  await new Promise<void>((resolve) => {
+    client.on('close', resolve);
+  });
 }
 
 async function startDaemon(): Promise<void> {
