@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/Claude-B.png" alt="Claude-B Logo" width="400">
+  <img src="assets/Claude-B.png" alt="Claude-B Logo" width="800">
 </p>
 
 # Claude-B
