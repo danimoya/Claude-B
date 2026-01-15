@@ -204,11 +204,11 @@ pnpm test
 - [x] Live output streaming
 - [x] Auto-watch with status feedback
 - [x] Async prompt processing
-- [ ] REST API for remote access
-- [ ] JWT authentication
-- [ ] Hooks and webhooks
-- [ ] Multi-host orchestration
+- [x] REST API for remote access
+- [x] JWT authentication
+- [x] Hooks and webhooks
+- [x] Multi-host orchestration
 
 ## License
 
-MIT
+AGPL-3.0 - See [LICENSE](LICENSE) for details.

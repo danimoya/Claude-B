@@ -1,6 +1,6 @@
 {
   "name": "claude-b",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Background-capable Claude Code with async workflows and REST API",
   "type": "module",
   "main": "dist/cli/index.js",
@@ -49,5 +49,5 @@
     "claude-code"
   ],
   "author": "",
-  "license": "MIT"
+  "license": "AGPL-3.0"
 }
