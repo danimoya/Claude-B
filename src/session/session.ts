@@ -16,6 +16,7 @@ try {
 export interface SessionState {
   id: string;
   name?: string;
+  model?: string;  // Claude model to use (e.g., 'claude-3-opus', 'claude-3-sonnet')
   status: 'idle' | 'busy';
   createdAt: string;
   workingDir: string;
@@ -34,6 +35,7 @@ interface PromptEntry {
 export class Session extends EventEmitter {
   public id: string;
   public name?: string;
+  public model?: string;
   public status: 'idle' | 'busy' = 'idle';
   public createdAt: string;
 
@@ -57,6 +59,7 @@ export class Session extends EventEmitter {
     super();
     this.id = state.id;
     this.name = state.name;
+    this.model = state.model;
     this.status = state.status;
     this.createdAt = state.createdAt;
     this.workingDir = state.workingDir;
@@ -66,10 +69,11 @@ export class Session extends EventEmitter {
     this.promptCount = state.promptCount || 0;
   }
 
-  static create(name: string | undefined, configDir: string): Session {
+  static create(name: string | undefined, configDir: string, model?: string): Session {
     const state: SessionState = {
       id: nanoid(8),
       name,
+      model,
       status: 'idle',
       createdAt: new Date().toISOString(),
       workingDir: process.cwd(),
@@ -82,6 +86,7 @@ export class Session extends EventEmitter {
     return {
       id: this.id,
       name: this.name,
+      model: this.model,
       status: this.status,
       createdAt: this.createdAt,
       workingDir: this.workingDir,
@@ -323,7 +328,11 @@ export class Session extends EventEmitter {
       // Always use --print mode for programmatic access
       // PTY mode doesn't work well with Claude's TUI for automated prompts
       // Spawn fresh process for each prompt
-      const proc = spawn('claude', ['--print', '--dangerously-skip-permissions'], {
+      const args = ['--print', '--dangerously-skip-permissions'];
+      if (this.model) {
+        args.push('--model', this.model);
+      }
+      const proc = spawn('claude', args, {
         cwd: this.workingDir,
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env }

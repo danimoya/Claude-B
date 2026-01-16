@@ -4,6 +4,7 @@ import { WebSocket } from 'ws';
 
 interface CreateSessionBody {
   name?: string;
+  model?: string;
 }
 
 interface SendPromptBody {
@@ -37,17 +38,19 @@ export async function registerSessionRoutes(
       body: {
         type: 'object',
         properties: {
-          name: { type: 'string' }
+          name: { type: 'string' },
+          model: { type: 'string' }
         }
       }
     }
   }, async (request: FastifyRequest<{ Body: CreateSessionBody }>) => {
-    const { name } = request.body || {};
-    const session = await sessionManager.create(name);
+    const { name, model } = request.body || {};
+    const session = await sessionManager.create(name, model);
 
     return {
       id: session.id,
       name: session.name,
+      model: session.model,
       status: session.status,
       createdAt: session.createdAt
     };
@@ -71,6 +74,7 @@ export async function registerSessionRoutes(
     return {
       id: state.id,
       name: state.name,
+      model: state.model,
       status: state.status,
       createdAt: state.createdAt,
       workingDir: state.workingDir,

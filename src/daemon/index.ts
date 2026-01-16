@@ -151,7 +151,7 @@ class Daemon {
         return { data: { sessions: this.sessionManager.list() } };
 
       case 'session.create':
-        return this.createSession(params?.name as string | undefined);
+        return this.createSession(params?.name as string | undefined, params?.model as string | undefined);
 
       case 'session.kill':
         return this.killSession(params?.sessionId as string);
@@ -291,12 +291,12 @@ class Daemon {
     };
   }
 
-  private async createSession(name?: string): Promise<{ data?: Record<string, unknown>; error?: string }> {
+  private async createSession(name?: string, model?: string): Promise<{ data?: Record<string, unknown>; error?: string }> {
     try {
-      const session = await this.sessionManager.create(name);
+      const session = await this.sessionManager.create(name, model);
       // Dispatch session.created hook
       this.hookEngine.dispatch('session.created', { sessionId: session.id, name: session.name }).catch(() => {});
-      return { data: { sessionId: session.id, name: session.name } };
+      return { data: { sessionId: session.id, name: session.name, model: session.model } };
     } catch (error) {
       return { error: error instanceof Error ? error.message : 'Failed to create session' };
     }

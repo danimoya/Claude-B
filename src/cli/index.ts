@@ -130,6 +130,7 @@ program
   .option('-a, --attach <id>', 'Attach to session (foreground mode)')
   .option('-d, --detach', 'Detach from current session')
   .option('-n, --new [name]', 'Create new session')
+  .option('-m, --model <model>', 'Claude model to use (with --new)')
   .option('-k, --kill <id>', 'Kill/terminate session')
   .option('-w, --watch', 'Watch live output (tail -f style)')
   .option('-x, --select <id>', 'Select session for subsequent commands')
@@ -190,7 +191,7 @@ program
 
       if (options.new !== undefined) {
         const name = typeof options.new === 'string' ? options.new : undefined;
-        await createSession(client, name);
+        await createSession(client, name, options.model);
         return;
       }
 
@@ -415,8 +416,8 @@ async function detachSession(client: DaemonClient): Promise<void> {
   process.exit(0);
 }
 
-async function createSession(client: DaemonClient, name?: string): Promise<void> {
-  const result = await client.send({ method: 'session.create', params: { name } });
+async function createSession(client: DaemonClient, name?: string, model?: string): Promise<void> {
+  const result = await client.send({ method: 'session.create', params: { name, model } });
   client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
@@ -426,6 +427,9 @@ async function createSession(client: DaemonClient, name?: string): Promise<void>
   console.log(chalk.green(`Created session: ${data?.sessionId}`));
   if (name) {
     console.log(chalk.gray(`Name: ${name}`));
+  }
+  if (model) {
+    console.log(chalk.gray(`Model: ${model}`));
   }
   process.exit(0);
 }
