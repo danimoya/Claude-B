@@ -352,32 +352,35 @@ program
 // Command handlers
 async function showLastOutput(client: DaemonClient): Promise<void> {
   const result = await client.send({ method: 'session.last' });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   const data = result.data as SessionData | undefined;
   if (!data) {
     console.log(chalk.gray('No output available'));
-    return;
+    process.exit(0);
   }
   console.log(chalk.bold(`Session: ${data.sessionId}`));
   console.log(chalk.gray(`Status: ${data.status}`));
   console.log('');
   console.log(data.output);
+  process.exit(0);
 }
 
 async function listSessions(client: DaemonClient): Promise<void> {
   const result = await client.send({ method: 'session.list' });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   const data = result.data as SessionListData | undefined;
   const sessions = data?.sessions || [];
   if (sessions.length === 0) {
     console.log(chalk.gray('No active sessions'));
-    return;
+    process.exit(0);
   }
   console.log(chalk.bold('Sessions:'));
   for (const session of sessions) {
@@ -385,6 +388,7 @@ async function listSessions(client: DaemonClient): Promise<void> {
     const status = session.status === 'busy' ? chalk.yellow('busy') : chalk.gray('idle');
     console.log(`${marker} ${chalk.cyan(session.id)} ${session.name ? chalk.gray(`(${session.name})`) : ''} [${status}]`);
   }
+  process.exit(0);
 }
 
 async function attachSession(client: DaemonClient, sessionId: string): Promise<void> {
@@ -395,29 +399,35 @@ async function attachSession(client: DaemonClient, sessionId: string): Promise<v
 
 async function detachSession(client: DaemonClient): Promise<void> {
   await client.send({ method: 'session.detach' });
+  client.close();
   console.log(chalk.green('Detached from session'));
+  process.exit(0);
 }
 
 async function createSession(client: DaemonClient, name?: string): Promise<void> {
   const result = await client.send({ method: 'session.create', params: { name } });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   const data = result.data as SessionData | undefined;
   console.log(chalk.green(`Created session: ${data?.sessionId}`));
   if (name) {
     console.log(chalk.gray(`Name: ${name}`));
   }
+  process.exit(0);
 }
 
 async function killSession(client: DaemonClient, sessionId: string): Promise<void> {
   const result = await client.send({ method: 'session.kill', params: { sessionId } });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   console.log(chalk.green(`Killed session: ${sessionId}`));
+  process.exit(0);
 }
 
 async function watchSession(client: DaemonClient): Promise<void> {
@@ -427,37 +437,42 @@ async function watchSession(client: DaemonClient): Promise<void> {
 
 async function selectSession(client: DaemonClient, sessionId: string): Promise<void> {
   const result = await client.send({ method: 'session.select', params: { sessionId } });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   console.log(chalk.green(`Selected session: ${sessionId}`));
+  process.exit(0);
 }
 
 async function showCurrentSession(client: DaemonClient): Promise<void> {
   const result = await client.send({ method: 'session.current' });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   const data = result.data as SessionData | undefined;
   if (!data?.sessionId) {
     console.log(chalk.gray('No session selected'));
-    return;
+    process.exit(0);
   }
   console.log(chalk.cyan(data.sessionId));
   if (data.name) {
     console.log(chalk.gray(`Name: ${data.name}`));
   }
   console.log(chalk.gray(`Status: ${data.status}`));
+  process.exit(0);
 }
 
 async function startRestServer(client: DaemonClient, port: number): Promise<void> {
   console.log(chalk.gray(`Starting REST API server on port ${port}...`));
   const result = await client.send({ method: 'rest.start', params: { port } });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   const data = result.data as RestData | undefined;
   console.log(chalk.green(`REST API server started!`));
@@ -473,6 +488,7 @@ async function startRestServer(client: DaemonClient, port: number): Promise<void
   console.log(chalk.gray(`  # List sessions`));
   console.log(chalk.gray(`  curl http://localhost:${port}/api/sessions \\`));
   console.log(chalk.gray(`    -H "Authorization: Bearer <token>"`));
+  process.exit(0);
 }
 
 async function showApiKey(client: DaemonClient): Promise<void> {
@@ -481,37 +497,42 @@ async function showApiKey(client: DaemonClient): Promise<void> {
   const statusData = statusResult.data as RestData | undefined;
 
   if (!statusData?.running) {
+    client.close();
     console.log(chalk.yellow('REST server is not running.'));
     console.log(chalk.gray('Start it with: cb -r [port]'));
-    return;
+    process.exit(0);
   }
 
   const result = await client.send({ method: 'rest.apikey' });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   const data = result.data as RestData | undefined;
   console.log(chalk.bold('API Key:'));
   console.log(chalk.cyan(data?.apiKey));
+  process.exit(0);
 }
 
 async function showStatus(client: DaemonClient): Promise<void> {
   const result = await client.send({ method: 'daemon.status' });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   const data = result.data as StatusData | undefined;
   if (!data) {
     console.error(chalk.red('No status data available'));
-    return;
+    process.exit(1);
   }
   console.log(chalk.bold('Daemon Status:'));
   console.log(`  PID: ${chalk.cyan(data.pid)}`);
   console.log(`  Uptime: ${chalk.cyan(data.uptime)}`);
   console.log(`  Sessions: ${chalk.cyan(data.sessionCount)}`);
   console.log(`  Memory: ${chalk.cyan(data.memoryUsage)}`);
+  process.exit(0);
 }
 
 async function showLogs(): Promise<void> {
@@ -520,6 +541,7 @@ async function showLogs(): Promise<void> {
   console.log(chalk.gray(`Log file: ${logFile}`));
   // In a real implementation, we'd tail the log file
   console.log(chalk.gray('(Log viewing implementation pending)'));
+  process.exit(0);
 }
 
 async function sendPrompt(client: DaemonClient, prompt: string): Promise<void> {
@@ -588,14 +610,16 @@ async function addShellHook(client: DaemonClient, event: string, command: string
     method: 'hook.shell.add',
     params: { event, command }
   });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   const data = result.data as { hook?: ShellHookData };
   console.log(chalk.green(`Shell hook added: ${data.hook?.id}`));
   console.log(chalk.gray(`  Event: ${event}`));
   console.log(chalk.gray(`  Command: ${command}`));
+  process.exit(0);
 }
 
 async function removeShellHook(client: DaemonClient, id: string): Promise<void> {
@@ -603,25 +627,28 @@ async function removeShellHook(client: DaemonClient, id: string): Promise<void> 
     method: 'hook.shell.remove',
     params: { id }
   });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   console.log(chalk.green(`Shell hook removed: ${id}`));
+  process.exit(0);
 }
 
 async function listShellHooks(client: DaemonClient): Promise<void> {
   const result = await client.send({ method: 'hook.shell.list' });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   const data = result.data as HookListData;
   const hooks = data.hooks || [];
 
   if (hooks.length === 0) {
     console.log(chalk.gray('No shell hooks registered'));
-    return;
+    process.exit(0);
   }
 
   console.log(chalk.bold('Shell Hooks:'));
@@ -631,6 +658,7 @@ async function listShellHooks(client: DaemonClient): Promise<void> {
     console.log(`    Event: ${chalk.yellow(hook.event)}`);
     console.log(`    Command: ${chalk.gray(hook.command)}`);
   }
+  process.exit(0);
 }
 
 async function addWebhook(client: DaemonClient, event: string, url: string): Promise<void> {
@@ -638,14 +666,16 @@ async function addWebhook(client: DaemonClient, event: string, url: string): Pro
     method: 'hook.webhook.add',
     params: { event, url }
   });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   const data = result.data as { webhook?: WebhookData };
   console.log(chalk.green(`Webhook added: ${data.webhook?.id}`));
   console.log(chalk.gray(`  Event: ${event}`));
   console.log(chalk.gray(`  URL: ${url}`));
+  process.exit(0);
 }
 
 async function removeWebhook(client: DaemonClient, id: string): Promise<void> {
@@ -653,25 +683,28 @@ async function removeWebhook(client: DaemonClient, id: string): Promise<void> {
     method: 'hook.webhook.remove',
     params: { id }
   });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   console.log(chalk.green(`Webhook removed: ${id}`));
+  process.exit(0);
 }
 
 async function listWebhooks(client: DaemonClient): Promise<void> {
   const result = await client.send({ method: 'hook.webhook.list' });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   const data = result.data as HookListData;
   const webhooks = data.webhooks || [];
 
   if (webhooks.length === 0) {
     console.log(chalk.gray('No webhooks registered'));
-    return;
+    process.exit(0);
   }
 
   console.log(chalk.bold('Webhooks:'));
@@ -681,19 +714,22 @@ async function listWebhooks(client: DaemonClient): Promise<void> {
     console.log(`    Event: ${chalk.yellow(webhook.event)}`);
     console.log(`    URL: ${chalk.gray(webhook.url)}`);
   }
+  process.exit(0);
 }
 
 async function showHookStats(client: DaemonClient): Promise<void> {
   const result = await client.send({ method: 'hook.stats' });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   const data = result.data as unknown as HookStatsData;
   console.log(chalk.bold('Hook Statistics:'));
   console.log(`  Shell Hooks: ${chalk.cyan(data.enabledShellHooks)}/${data.shellHooks} enabled`);
   console.log(`  Webhooks: ${chalk.cyan(data.enabledWebhooks)}/${data.webhooks} enabled`);
   console.log(`  Events Processed: ${chalk.cyan(data.eventCount)}`);
+  process.exit(0);
 }
 
 // Orchestration functions
@@ -707,15 +743,17 @@ async function addRemoteHost(
     method: 'orchestration.host.add',
     params: { url, apiKey, name: options.name, priority: options.priority }
   });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   const data = result.data as { host?: RemoteHostData };
   console.log(chalk.green(`Remote host added: ${data.host?.id}`));
   console.log(chalk.gray(`  Name: ${data.host?.name}`));
   console.log(chalk.gray(`  URL: ${url}`));
   console.log(chalk.gray(`  Priority: ${data.host?.priority}`));
+  process.exit(0);
 }
 
 async function removeRemoteHost(client: DaemonClient, hostId: string): Promise<void> {
@@ -723,25 +761,29 @@ async function removeRemoteHost(client: DaemonClient, hostId: string): Promise<v
     method: 'orchestration.host.remove',
     params: { hostId }
   });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   console.log(chalk.green(`Remote host removed: ${hostId}`));
+  process.exit(0);
 }
 
 async function toggleRemoteHost(client: DaemonClient, hostId: string): Promise<void> {
   // First get current state
   const listResult = await client.send({ method: 'orchestration.host.list' });
   if (listResult.error) {
+    client.close();
     console.error(chalk.red(listResult.error));
-    return;
+    process.exit(1);
   }
   const hosts = (listResult.data as { hosts?: RemoteHostData[] }).hosts || [];
   const host = hosts.find(h => h.id === hostId);
   if (!host) {
+    client.close();
     console.error(chalk.red('Host not found'));
-    return;
+    process.exit(1);
   }
 
   const newEnabled = !host.enabled;
@@ -749,25 +791,28 @@ async function toggleRemoteHost(client: DaemonClient, hostId: string): Promise<v
     method: 'orchestration.host.toggle',
     params: { hostId, enabled: newEnabled }
   });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   console.log(chalk.green(`Remote host ${hostId}: ${newEnabled ? 'enabled' : 'disabled'}`));
+  process.exit(0);
 }
 
 async function listRemoteHosts(client: DaemonClient): Promise<void> {
   const result = await client.send({ method: 'orchestration.host.list' });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   const hosts = (result.data as { hosts?: RemoteHostData[] }).hosts || [];
 
   if (hosts.length === 0) {
     console.log(chalk.gray('No remote hosts configured'));
     console.log(chalk.gray('Add one with: cb --remote-add <url> --remote-key <apiKey>'));
-    return;
+    process.exit(0);
   }
 
   console.log(chalk.bold('Remote Hosts:'));
@@ -777,13 +822,15 @@ async function listRemoteHosts(client: DaemonClient): Promise<void> {
     console.log(`    URL: ${chalk.gray(host.url)}`);
     console.log(`    Priority: ${chalk.gray(String(host.priority))}`);
   }
+  process.exit(0);
 }
 
 async function showRemoteHealth(client: DaemonClient): Promise<void> {
   const result = await client.send({ method: 'orchestration.health' });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   const data = result.data as unknown as HealthStatus;
 
@@ -794,7 +841,7 @@ async function showRemoteHealth(client: DaemonClient): Promise<void> {
 
   if (data.hosts.length === 0) {
     console.log(chalk.gray('No hosts to show'));
-    return;
+    process.exit(0);
   }
 
   console.log(chalk.bold('Host Health:'));
@@ -809,13 +856,15 @@ async function showRemoteHealth(client: DaemonClient): Promise<void> {
       console.log(`    Last Error: ${chalk.red(host.lastError)}`);
     }
   }
+  process.exit(0);
 }
 
 async function showOrchestrationStats(client: DaemonClient): Promise<void> {
   const result = await client.send({ method: 'orchestration.stats' });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   const data = result.data as unknown as OrchestrationStats;
 
@@ -847,6 +896,7 @@ async function showOrchestrationStats(client: DaemonClient): Promise<void> {
       console.log(`    ${hostId}: ${stateColor(cb.state)} (${cb.failures} failures)`);
     }
   }
+  process.exit(0);
 }
 
 async function sendRemotePrompt(client: DaemonClient, hostId: string, prompt: string): Promise<void> {
@@ -855,9 +905,10 @@ async function sendRemotePrompt(client: DaemonClient, hostId: string, prompt: st
     method: 'orchestration.prompt',
     params: { hostId, prompt }
   });
+  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    process.exit(1);
   }
   const data = result.data as unknown as RemotePromptResult;
 
@@ -876,6 +927,7 @@ async function sendRemotePrompt(client: DaemonClient, hostId: string, prompt: st
     console.log('');
     console.error(chalk.red(`Error: ${data.error}`));
   }
+  process.exit(0);
 }
 
 // Handle stdin for piped input or parse arguments
