@@ -133,6 +133,7 @@ program
   .option('-x, --select <id>', 'Select session for subsequent commands')
   .option('-c, --current', 'Show current selected session')
   .option('-r, --rest [port]', 'Start REST API server')
+  .option('--rest-stop', 'Stop REST API server')
   .option('--status', 'Daemon status and health')
   .option('--logs', 'View daemon logs')
   .option('--hook <event> <cmd>', 'Register shell hook for event')
@@ -212,6 +213,11 @@ program
       if (options.rest !== undefined) {
         const port = typeof options.rest === 'string' ? parseInt(options.rest, 10) : 3847;
         await startRestServer(client, port);
+        return;
+      }
+
+      if (options.restStop) {
+        await stopRestServer(client);
         return;
       }
 
@@ -488,6 +494,27 @@ async function startRestServer(client: DaemonClient, port: number): Promise<void
   console.log(chalk.gray(`  # List sessions`));
   console.log(chalk.gray(`  curl http://localhost:${port}/api/sessions \\`));
   console.log(chalk.gray(`    -H "Authorization: Bearer <token>"`));
+  process.exit(0);
+}
+
+async function stopRestServer(client: DaemonClient): Promise<void> {
+  // First check if REST server is running
+  const statusResult = await client.send({ method: 'rest.status' });
+  const statusData = statusResult.data as RestData | undefined;
+
+  if (!statusData?.running) {
+    client.close();
+    console.log(chalk.gray('REST server is not running.'));
+    process.exit(0);
+  }
+
+  const result = await client.send({ method: 'rest.stop' });
+  client.close();
+  if (result.error) {
+    console.error(chalk.red(result.error));
+    process.exit(1);
+  }
+  console.log(chalk.green('REST API server stopped'));
   process.exit(0);
 }
 

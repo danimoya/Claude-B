@@ -70,6 +70,8 @@ cb -a main
 | `cb --watch` | `-w` | Watch live output |
 | `cb --select <id>` | `-x` | Select session for commands |
 | `cb --current` | `-c` | Show current session |
+| `cb --rest [port]` | `-r` | Start REST API server |
+| `cb --rest-stop` | | Stop REST API server |
 | `cb --status` | | Daemon status and health |
 
 ## Workflows
