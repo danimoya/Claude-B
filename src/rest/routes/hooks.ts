@@ -6,6 +6,7 @@ interface AddShellHookBody {
   event: HookEventType | '*';
   command: string;
   timeout?: number;
+  sessionFilter?: string;
 }
 
 interface AddWebhookBody {
@@ -16,6 +17,7 @@ interface AddWebhookBody {
   timeout?: number;
   retries?: number;
   transform?: string;
+  sessionFilter?: string;
 }
 
 interface ToggleBody {
@@ -72,13 +74,14 @@ export async function registerHookRoutes(
         properties: {
           event: { type: 'string' },
           command: { type: 'string', minLength: 1 },
-          timeout: { type: 'number' }
+          timeout: { type: 'number' },
+          sessionFilter: { type: 'string' }
         }
       }
     }
   }, async (request: FastifyRequest<{ Body: AddShellHookBody }>) => {
-    const { event, command, timeout } = request.body;
-    const hook = await hookEngine.addShellHook(event, command, { timeout });
+    const { event, command, timeout, sessionFilter } = request.body;
+    const hook = await hookEngine.addShellHook(event, command, { timeout, sessionFilter });
     return { hook };
   });
 
@@ -147,7 +150,8 @@ export async function registerHookRoutes(
           headers: { type: 'object' },
           timeout: { type: 'number' },
           retries: { type: 'number' },
-          transform: { type: 'string' }
+          transform: { type: 'string' },
+          sessionFilter: { type: 'string' }
         }
       }
     }
