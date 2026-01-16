@@ -121,6 +121,12 @@ class Daemon {
     });
 
     socket.on('close', () => {
+      // Detach from session if attached
+      const attachedSession = this.sessionManager.getAttachedSession(socket);
+      if (attachedSession) {
+        attachedSession.detach(socket);
+        this.sessionManager.unregisterAttachment(socket);
+      }
       this.clients.delete(socket);
       this.log(`Client disconnected (total: ${this.clients.size})`);
     });
@@ -353,6 +359,8 @@ class Daemon {
         return { error: 'Session not found' };
       }
       session.attach(socket);
+      // Register the socket-session mapping so stdin can find the session
+      this.sessionManager.registerAttachment(socket, sessionId);
       return { data: { success: true } };
     } catch (error) {
       return { error: error instanceof Error ? error.message : 'Failed to attach' };
@@ -360,10 +368,13 @@ class Daemon {
   }
 
   private detachSession(socket: Socket): { data?: Record<string, unknown>; error?: string } {
-    const session = this.sessionManager.current();
+    // Get the attached session for this socket (not just current)
+    const session = this.sessionManager.getAttachedSession(socket);
     if (session) {
       session.detach(socket);
     }
+    // Unregister the socket-session mapping
+    this.sessionManager.unregisterAttachment(socket);
     return { data: { success: true } };
   }
 

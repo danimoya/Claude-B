@@ -1,6 +1,6 @@
 {
   "name": "claude-b",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Background-capable Claude Code with async workflows and REST API",
   "type": "module",
   "main": "dist/cli/index.js",
