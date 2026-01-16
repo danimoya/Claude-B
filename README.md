@@ -224,6 +224,71 @@ docker run -d \
   claude-b
 ```
 
+### Testing REST API and Hooks
+
+Build and run a test container:
+
+```bash
+# Build the image
+docker build -t claudeb-test:latest .
+
+# Run container with API key
+docker run -d \
+  --name claudeb-test \
+  -e ANTHROPIC_API_KEY=your-key-here \
+  -p 3850:3847 \
+  claudeb-test:latest
+
+# Wait for startup and get API key from logs
+sleep 3
+docker logs claudeb-test
+# Look for: API Key: cb_xxxxx...
+```
+
+Test the REST API:
+
+```bash
+# Set your API key (from docker logs output)
+API_KEY="cb_your_api_key_here"
+
+# Get JWT token
+TOKEN=$(curl -4 -s -X POST http://127.0.0.1:3850/api/auth/token \
+  -H "Content-Type: application/json" \
+  -d "{\"api_key\": \"$API_KEY\"}" | jq -r '.access_token')
+
+# Test health endpoint
+curl -4 -s http://127.0.0.1:3850/api/health | jq
+
+# List sessions
+curl -4 -s http://127.0.0.1:3850/api/sessions \
+  -H "Authorization: Bearer $TOKEN" | jq
+
+# Create a session with model selection
+curl -4 -s -X POST http://127.0.0.1:3850/api/sessions \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "test-session", "model": "sonnet"}' | jq
+
+# Add a shell hook
+curl -4 -s -X POST http://127.0.0.1:3850/api/hooks/shell \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"event": "prompt.completed", "command": "echo Done!"}' | jq
+
+# Add a webhook with session filter
+curl -4 -s -X POST http://127.0.0.1:3850/api/hooks/webhook \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"event": "session.created", "url": "https://httpbin.org/post", "sessionFilter": "test-session"}' | jq
+
+# List all hooks
+curl -4 -s http://127.0.0.1:3850/api/hooks/shell -H "Authorization: Bearer $TOKEN" | jq
+curl -4 -s http://127.0.0.1:3850/api/hooks/webhook -H "Authorization: Bearer $TOKEN" | jq
+
+# Cleanup
+docker stop claudeb-test && docker rm claudeb-test
+```
+
 ## Development
 
 ```bash
