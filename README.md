@@ -243,18 +243,120 @@ pnpm typecheck
 pnpm test
 ```
 
-## Roadmap
+## Proposed Features
 
-- [x] Background execution with daemon
-- [x] Session management
-- [x] Attach/detach (fg-style)
-- [x] Live output streaming
-- [x] Auto-watch with status feedback
-- [x] Async prompt processing
-- [x] REST API for remote access
-- [x] JWT authentication
-- [x] Hooks and webhooks
-- [x] Multi-host orchestration
+### Workflow Pipelines
+Chain AI tasks together like GitHub Actions for AI. Define multi-step workflows where output flows between sessions.
+
+```yaml
+# .claude-b/workflows/code-review.yml
+name: code-review
+steps:
+  - session: analyze
+    prompt: "Analyze {{file}} for potential issues"
+  - session: suggest
+    prompt: "Based on: {{steps.analyze.output}}, suggest improvements"
+  - session: implement
+    prompt: "Implement the top suggestion"
+    requires_approval: true
+```
+
+```bash
+cb workflow run code-review --file src/api.ts
+```
+
+### Session Templates
+Pre-configured session setups with custom system prompts, model selection, and hooks. One command to start specialized workflows.
+
+```bash
+# Create from template
+cb -n myreview --template code-review
+
+# Templates include: code-review, bug-fix, refactor, test-writer, docs
+cb template list
+cb template create my-custom --from current
+```
+
+### Prompt Queues & Scheduling
+Queue prompts for batch processing. Schedule recurring AI tasks.
+
+```bash
+# Queue multiple prompts
+cb queue add "Analyze auth.ts"
+cb queue add "Analyze api.ts"
+cb queue add "Summarize all findings"
+cb queue run                    # Process sequentially
+
+# Schedule recurring tasks
+cb schedule "Review open PRs" --cron "0 9 * * *"
+cb schedule "Update docs" --every 24h
+```
+
+### Cross-Session Context
+Sessions that share context and reference each other's outputs.
+
+```bash
+# Create a context pool
+cb context create myproject
+
+# Sessions share the pool
+cb -n backend --context myproject
+cb -n frontend --context myproject
+
+# Reference other sessions
+cb -x frontend "Use the API schema from @backend to generate TypeScript types"
+```
+
+### Cost & Usage Analytics
+Track token usage, set budgets, and monitor spending.
+
+```bash
+cb usage                        # Current session stats
+cb usage --all                  # All sessions
+cb usage --report weekly        # Usage report
+
+cb budget set 10.00 --daily     # Daily spending limit
+cb budget set 100.00 --session  # Per-session limit
+```
+
+### Session Snapshots & Branching
+Git-like version control for AI sessions. Save state, branch, compare approaches.
+
+```bash
+cb snapshot create "before-refactor"
+cb snapshot list
+cb snapshot restore abc123
+
+# Branch a session
+cb branch myfeature --from main-session
+cb branch compare main-session myfeature
+```
+
+### Smart Fallbacks & Retries
+Automatic retry on failures with model fallback chains.
+
+```bash
+# Configure fallback chain
+cb config set fallback-chain "opus,sonnet,haiku"
+
+# Auto-retry with exponential backoff
+cb config set auto-retry true
+cb config set max-retries 3
+```
+
+### Output Transformers
+Post-process AI output with built-in or custom transformers.
+
+```bash
+# Extract code blocks
+cb "Generate a function" | cb transform extract-code
+
+# Parse structured output
+cb "List files as JSON" | cb transform json
+
+# Custom transformer
+cb transform register my-parser --script ./parse.js
+```
 
 ## License
 
