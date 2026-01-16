@@ -29,7 +29,10 @@ class Daemon {
   private clients: Set<Socket> = new Set();
   private startTime: number = Date.now();
   private restServer: RestServer | null = null;
-  private restConfig: RestConfig = { host: '127.0.0.1', port: 3847 };
+  private restConfig: RestConfig = {
+    host: process.env.REST_HOST || '127.0.0.1',
+    port: parseInt(process.env.REST_PORT || '3847', 10)
+  };
 
   constructor() {
     const configDir = `${homedir()}/.claude-b`;

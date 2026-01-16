@@ -25,7 +25,12 @@ EXPOSE 3847
 
 # Set default environment
 ENV ANTHROPIC_API_KEY=""
-ENV PORT=3847
+ENV REST_HOST="0.0.0.0"
+ENV REST_PORT="3847"
+
+# Copy and set entrypoint
+COPY docker-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 # Start daemon with REST API
-CMD ["node", "dist/daemon/index.js"]
+CMD ["/entrypoint.sh"]

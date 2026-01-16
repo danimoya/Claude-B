@@ -13,8 +13,8 @@ Claude-B is a background-capable wrapper around [Claude Code](https://claude.ai/
 - **Foreground attach** - Like `fg` in Linux, attach to see live output
 - **Auto-watch streaming** - Automatically streams output after sending prompts
 - **Status feedback** - Real-time processing/completed/error status messages
-- **REST API** - Control sessions from other machines (planned)
-- **Hooks** - Notifications and multi-host AI orchestration (planned)
+- **REST API** - Control sessions remotely via HTTP/WebSocket
+- **Hooks** - Shell hooks and webhooks for notifications and automation
 
 ## Installation
 
@@ -243,7 +243,7 @@ pnpm typecheck
 pnpm test
 ```
 
-## Proposed Features
+## Potential Features
 
 ### Workflow Pipelines
 Chain AI tasks together like GitHub Actions for AI. Define multi-step workflows where output flows between sessions.
