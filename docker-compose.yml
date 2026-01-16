@@ -1,0 +1,83 @@
+# Docker Compose for Claude-B Multi-Host Orchestration Testing
+#
+# Usage:
+#   export ANTHROPIC_API_KEY=your-key-here
+#   docker-compose up -d
+#
+# This creates 3 Claude-B instances to test orchestration features:
+#   - host1: Primary instance (port 3847)
+#   - host2: Secondary instance (port 3848)
+#   - host3: Tertiary instance (port 3849)
+#
+# Each instance runs its own REST API server.
+# Use the primary instance to orchestrate across all hosts.
+
+services:
+  host1:
+    build: .
+    container_name: claude-b-host1
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - PORT=3847
+      - HOST_NAME=host1
+    ports:
+      - "3847:3847"
+    volumes:
+      - host1-data:/root/.claude-b
+    networks:
+      - claude-b-net
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3847/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  host2:
+    build: .
+    container_name: claude-b-host2
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - PORT=3847
+      - HOST_NAME=host2
+    ports:
+      - "3848:3847"
+    volumes:
+      - host2-data:/root/.claude-b
+    networks:
+      - claude-b-net
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3847/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  host3:
+    build: .
+    container_name: claude-b-host3
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - PORT=3847
+      - HOST_NAME=host3
+    ports:
+      - "3849:3847"
+    volumes:
+      - host3-data:/root/.claude-b
+    networks:
+      - claude-b-net
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3847/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  claude-b-net:
+    driver: bridge
+
+volumes:
+  host1-data:
+  host2-data:
+  host3-data:

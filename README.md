@@ -179,6 +179,51 @@ Config file: `~/.claude-b/config.json`
 └── logs/                # Log files
 ```
 
+## Docker
+
+### Multi-Host Orchestration Testing
+
+Run multiple Claude-B instances for testing orchestration features:
+
+```bash
+# Set your API key
+export ANTHROPIC_API_KEY=your-key-here
+
+# Start 3 instances
+docker-compose up -d
+
+# Instances available at:
+#   host1: http://localhost:3847
+#   host2: http://localhost:3848
+#   host3: http://localhost:3849
+
+# Configure orchestration from primary host
+cb -r                                           # Start REST API
+cb --remote-add http://localhost:3848 --remote-key <api-key> --remote-name host2
+cb --remote-add http://localhost:3849 --remote-key <api-key> --remote-name host3
+
+# Send prompts to remote hosts
+cb --remote host2 "Analyze this codebase"
+cb --remote-health                              # Check health status
+
+# Stop containers
+docker-compose down
+```
+
+### Single Instance
+
+```bash
+# Build image
+docker build -t claude-b .
+
+# Run container
+docker run -d \
+  -e ANTHROPIC_API_KEY=your-key \
+  -p 3847:3847 \
+  --name claude-b \
+  claude-b
+```
+
 ## Development
 
 ```bash
