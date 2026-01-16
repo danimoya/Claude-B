@@ -1,0 +1,32 @@
+# Source files (dist is published)
+src/
+tsconfig.json
+
+# Tests
+**/*.test.ts
+vitest.config.ts
+
+# Development files
+.git/
+.github/
+.vscode/
+.idea/
+
+# Docker
+Dockerfile
+docker-compose.yml
+docker-entrypoint.sh
+.dockerignore
+
+# Documentation (keep README)
+CONTRIBUTING.md
+CLAUDE.md
+
+# Misc
+*.log
+*.tmp
+.DS_Store
+node_modules/
+coverage/
+.env
+.env.*

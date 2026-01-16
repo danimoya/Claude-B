@@ -1,6 +1,6 @@
 {
   "name": "claude-b",
-  "version": "0.2.9",
+  "version": "0.3.0",
   "description": "Background-capable Claude Code with async workflows and REST API",
   "type": "module",
   "main": "dist/cli/index.js",
@@ -32,6 +32,9 @@
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/ws": "^8.18.1",
+    "@typescript-eslint/eslint-plugin": "^8.53.0",
+    "@typescript-eslint/parser": "^8.53.0",
+    "eslint": "^9.39.2",
     "tsup": "^8.3.0",
     "typescript": "^5.7.0",
     "vitest": "^2.1.0"
@@ -48,6 +51,14 @@
     "anthropic",
     "claude-code"
   ],
-  "author": "",
-  "license": "AGPL-3.0"
+  "author": "danimoya",
+  "license": "AGPL-3.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/danimoya/Claude-B.git"
+  },
+  "homepage": "https://github.com/danimoya/Claude-B#readme",
+  "bugs": {
+    "url": "https://github.com/danimoya/Claude-B/issues"
+  }
 }
