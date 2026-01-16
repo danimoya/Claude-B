@@ -8,6 +8,7 @@ export interface ShellHook {
   event: HookEventType | '*';  // '*' matches all events
   command: string;
   timeout?: number;  // milliseconds, default 30000
+  sessionFilter?: string;  // only trigger for this sessionId
   enabled: boolean;
   createdAt: string;
 }

@@ -73,13 +73,14 @@ export class HookEngine extends EventEmitter {
   async addShellHook(
     event: HookEventType | '*',
     command: string,
-    options?: { timeout?: number }
+    options?: { timeout?: number; sessionFilter?: string }
   ): Promise<ShellHook> {
     const hook: ShellHook = {
       id: nanoid(8),
       event,
       command,
       timeout: options?.timeout,
+      sessionFilter: options?.sessionFilter,
       enabled: true,
       createdAt: new Date().toISOString()
     };
@@ -124,6 +125,7 @@ export class HookEngine extends EventEmitter {
       timeout?: number;
       retries?: number;
       transform?: string;
+      sessionFilter?: string;
     }
   ): Promise<Webhook> {
     const webhook: Webhook = {
@@ -135,6 +137,7 @@ export class HookEngine extends EventEmitter {
       timeout: options?.timeout,
       retries: options?.retries,
       transform: options?.transform,
+      sessionFilter: options?.sessionFilter,
       enabled: true,
       createdAt: new Date().toISOString()
     };
@@ -186,14 +189,25 @@ export class HookEngine extends EventEmitter {
     this.emit('event', event);
     this.emit(type, event);
 
-    // Find matching hooks
-    const matchingShellHooks = Array.from(this.shellHooks.values()).filter(
-      hook => hook.enabled && (hook.event === type || hook.event === '*')
-    );
+    // Extract sessionId from payload if present
+    const payloadSessionId = (payload as Record<string, unknown>).sessionId as string | undefined;
 
-    const matchingWebhooks = Array.from(this.webhooks.values()).filter(
-      webhook => webhook.enabled && (webhook.event === type || webhook.event === '*')
-    );
+    // Find matching hooks (check event type and optional sessionFilter)
+    const matchingShellHooks = Array.from(this.shellHooks.values()).filter(hook => {
+      if (!hook.enabled) return false;
+      if (hook.event !== type && hook.event !== '*') return false;
+      // If hook has sessionFilter, only match if sessionId matches
+      if (hook.sessionFilter && hook.sessionFilter !== payloadSessionId) return false;
+      return true;
+    });
+
+    const matchingWebhooks = Array.from(this.webhooks.values()).filter(webhook => {
+      if (!webhook.enabled) return false;
+      if (webhook.event !== type && webhook.event !== '*') return false;
+      // If webhook has sessionFilter, only match if sessionId matches
+      if (webhook.sessionFilter && webhook.sessionFilter !== payloadSessionId) return false;
+      return true;
+    });
 
     // Execute hooks in parallel
     const [shellResults, webhookResults] = await Promise.all([

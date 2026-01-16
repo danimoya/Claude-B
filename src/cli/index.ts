@@ -48,6 +48,7 @@ interface ShellHookData {
   id: string;
   event: string;
   command: string;
+  sessionFilter?: string;
   enabled: boolean;
   createdAt: string;
 }
@@ -56,6 +57,7 @@ interface WebhookData {
   id: string;
   event: string;
   url: string;
+  sessionFilter?: string;
   enabled: boolean;
   createdAt: string;
 }
@@ -137,10 +139,12 @@ program
   .option('--status', 'Daemon status and health')
   .option('--logs', 'View daemon logs')
   .option('--hook <event> <cmd>', 'Register shell hook for event')
+  .option('--hook-session <id>', 'Only trigger hook for this session (use with --hook)')
   .option('--unhook <id>', 'Remove a shell hook')
   .option('--hooks', 'List all shell hooks')
   .option('--webhook <url>', 'Register webhook for notifications')
   .option('--webhook-event <event>', 'Event type for webhook (default: *)')
+  .option('--webhook-session <id>', 'Only trigger webhook for this session (use with --webhook)')
   .option('--unwebhook <id>', 'Remove a webhook')
   .option('--webhooks', 'List all webhooks')
   .option('--hook-stats', 'Show hook statistics')
@@ -244,11 +248,12 @@ program
         if (args.length < 1) {
           console.error(chalk.red('Usage: cb --hook <event> <command>'));
           console.error(chalk.gray('Events: session.created, session.destroyed, prompt.received, prompt.completed, prompt.error, daemon.started, daemon.stopped, rest.started, rest.stopped, * (all)'));
+          console.error(chalk.gray('Use --hook-session <id> to filter by session'));
           return;
         }
         const event = options.hook;
         const command = args.join(' ');
-        await addShellHook(client, event, command);
+        await addShellHook(client, event, command, options.hookSession);
         return;
       }
 
@@ -264,7 +269,7 @@ program
 
       if (options.webhook) {
         const event = options.webhookEvent || '*';
-        await addWebhook(client, event, options.webhook);
+        await addWebhook(client, event, options.webhook, options.webhookSession);
         return;
       }
 
@@ -632,10 +637,10 @@ async function startDaemon(): Promise<void> {
 }
 
 // Hook management functions
-async function addShellHook(client: DaemonClient, event: string, command: string): Promise<void> {
+async function addShellHook(client: DaemonClient, event: string, command: string, sessionFilter?: string): Promise<void> {
   const result = await client.send({
     method: 'hook.shell.add',
-    params: { event, command }
+    params: { event, command, sessionFilter }
   });
   client.close();
   if (result.error) {
@@ -646,6 +651,9 @@ async function addShellHook(client: DaemonClient, event: string, command: string
   console.log(chalk.green(`Shell hook added: ${data.hook?.id}`));
   console.log(chalk.gray(`  Event: ${event}`));
   console.log(chalk.gray(`  Command: ${command}`));
+  if (sessionFilter) {
+    console.log(chalk.gray(`  Session filter: ${sessionFilter}`));
+  }
   process.exit(0);
 }
 
@@ -684,14 +692,17 @@ async function listShellHooks(client: DaemonClient): Promise<void> {
     console.log(`  ${chalk.cyan(hook.id)} [${status}]`);
     console.log(`    Event: ${chalk.yellow(hook.event)}`);
     console.log(`    Command: ${chalk.gray(hook.command)}`);
+    if (hook.sessionFilter) {
+      console.log(`    Session: ${chalk.magenta(hook.sessionFilter)}`);
+    }
   }
   process.exit(0);
 }
 
-async function addWebhook(client: DaemonClient, event: string, url: string): Promise<void> {
+async function addWebhook(client: DaemonClient, event: string, url: string, sessionFilter?: string): Promise<void> {
   const result = await client.send({
     method: 'hook.webhook.add',
-    params: { event, url }
+    params: { event, url, sessionFilter }
   });
   client.close();
   if (result.error) {
@@ -702,6 +713,9 @@ async function addWebhook(client: DaemonClient, event: string, url: string): Pro
   console.log(chalk.green(`Webhook added: ${data.webhook?.id}`));
   console.log(chalk.gray(`  Event: ${event}`));
   console.log(chalk.gray(`  URL: ${url}`));
+  if (sessionFilter) {
+    console.log(chalk.gray(`  Session filter: ${sessionFilter}`));
+  }
   process.exit(0);
 }
 
@@ -740,6 +754,9 @@ async function listWebhooks(client: DaemonClient): Promise<void> {
     console.log(`  ${chalk.cyan(webhook.id)} [${status}]`);
     console.log(`    Event: ${chalk.yellow(webhook.event)}`);
     console.log(`    URL: ${chalk.gray(webhook.url)}`);
+    if (webhook.sessionFilter) {
+      console.log(`    Session: ${chalk.magenta(webhook.sessionFilter)}`);
+    }
   }
   process.exit(0);
 }

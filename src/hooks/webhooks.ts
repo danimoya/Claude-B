@@ -11,6 +11,7 @@ export interface Webhook {
   timeout?: number;  // milliseconds, default 10000
   retries?: number;  // default 0
   transform?: string;  // JavaScript expression to transform payload
+  sessionFilter?: string;  // only trigger for this sessionId
   enabled: boolean;
   createdAt: string;
 }

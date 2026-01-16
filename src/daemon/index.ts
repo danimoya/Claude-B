@@ -200,7 +200,8 @@ class Daemon {
         return this.addShellHook(
           params?.event as HookEventType | '*',
           params?.command as string,
-          params?.timeout as number | undefined
+          params?.timeout as number | undefined,
+          params?.sessionFilter as string | undefined
         );
 
       case 'hook.shell.remove':
@@ -540,14 +541,15 @@ class Daemon {
   private async addShellHook(
     event: HookEventType | '*',
     command: string,
-    timeout?: number
+    timeout?: number,
+    sessionFilter?: string
   ): Promise<{ data?: Record<string, unknown>; error?: string }> {
     if (!event || !command) {
       return { error: 'Event and command are required' };
     }
 
     try {
-      const hook = await this.hookEngine.addShellHook(event, command, { timeout });
+      const hook = await this.hookEngine.addShellHook(event, command, { timeout, sessionFilter });
       return { data: { hook } };
     } catch (error) {
       return { error: error instanceof Error ? error.message : 'Failed to add shell hook' };
@@ -596,7 +598,8 @@ class Daemon {
         headers: options.headers as Record<string, string> | undefined,
         timeout: options.timeout as number | undefined,
         retries: options.retries as number | undefined,
-        transform: options.transform as string | undefined
+        transform: options.transform as string | undefined,
+        sessionFilter: options.sessionFilter as string | undefined
       });
       return { data: { webhook } };
     } catch (error) {
