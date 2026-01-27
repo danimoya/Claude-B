@@ -4,6 +4,7 @@ import { nanoid } from 'nanoid';
 import { EventEmitter } from 'events';
 import { mkdir, writeFile, readFile, appendFile } from 'fs/promises';
 import { existsSync } from 'fs';
+import { getClaudePath } from '../utils/claude-detector.js';
 
 // Try to import node-pty, fall back to regular spawn if not available
 let pty: typeof import('node-pty') | null = null;
@@ -131,8 +132,9 @@ export class Session extends EventEmitter {
     await this.ensureSessionDir();
 
     // Try to use PTY for full interactive support
+    const claudePath = getClaudePath();
     if (pty) {
-      this.process = pty.spawn('claude', ['--dangerously-skip-permissions'], {
+      this.process = pty.spawn(claudePath, ['--dangerously-skip-permissions'], {
         name: 'xterm-256color',
         cols: 120,
         rows: 40,
@@ -149,7 +151,7 @@ export class Session extends EventEmitter {
       });
     } else {
       // Fallback to regular spawn with pipe
-      const proc = spawn('claude', ['--print'], {
+      const proc = spawn(claudePath, ['--print'], {
         cwd: this.workingDir,
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env }
@@ -328,11 +330,12 @@ export class Session extends EventEmitter {
       // Always use --print mode for programmatic access
       // PTY mode doesn't work well with Claude's TUI for automated prompts
       // Spawn fresh process for each prompt
+      const claudePath = getClaudePath();
       const args = ['--print', '--dangerously-skip-permissions'];
       if (this.model) {
         args.push('--model', this.model);
       }
-      const proc = spawn('claude', args, {
+      const proc = spawn(claudePath, args, {
         cwd: this.workingDir,
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env }

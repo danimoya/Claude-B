@@ -4,6 +4,7 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import { DaemonClient } from '../daemon/client.js';
 import { version } from '../utils/version.js';
+import { detectClaude } from '../utils/claude-detector.js';
 
 // Type definitions for API responses
 interface SessionInfo {
@@ -568,6 +569,15 @@ async function showStatus(client: DaemonClient): Promise<void> {
   console.log(`  Uptime: ${chalk.cyan(data.uptime)}`);
   console.log(`  Sessions: ${chalk.cyan(data.sessionCount)}`);
   console.log(`  Memory: ${chalk.cyan(data.memoryUsage)}`);
+
+  // Show Claude Code detection info
+  const claude = detectClaude();
+  if (claude) {
+    const version = claude.version ? ` v${claude.version}` : '';
+    console.log(`  Claude: ${chalk.green(claude.path)}${chalk.gray(version)} (${claude.type})`);
+  } else {
+    console.log(`  Claude: ${chalk.red('Not found')} - set CLAUDE_PATH or install Claude Code`);
+  }
   process.exit(0);
 }
 
