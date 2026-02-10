@@ -172,6 +172,10 @@ program
   .option('--inbox-clear', 'Mark all notifications as read')
   .option('--inbox-count', 'Show unread notification count')
   .option('--remote-fire <hostId>', 'Fire and forget to remote host')
+  // Telegram integration
+  .option('--telegram <token>', 'Set up Telegram bot with token')
+  .option('--telegram-stop', 'Disable Telegram notifications')
+  .option('--telegram-status', 'Show Telegram bot status')
   .action(async (promptParts: string[], options) => {
     const client = new DaemonClient();
 
@@ -358,6 +362,22 @@ program
 
       if (options.inboxCount) {
         await showInboxCount(client);
+        return;
+      }
+
+      // Telegram commands
+      if (options.telegram) {
+        await setupTelegram(client, options.telegram);
+        return;
+      }
+
+      if (options.telegramStop) {
+        await stopTelegram(client);
+        return;
+      }
+
+      if (options.telegramStatus) {
+        await showTelegramStatus(client);
         return;
       }
 
@@ -1098,50 +1118,238 @@ interface InboxNotification {
   durationMs?: number;
   costUsd?: number;
   resultPreview?: string;
+  resultFull?: string;
+  claudeSessionId?: string;
   viewCommand: string;
   read: boolean;
 }
 
+// Markdown-to-terminal renderer (chalk only, no deps)
+function renderMarkdown(text: string): string {
+  const lines = text.split('\n');
+  const result: string[] = [];
+  let inCodeBlock = false;
+
+  for (const line of lines) {
+    if (line.startsWith('```')) {
+      inCodeBlock = !inCodeBlock;
+      result.push(inCodeBlock ? chalk.gray('  ┌─') : chalk.gray('  └─'));
+      continue;
+    }
+
+    if (inCodeBlock) {
+      result.push(chalk.gray(`  │ ${line}`));
+      continue;
+    }
+
+    // Headers
+    if (line.startsWith('### ')) {
+      result.push(chalk.bold.dim(line.slice(4)));
+      continue;
+    }
+    if (line.startsWith('## ')) {
+      result.push(chalk.bold(line.slice(3)));
+      continue;
+    }
+    if (line.startsWith('# ')) {
+      result.push(chalk.bold.underline(line.slice(2)));
+      continue;
+    }
+
+    // Blockquotes
+    if (line.startsWith('> ')) {
+      result.push(chalk.gray(`  │ ${line.slice(2)}`));
+      continue;
+    }
+
+    // Unordered list items
+    if (/^[-*] /.test(line)) {
+      result.push(`  • ${renderInline(line.slice(2))}`);
+      continue;
+    }
+
+    // Ordered list items
+    const orderedMatch = line.match(/^(\d+)\. (.*)$/);
+    if (orderedMatch) {
+      result.push(`  ${orderedMatch[1]}. ${renderInline(orderedMatch[2])}`);
+      continue;
+    }
+
+    // Regular line
+    result.push(`  ${renderInline(line)}`);
+  }
+
+  return result.join('\n');
+}
+
+function renderInline(text: string): string {
+  // Bold
+  text = text.replace(/\*\*(.+?)\*\*/g, (_, m) => chalk.bold(m));
+  // Italic
+  text = text.replace(/(?<!\*)\*([^*]+?)\*(?!\*)/g, (_, m) => chalk.italic(m));
+  // Inline code
+  text = text.replace(/`([^`]+?)`/g, (_, m) => chalk.cyan(m));
+  return text;
+}
+
 async function showInbox(client: DaemonClient): Promise<void> {
   const result = await client.send({ method: 'notification.list', params: { unreadOnly: false } });
-  client.close();
 
   if (result.error) {
+    client.close();
     console.error(chalk.red(result.error));
     process.exit(1);
   }
 
   const data = result.data as { notifications: InboxNotification[] };
-  const notifications = data.notifications || [];
+  const notifications = [...(data.notifications || [])].reverse(); // newest first
 
   if (notifications.length === 0) {
+    client.close();
     console.log(chalk.gray('No notifications'));
     process.exit(0);
   }
 
-  console.log(chalk.bold('Notification Inbox:'));
-  console.log('');
+  let currentIndex = 0;
 
-  for (const n of [...notifications].reverse()) {
-    const readMarker = n.read ? ' ' : chalk.green('*');
+  function render(): void {
+    const rows = process.stdout.rows || 24;
+    const cols = process.stdout.columns || 80;
+    const n = notifications[currentIndex];
+    const total = notifications.length;
+    const unreadCount = notifications.filter(x => !x.read).length;
+
+    // Clear screen + move cursor home
+    process.stdout.write('\x1b[2J\x1b[H');
+
+    // Header
+    const headerLeft = `── Inbox (${currentIndex + 1}/${total})${n.read ? '' : ' * unread'}`;
+    const headerRight = unreadCount > 0 ? `${unreadCount} unread ──` : '──';
+    console.log(chalk.bold(headerLeft) + chalk.gray(` ${'─'.repeat(Math.max(2, cols - headerLeft.length - headerRight.length - 2))} ${headerRight}`));
+    console.log('');
+
+    // Status + name + meta
     const statusIcon = n.type === 'prompt.completed' ? chalk.green('OK') : chalk.red('ERR');
     const duration = n.durationMs ? `${(n.durationMs / 1000).toFixed(1)}s` : '';
     const cost = n.costUsd ? `$${n.costUsd.toFixed(4)}` : '';
     const time = new Date(n.timestamp).toLocaleTimeString();
 
-    console.log(`${readMarker} ${statusIcon} ${chalk.cyan(n.sessionName || n.sessionId)} ${chalk.gray(time)} ${chalk.gray(duration)} ${chalk.gray(cost)}`);
+    console.log(`  ${statusIcon}  ${chalk.cyan.bold(n.sessionName || n.sessionId)}  ${chalk.gray(time)}  ${chalk.gray(duration)}  ${chalk.gray(cost)}`);
+
     if (n.goal) {
-      console.log(`    ${chalk.gray(n.goal)}`);
+      console.log(`  ${chalk.gray('Goal:')} ${n.goal}`);
     }
-    if (n.resultPreview) {
-      const preview = n.resultPreview.slice(0, 80);
-      console.log(`    ${chalk.gray(preview)}${n.resultPreview.length > 80 ? '...' : ''}`);
-    }
-    console.log(`    ${chalk.yellow(n.viewCommand)}`);
     console.log('');
+
+    // Render body — full result with markdown, or preview
+    const bodyText = n.resultFull || n.resultPreview || '';
+    if (bodyText) {
+      const rendered = renderMarkdown(bodyText);
+      // Cap output to terminal height minus header/footer lines
+      const maxBodyLines = rows - 10;
+      const bodyLines = rendered.split('\n');
+      if (bodyLines.length > maxBodyLines) {
+        console.log(bodyLines.slice(0, maxBodyLines).join('\n'));
+        console.log(chalk.gray(`  ... (${bodyLines.length - maxBodyLines} more lines)`));
+      } else {
+        console.log(rendered);
+      }
+    } else {
+      console.log(chalk.gray('  (no output)'));
+    }
+
+    console.log('');
+
+    // Resume command
+    if (n.claudeSessionId) {
+      console.log(`  ${chalk.gray('Resume:')} ${chalk.yellow('cb "your follow-up here"')}`);
+    } else {
+      console.log(`  ${chalk.gray('View:')} ${chalk.yellow('cb -l')}`);
+    }
+
+    console.log('');
+
+    // Footer
+    const footer = '── n=next  p=prev  r=read  d=delete  q=quit ──';
+    console.log(chalk.gray(footer));
   }
 
-  process.exit(0);
+  function cleanup(): void {
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(false);
+    }
+    process.stdout.write('\x1b[2J\x1b[H');
+    client.close();
+  }
+
+  // Enter raw mode for key input
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+  }
+  process.stdin.resume();
+  process.stdin.setEncoding('utf8');
+
+  render();
+
+  process.stdin.on('data', async (key: string) => {
+    switch (key) {
+      case 'n': case 'j': case '\x1b[C': case '\x1b[B': // next (n, j, right, down)
+        if (currentIndex < notifications.length - 1) {
+          currentIndex++;
+          render();
+        }
+        break;
+
+      case 'p': case 'k': case '\x1b[D': case '\x1b[A': // prev (p, k, left, up)
+        if (currentIndex > 0) {
+          currentIndex--;
+          render();
+        }
+        break;
+
+      case 'r': { // mark read
+        const n = notifications[currentIndex];
+        if (!n.read) {
+          await client.send({ method: 'notification.markRead', params: { id: n.id } });
+          n.read = true;
+          render();
+        }
+        break;
+      }
+
+      case 'd': { // delete
+        const n = notifications[currentIndex];
+        await client.send({ method: 'notification.delete', params: { id: n.id } });
+        notifications.splice(currentIndex, 1);
+        if (notifications.length === 0) {
+          cleanup();
+          console.log(chalk.gray('No more notifications'));
+          process.exit(0);
+        }
+        if (currentIndex >= notifications.length) {
+          currentIndex = notifications.length - 1;
+        }
+        render();
+        break;
+      }
+
+      case 'q': case '\x03': // quit (q, Ctrl+C)
+        cleanup();
+        process.exit(0);
+        break;
+
+      default:
+        // Ignore Esc alone and other keys
+        if (key === '\x1b') {
+          cleanup();
+          process.exit(0);
+        }
+        break;
+    }
+  });
+
+  // Keep alive until user quits
+  await new Promise<void>(() => {});
 }
 
 async function clearInbox(client: DaemonClient): Promise<void> {
@@ -1169,6 +1377,67 @@ async function showInboxCount(client: DaemonClient): Promise<void> {
     console.log(chalk.gray('View with: cb -i'));
   } else {
     console.log(chalk.gray(`No unread notifications (${data.total} total)`));
+  }
+  process.exit(0);
+}
+
+// Telegram functions
+async function setupTelegram(client: DaemonClient, token: string): Promise<void> {
+  console.log(chalk.gray('Setting up Telegram bot...'));
+  const result = await client.send({ method: 'telegram.setup', params: { token } });
+  client.close();
+
+  if (result.error) {
+    console.error(chalk.red(result.error));
+    process.exit(1);
+  }
+
+  const data = result.data as { username?: string };
+  console.log(chalk.green('Telegram bot started!'));
+  if (data.username) {
+    console.log(`  Bot: ${chalk.cyan(`@${data.username}`)}`);
+  }
+  console.log('');
+  console.log(chalk.gray('Send /start to your bot in Telegram to register.'));
+  process.exit(0);
+}
+
+async function stopTelegram(client: DaemonClient): Promise<void> {
+  const result = await client.send({ method: 'telegram.stop' });
+  client.close();
+
+  if (result.error) {
+    console.error(chalk.red(result.error));
+    process.exit(1);
+  }
+
+  console.log(chalk.green('Telegram bot stopped and token cleared.'));
+  process.exit(0);
+}
+
+async function showTelegramStatus(client: DaemonClient): Promise<void> {
+  const result = await client.send({ method: 'telegram.status' });
+  client.close();
+
+  if (result.error) {
+    console.error(chalk.red(result.error));
+    process.exit(1);
+  }
+
+  const data = result.data as { running: boolean; enabled: boolean; chatIds: string[] };
+  const status = data.running ? chalk.green('running') : chalk.gray('stopped');
+  console.log(chalk.bold('Telegram Bot:'));
+  console.log(`  Status: ${status}`);
+  console.log(`  Enabled: ${data.enabled ? chalk.green('yes') : chalk.gray('no')}`);
+  if (data.chatIds.length > 0) {
+    console.log(`  Registered chats: ${chalk.cyan(data.chatIds.length.toString())}`);
+  } else {
+    console.log(chalk.gray('  No registered chats (send /start to your bot)'));
+  }
+
+  if (!data.running && !data.enabled) {
+    console.log('');
+    console.log(chalk.gray('Set up with: cb --telegram <token>'));
   }
   process.exit(0);
 }

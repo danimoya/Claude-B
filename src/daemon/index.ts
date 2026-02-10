@@ -9,6 +9,7 @@ import { HookEngine } from '../hooks/engine.js';
 import { HookEventType } from '../hooks/events.js';
 import { OrchestrationManager, createHost } from '../orchestration/index.js';
 import { NotificationInbox, NotificationInput } from '../notifications/inbox.js';
+import { ClaudeBTelegramBot } from '../telegram/bot.js';
 
 interface DaemonConfig {
   socketPath: string;
@@ -29,6 +30,7 @@ class Daemon {
   private hookEngine: HookEngine;
   private orchestrationManager: OrchestrationManager;
   private notificationInbox: NotificationInbox;
+  private telegramBot: ClaudeBTelegramBot;
   private clients: Set<Socket> = new Set();
   private startTime: number = Date.now();
   private restServer: RestServer | null = null;
@@ -49,6 +51,17 @@ class Daemon {
     this.hookEngine = new HookEngine(configDir);
     this.orchestrationManager = new OrchestrationManager(configDir);
     this.notificationInbox = new NotificationInbox(configDir);
+    this.telegramBot = new ClaudeBTelegramBot({
+      configDir,
+      onPrompt: async (sessionId: string, prompt: string) => {
+        const session = this.sessionManager.get(sessionId);
+        if (!session) throw new Error('Session not found');
+        this.sessionManager.select(sessionId);
+        await session.sendPrompt(prompt);
+      },
+      getSessions: () => this.sessionManager.list(),
+      getInboxCount: () => this.notificationInbox.count(),
+    });
   }
 
   async start(): Promise<void> {
@@ -81,6 +94,14 @@ class Daemon {
     await this.hookEngine.load();
     await this.orchestrationManager.load();
     this.orchestrationManager.startHealthChecks();
+
+    // Auto-start Telegram bot if configured
+    try {
+      await this.telegramBot.start();
+      this.log('Telegram bot started');
+    } catch {
+      // No token configured or invalid — that's fine
+    }
 
     // Create server
     this.server = createServer((socket) => this.handleConnection(socket));
@@ -283,6 +304,12 @@ class Daemon {
       case 'notification.clear':
         return this.clearNotifications();
 
+      case 'notification.markRead':
+        return this.markNotificationRead(params?.id as string);
+
+      case 'notification.delete':
+        return this.deleteNotification(params?.id as string);
+
       // Fire-and-forget
       case 'prompt.fire':
         return this.fireAndForget(
@@ -298,6 +325,16 @@ class Daemon {
           params?.hostId as string | undefined,
           params?.goal as string | undefined
         );
+
+      // Telegram bot
+      case 'telegram.setup':
+        return this.setupTelegram(params?.token as string);
+
+      case 'telegram.stop':
+        return this.stopTelegram();
+
+      case 'telegram.status':
+        return this.getTelegramStatus();
 
       default:
         return { error: `Unknown method: ${method}` };
@@ -469,9 +506,10 @@ class Daemon {
       };
       session.on('prompt.completed', completionHandler);
 
-      // Listen for notification events to write to inbox
+      // Listen for notification events to write to inbox + forward to Telegram
       const notificationHandler = (notifData: NotificationInput) => {
         this.notificationInbox.addNotification(notifData).catch(() => {});
+        this.forwardToTelegram(notifData);
         session!.off('notification', notificationHandler);
       };
       session.on('notification', notificationHandler);
@@ -793,6 +831,71 @@ class Daemon {
     return { data: { cleared } };
   }
 
+  private async markNotificationRead(id: string): Promise<{ data?: Record<string, unknown>; error?: string }> {
+    if (!id) return { error: 'Notification ID is required' };
+    const marked = await this.notificationInbox.markRead(id);
+    return { data: { success: marked } };
+  }
+
+  private async deleteNotification(id: string): Promise<{ data?: Record<string, unknown>; error?: string }> {
+    if (!id) return { error: 'Notification ID is required' };
+    const deleted = await this.notificationInbox.deleteNotification(id);
+    return { data: { success: deleted } };
+  }
+
+  // Telegram methods
+  private async setupTelegram(token: string): Promise<{ data?: Record<string, unknown>; error?: string }> {
+    if (!token) return { error: 'Token is required' };
+
+    try {
+      if (this.telegramBot.isRunning()) {
+        await this.telegramBot.stop();
+      }
+      const info = await this.telegramBot.start(token);
+      this.log(`Telegram bot started: @${info.username}`);
+      return { data: { success: true, username: info.username } };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : 'Failed to start Telegram bot' };
+    }
+  }
+
+  private async stopTelegram(): Promise<{ data?: Record<string, unknown>; error?: string }> {
+    try {
+      await this.telegramBot.stop();
+      this.log('Telegram bot stopped');
+      return { data: { success: true } };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : 'Failed to stop Telegram bot' };
+    }
+  }
+
+  private getTelegramStatus(): { data?: Record<string, unknown>; error?: string } {
+    const running = this.telegramBot.isRunning();
+    const config = this.telegramBot.getConfig();
+    return {
+      data: {
+        running,
+        enabled: config.enabled,
+        chatIds: config.chatIds,
+      },
+    };
+  }
+
+  private forwardToTelegram(notification: {
+    sessionId: string;
+    sessionName?: string;
+    type: string;
+    goal?: string;
+    exitCode: number | null;
+    durationMs?: number;
+    costUsd?: number;
+    resultPreview?: string;
+  }): void {
+    if (this.telegramBot.isRunning()) {
+      this.telegramBot.broadcastNotification(notification).catch(() => {});
+    }
+  }
+
   // Fire-and-forget methods
   private async fireAndForget(
     prompt: string,
@@ -816,6 +919,7 @@ class Daemon {
       const completionHandler = (info: { promptId?: string; code?: number }) => {
         if (info.promptId === promptId) {
           const structured = session.getStructuredResult();
+          const fullResult = structured?.result || session.getLastOutput();
           this.notificationInbox.addNotification({
             sessionId: session.id,
             sessionName: session.name,
@@ -824,9 +928,23 @@ class Daemon {
             exitCode: info.code ?? null,
             durationMs: structured?.durationMs,
             costUsd: structured?.costUsd,
-            resultPreview: structured?.result?.slice(0, 200) || session.getLastOutput().slice(0, 200),
+            resultPreview: fullResult.slice(0, 200),
+            resultFull: fullResult.slice(0, 50000),
+            claudeSessionId: session.getClaudeSessionId(),
             viewCommand: `cb -l`,
           }).catch(() => {});
+
+          // Forward to Telegram
+          this.forwardToTelegram({
+            sessionId: session.id,
+            sessionName: session.name,
+            type: info.code === 0 || info.code === null ? 'prompt.completed' : 'prompt.error',
+            goal: session.goal,
+            exitCode: info.code ?? null,
+            durationMs: structured?.durationMs,
+            costUsd: structured?.costUsd,
+            resultPreview: fullResult.slice(0, 200),
+          });
 
           this.hookEngine.dispatch('prompt.completed', {
             sessionId: session.id,
@@ -861,26 +979,31 @@ class Daemon {
       hostId,
       timeout: 600000
     }).then(async (result) => {
-      await this.notificationInbox.addNotification({
+      const notif = {
         sessionId: result.sessionId,
         sessionName: `remote:${result.host}`,
-        type: result.status === 'completed' ? 'prompt.completed' : 'prompt.error',
+        type: (result.status === 'completed' ? 'prompt.completed' : 'prompt.error') as 'prompt.completed' | 'prompt.error',
         goal: taskGoal,
         exitCode: result.status === 'completed' ? 0 : 1,
         durationMs: result.latency,
         resultPreview: result.output?.slice(0, 200),
+        resultFull: result.output?.slice(0, 50000),
         viewCommand: `cb -i`,
-      });
+      };
+      await this.notificationInbox.addNotification(notif);
+      this.forwardToTelegram(notif);
     }).catch(async (error) => {
-      await this.notificationInbox.addNotification({
+      const notif = {
         sessionId: trackingId,
         sessionName: `remote:${hostId || 'auto'}`,
-        type: 'prompt.error',
+        type: 'prompt.error' as const,
         goal: taskGoal,
         exitCode: 1,
         resultPreview: error instanceof Error ? error.message : String(error),
         viewCommand: `cb -i`,
-      });
+      };
+      await this.notificationInbox.addNotification(notif);
+      this.forwardToTelegram(notif);
     });
 
     return { data: { trackingId, goal: taskGoal, status: 'dispatched' } };
@@ -916,6 +1039,11 @@ class Daemon {
       await this.restServer.stop();
       this.hookEngine.dispatch('rest.stopped', {}).catch(() => {});
       this.restServer = null;
+    }
+
+    // Stop Telegram bot
+    if (this.telegramBot.isRunning()) {
+      await this.telegramBot.stop();
     }
 
     // Stop orchestration

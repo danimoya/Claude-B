@@ -13,6 +13,8 @@ export interface Notification {
   durationMs?: number;
   costUsd?: number;
   resultPreview?: string;
+  resultFull?: string;         // full output (capped 50KB)
+  claudeSessionId?: string;   // Claude Code session UUID for resume
   viewCommand: string;
   read: boolean;
 }
@@ -57,6 +59,23 @@ export class NotificationInbox {
     const marked = all.map(n => ({ ...n, read: true }));
     await this.writeAll(marked);
     return unreadCount;
+  }
+
+  async markRead(id: string): Promise<boolean> {
+    const all = await this.readAll();
+    const notification = all.find(n => n.id === id);
+    if (!notification || notification.read) return false;
+    notification.read = true;
+    await this.writeAll(all);
+    return true;
+  }
+
+  async deleteNotification(id: string): Promise<boolean> {
+    const all = await this.readAll();
+    const filtered = all.filter(n => n.id !== id);
+    if (filtered.length === all.length) return false;
+    await this.writeAll(filtered);
+    return true;
   }
 
   async count(): Promise<{ total: number; unread: number }> {

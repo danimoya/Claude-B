@@ -505,6 +505,10 @@ export class Session extends EventEmitter {
       proc.unref();
     } catch { /* ignore */ }
 
+    // Full result (capped at 50KB)
+    const fullResult = this.lastStructuredResult?.result || this.lastOutput || '';
+    const resultFull = fullResult.slice(0, 50000);
+
     // Channel 3: Emit structured notification event (daemon writes to inbox)
     this.emit('notification', {
       sessionId: this.id,
@@ -515,6 +519,8 @@ export class Session extends EventEmitter {
       durationMs: this.lastStructuredResult?.durationMs,
       costUsd: this.lastStructuredResult?.costUsd,
       resultPreview,
+      resultFull,
+      claudeSessionId: this.claudeSessionId,
       viewCommand: viewCmd,
     });
 

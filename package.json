@@ -25,12 +25,14 @@
     "fastify": "^5.0.0",
     "nanoid": "^5.0.7",
     "node-pty": "^1.0.0",
+    "node-telegram-bot-api": "^0.67.0",
     "ora": "^8.1.0",
     "strip-ansi": "^7.1.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@types/node-telegram-bot-api": "^0.64.13",
     "@types/ws": "^8.18.1",
     "@typescript-eslint/eslint-plugin": "^8.53.0",
     "@typescript-eslint/parser": "^8.53.0",
