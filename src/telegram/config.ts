@@ -7,6 +7,11 @@ export interface AIProviderConfig {
   model?: string;
 }
 
+export interface STTProviderConfig {
+  provider: 'speechmatics' | 'deepgram' | 'openai';
+  apiKey: string;
+}
+
 export interface PendingPrompt {
   chatId: string;
   sessionId: string;
@@ -21,7 +26,8 @@ export interface TelegramConfig {
   chatIds: string[];
   sessionMap: Record<string, string>; // telegramMessageId -> claudeSessionId
   // Voice pipeline
-  speechmaticsApiKey?: string;
+  speechmaticsApiKey?: string;  // Legacy — use sttProvider instead
+  sttProvider?: STTProviderConfig;
   aiProvider?: AIProviderConfig;
   pendingPrompts: Record<string, PendingPrompt>; // messageId -> pending
   resultMap: Record<string, string>; // messageId -> result text (for TTS)
@@ -54,6 +60,11 @@ export class TelegramConfigManager {
     try {
       const content = await readFile(this.configPath, 'utf-8');
       this.config = { ...DEFAULT_CONFIG, ...JSON.parse(content) };
+      // Auto-migrate legacy speechmaticsApiKey → sttProvider
+      if (this.config.speechmaticsApiKey && !this.config.sttProvider) {
+        this.config.sttProvider = { provider: 'speechmatics', apiKey: this.config.speechmaticsApiKey };
+        await this.save();
+      }
     } catch {
       this.config = { ...DEFAULT_CONFIG };
     }
@@ -107,9 +118,18 @@ export class TelegramConfigManager {
   }
 
   // Voice config
-  async setSpeechmaticsKey(key: string): Promise<void> {
-    this.config.speechmaticsApiKey = key;
+  async setSTTProvider(config: STTProviderConfig): Promise<void> {
+    this.config.sttProvider = config;
+    // Keep legacy field in sync for backward compat
+    if (config.provider === 'speechmatics') {
+      this.config.speechmaticsApiKey = config.apiKey;
+    }
     await this.save();
+  }
+
+  /** @deprecated Use setSTTProvider instead */
+  async setSpeechmaticsKey(key: string): Promise<void> {
+    await this.setSTTProvider({ provider: 'speechmatics', apiKey: key });
   }
 
   async setAIProvider(config: AIProviderConfig): Promise<void> {

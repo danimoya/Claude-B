@@ -12,6 +12,7 @@ import { NotificationInbox, NotificationInput } from '../notifications/inbox.js'
 import { ClaudeBTelegramBot } from '../telegram/bot.js';
 import { VoicePipeline } from '../telegram/voice.js';
 import { createAIProvider } from '../telegram/ai-provider.js';
+import { createSTTTTSProvider } from '../telegram/stt-tts-provider.js';
 
 interface DaemonConfig {
   socketPath: string;
@@ -89,16 +90,14 @@ class Daemon {
 
   private async initVoicePipeline(): Promise<void> {
     const config = this.telegramBot.getConfigManager().get();
-    if (config.speechmaticsApiKey && config.aiProvider) {
+    if (config.sttProvider && config.aiProvider) {
       try {
+        const tempDir = `${this.config.configDir}/voice-temp`;
+        const sttProvider = createSTTTTSProvider(config.sttProvider, tempDir);
         const aiProvider = createAIProvider(config.aiProvider);
-        const pipeline = new VoicePipeline({
-          speechmaticsApiKey: config.speechmaticsApiKey,
-          aiProvider,
-          tempDir: `${this.config.configDir}/voice-temp`,
-        });
+        const pipeline = new VoicePipeline({ sttProvider, aiProvider });
         this.telegramBot.setVoicePipeline(pipeline);
-        this.log('Voice pipeline initialized');
+        this.log(`Voice pipeline initialized (STT: ${config.sttProvider.provider})`);
       } catch (err) {
         this.log(`Voice pipeline init failed: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -397,7 +396,7 @@ class Daemon {
 
       // Voice pipeline
       case 'voice.setup':
-        return this.setupVoice(params?.speechmaticsKey as string);
+        return this.setupVoice(params?.provider as string, params?.apiKey as string);
 
       case 'voice.ai':
         return this.setupVoiceAI(
@@ -961,17 +960,21 @@ class Daemon {
     };
   }
 
-  private async setupVoice(speechmaticsKey: string): Promise<{ data?: Record<string, unknown>; error?: string }> {
-    if (!speechmaticsKey) return { error: 'Speechmatics API key is required' };
+  private async setupVoice(provider: string, apiKey: string): Promise<{ data?: Record<string, unknown>; error?: string }> {
+    if (!provider || !apiKey) return { error: 'Provider and API key are required' };
+    const validProviders = ['speechmatics', 'deepgram', 'openai'];
+    if (!validProviders.includes(provider)) {
+      return { error: `Provider must be one of: ${validProviders.join(', ')}` };
+    }
 
     try {
       const configManager = this.telegramBot.getConfigManager();
-      await configManager.setSpeechmaticsKey(speechmaticsKey);
+      await configManager.setSTTProvider({ provider: provider as 'speechmatics' | 'deepgram' | 'openai', apiKey });
       // Re-init voice pipeline if AI provider is already configured
       await this.initVoicePipeline();
-      return { data: { success: true, configured: true } };
+      return { data: { success: true, provider } };
     } catch (error) {
-      return { error: error instanceof Error ? error.message : 'Failed to configure Speechmatics' };
+      return { error: error instanceof Error ? error.message : 'Failed to configure STT provider' };
     }
   }
 
@@ -1001,12 +1004,14 @@ class Daemon {
     const config = configManager.get();
     return {
       data: {
-        speechmaticsConfigured: !!config.speechmaticsApiKey,
+        sttProvider: config.sttProvider ? {
+          provider: config.sttProvider.provider,
+        } : null,
         aiProvider: config.aiProvider ? {
           provider: config.aiProvider.provider,
           model: config.aiProvider.model || 'default',
         } : null,
-        pipelineActive: !!config.speechmaticsApiKey && !!config.aiProvider,
+        pipelineActive: !!config.sttProvider && !!config.aiProvider,
       },
     };
   }

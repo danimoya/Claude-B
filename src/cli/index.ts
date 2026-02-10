@@ -177,7 +177,7 @@ program
   .option('--telegram-stop', 'Disable Telegram notifications')
   .option('--telegram-status', 'Show Telegram bot status')
   // Voice pipeline
-  .option('--voice-setup <key>', 'Configure Speechmatics API key for voice')
+  .option('--voice-setup <provider>', 'Configure STT provider: speechmatics, deepgram, or openai')
   .option('--ai-provider <config>', 'Set AI provider: "anthropic <key>" or "openrouter <key>"')
   .option('--voice-status', 'Show voice pipeline status')
   // Shell integration
@@ -395,7 +395,12 @@ program
 
       // Voice pipeline commands
       if (options.voiceSetup) {
-        await setupVoicePipeline(client, options.voiceSetup);
+        const apiKey = promptParts[0];
+        if (!apiKey) {
+          console.error(chalk.red('Usage: cb --voice-setup <speechmatics|deepgram|openai> <api-key>'));
+          process.exit(1);
+        }
+        await setupVoicePipeline(client, options.voiceSetup, apiKey);
         return;
       }
 
@@ -1534,9 +1539,9 @@ fi
 }
 
 // Voice pipeline functions
-async function setupVoicePipeline(client: DaemonClient, speechmaticsKey: string): Promise<void> {
-  console.log(chalk.gray('Configuring Speechmatics API key...'));
-  const result = await client.send({ method: 'voice.setup', params: { speechmaticsKey } });
+async function setupVoicePipeline(client: DaemonClient, provider: string, apiKey: string): Promise<void> {
+  console.log(chalk.gray(`Configuring STT provider (${provider})...`));
+  const result = await client.send({ method: 'voice.setup', params: { provider, apiKey } });
   client.close();
 
   if (result.error) {
@@ -1544,7 +1549,7 @@ async function setupVoicePipeline(client: DaemonClient, speechmaticsKey: string)
     process.exit(1);
   }
 
-  console.log(chalk.green('Speechmatics API key configured!'));
+  console.log(chalk.green(`STT provider configured: ${provider}`));
   console.log('');
   console.log(chalk.gray('Next: set up an AI provider for prompt optimization:'));
   console.log(chalk.gray('  cb --ai-provider anthropic <api-key>'));
@@ -1581,13 +1586,18 @@ async function showVoiceStatus(client: DaemonClient): Promise<void> {
   }
 
   const data = result.data as {
-    speechmaticsConfigured?: boolean;
+    sttProvider?: { provider: string } | null;
     aiProvider?: { provider: string; model: string } | null;
     pipelineActive?: boolean;
   };
 
   console.log(chalk.bold('Voice Pipeline:'));
-  console.log(`  Speechmatics: ${data.speechmaticsConfigured ? chalk.green('configured') : chalk.gray('not configured')}`);
+
+  if (data.sttProvider) {
+    console.log(`  STT Provider: ${chalk.green(data.sttProvider.provider)}`);
+  } else {
+    console.log(`  STT Provider: ${chalk.gray('not configured')}`);
+  }
 
   if (data.aiProvider) {
     console.log(`  AI Provider: ${chalk.green(data.aiProvider.provider)} (${chalk.cyan(data.aiProvider.model)})`);
@@ -1597,10 +1607,10 @@ async function showVoiceStatus(client: DaemonClient): Promise<void> {
 
   console.log(`  Pipeline: ${data.pipelineActive ? chalk.green('active') : chalk.yellow('inactive')}`);
 
-  if (!data.speechmaticsConfigured || !data.aiProvider) {
+  if (!data.sttProvider || !data.aiProvider) {
     console.log('');
-    if (!data.speechmaticsConfigured) {
-      console.log(chalk.gray('  Set up STT: cb --voice-setup <speechmatics-key>'));
+    if (!data.sttProvider) {
+      console.log(chalk.gray('  Set up STT: cb --voice-setup <speechmatics|deepgram|openai> <api-key>'));
     }
     if (!data.aiProvider) {
       console.log(chalk.gray('  Set up AI: cb --ai-provider <anthropic|openrouter> <api-key>'));
