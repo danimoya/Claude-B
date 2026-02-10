@@ -10,6 +10,8 @@ import { HookEventType } from '../hooks/events.js';
 import { OrchestrationManager, createHost } from '../orchestration/index.js';
 import { NotificationInbox, NotificationInput } from '../notifications/inbox.js';
 import { ClaudeBTelegramBot } from '../telegram/bot.js';
+import { VoicePipeline } from '../telegram/voice.js';
+import { createAIProvider } from '../telegram/ai-provider.js';
 
 interface DaemonConfig {
   socketPath: string;
@@ -72,7 +74,35 @@ class Daemon {
       },
       getSessions: () => this.sessionManager.list(),
       getInboxCount: () => this.notificationInbox.count(),
+      getSessionContext: (sessionId: string) => {
+        const session = this.sessionManager.get(sessionId);
+        if (!session) return undefined;
+        return {
+          sessionName: session.name,
+          goal: session.goal,
+          lastOutput: session.getLastOutput().slice(-2000),
+          status: session.status,
+        };
+      },
     });
+  }
+
+  private async initVoicePipeline(): Promise<void> {
+    const config = this.telegramBot.getConfigManager().get();
+    if (config.speechmaticsApiKey && config.aiProvider) {
+      try {
+        const aiProvider = createAIProvider(config.aiProvider);
+        const pipeline = new VoicePipeline({
+          speechmaticsApiKey: config.speechmaticsApiKey,
+          aiProvider,
+          tempDir: `${this.config.configDir}/voice-temp`,
+        });
+        this.telegramBot.setVoicePipeline(pipeline);
+        this.log('Voice pipeline initialized');
+      } catch (err) {
+        this.log(`Voice pipeline init failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   }
 
   async start(): Promise<void> {
@@ -126,6 +156,8 @@ class Daemon {
     try {
       await this.telegramBot.start();
       this.log('Telegram bot started');
+      // Initialize voice pipeline if configured
+      await this.initVoicePipeline();
     } catch {
       // No token configured or invalid — that's fine
     }
@@ -362,6 +394,20 @@ class Daemon {
 
       case 'telegram.status':
         return this.getTelegramStatus();
+
+      // Voice pipeline
+      case 'voice.setup':
+        return this.setupVoice(params?.speechmaticsKey as string);
+
+      case 'voice.ai':
+        return this.setupVoiceAI(
+          params?.provider as string,
+          params?.apiKey as string,
+          params?.model as string | undefined
+        );
+
+      case 'voice.status':
+        return this.getVoiceStatus();
 
       default:
         return { error: `Unknown method: ${method}` };
@@ -905,6 +951,56 @@ class Daemon {
         running,
         enabled: config.enabled,
         chatIds: config.chatIds,
+      },
+    };
+  }
+
+  private async setupVoice(speechmaticsKey: string): Promise<{ data?: Record<string, unknown>; error?: string }> {
+    if (!speechmaticsKey) return { error: 'Speechmatics API key is required' };
+
+    try {
+      const configManager = this.telegramBot.getConfigManager();
+      await configManager.setSpeechmaticsKey(speechmaticsKey);
+      // Re-init voice pipeline if AI provider is already configured
+      await this.initVoicePipeline();
+      return { data: { success: true, configured: true } };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : 'Failed to configure Speechmatics' };
+    }
+  }
+
+  private async setupVoiceAI(
+    provider: string,
+    apiKey: string,
+    model?: string
+  ): Promise<{ data?: Record<string, unknown>; error?: string }> {
+    if (!provider || !apiKey) return { error: 'Provider and API key are required' };
+    if (provider !== 'anthropic' && provider !== 'openrouter') {
+      return { error: 'Provider must be "anthropic" or "openrouter"' };
+    }
+
+    try {
+      const configManager = this.telegramBot.getConfigManager();
+      await configManager.setAIProvider({ provider: provider as 'anthropic' | 'openrouter', apiKey, model });
+      // Re-init voice pipeline if Speechmatics is already configured
+      await this.initVoicePipeline();
+      return { data: { success: true, provider, model: model || 'default' } };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : 'Failed to configure AI provider' };
+    }
+  }
+
+  private getVoiceStatus(): { data?: Record<string, unknown>; error?: string } {
+    const configManager = this.telegramBot.getConfigManager();
+    const config = configManager.get();
+    return {
+      data: {
+        speechmaticsConfigured: !!config.speechmaticsApiKey,
+        aiProvider: config.aiProvider ? {
+          provider: config.aiProvider.provider,
+          model: config.aiProvider.model || 'default',
+        } : null,
+        pipelineActive: !!config.speechmaticsApiKey && !!config.aiProvider,
       },
     };
   }
