@@ -33,9 +33,22 @@ export class SessionManager {
       const data = await readFile(this.indexPath, 'utf-8');
       const index: SessionIndex = JSON.parse(data);
 
+      let staleCount = 0;
       for (const state of index.sessions) {
+        // Reset stale "busy" sessions — no process survives a daemon restart
+        if (state.status === 'busy') {
+          state.status = 'idle';
+          staleCount++;
+        }
         const session = new Session(state, this.configDir);
+        // Load persisted output buffer from disk
+        await session.loadPersistedOutput();
         this.sessions.set(session.id, session);
+      }
+
+      if (staleCount > 0) {
+        console.log(`[SessionManager] Reset ${staleCount} stale busy session(s) to idle`);
+        await this.save();
       }
 
       if (index.selectedId && this.sessions.has(index.selectedId)) {

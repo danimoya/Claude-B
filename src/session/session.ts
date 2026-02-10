@@ -93,6 +93,41 @@ export class Session extends EventEmitter {
     this.lastActivityAt = state.lastActivityAt || state.createdAt;
   }
 
+  /**
+   * Load persisted output from disk (call after constructor for restored sessions).
+   */
+  async loadPersistedOutput(): Promise<void> {
+    try {
+      const outputPath = `${this.sessionDir}/last-output.txt`;
+      if (existsSync(outputPath)) {
+        this.lastOutput = await readFile(outputPath, 'utf-8');
+      }
+    } catch { /* ignore */ }
+
+    try {
+      const resultPath = `${this.sessionDir}/last-result.json`;
+      if (existsSync(resultPath)) {
+        const data = await readFile(resultPath, 'utf-8');
+        this.lastStructuredResult = JSON.parse(data);
+      }
+    } catch { /* ignore */ }
+  }
+
+  /**
+   * Persist last output and structured result to disk.
+   */
+  private async persistOutput(): Promise<void> {
+    try {
+      await this.ensureSessionDir();
+      if (this.lastOutput) {
+        await writeFile(`${this.sessionDir}/last-output.txt`, this.lastOutput);
+      }
+      if (this.lastStructuredResult) {
+        await writeFile(`${this.sessionDir}/last-result.json`, JSON.stringify(this.lastStructuredResult));
+      }
+    } catch { /* ignore */ }
+  }
+
   static create(name: string | undefined, configDir: string, model?: string, goal?: string, fireAndForget?: boolean): Session {
     const now = new Date().toISOString();
     const state: SessionState = {
@@ -278,6 +313,9 @@ export class Session extends EventEmitter {
       }).catch(() => {});
     }
 
+    // Persist output to disk for restart recovery
+    this.persistOutput().catch(() => {});
+
     // Notify watchers that processing completed
     this.broadcastStatus('completed', { promptId: this.lastPromptId });
 
@@ -296,6 +334,9 @@ export class Session extends EventEmitter {
     if (this.isProcessing) {
       this.status = 'idle';
       this.lastOutput = this.currentPromptOutput.join('');
+
+      // Persist output to disk for restart recovery
+      this.persistOutput().catch(() => {});
 
       // Notify watchers that processing completed
       this.broadcastStatus('completed', { promptId: this.lastPromptId, exitCode: code });
