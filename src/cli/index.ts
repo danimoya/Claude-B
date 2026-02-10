@@ -165,6 +165,13 @@ program
   .option('--remote-health', 'Show health status of remote hosts')
   .option('--remote-stats', 'Show orchestration statistics')
   .option('--remote <hostId>', 'Send prompt to specific remote host')
+  // Fire-and-forget and notifications
+  .option('-f, --fire', 'Fire and forget (launch task in background, no watching)')
+  .option('-g, --goal <description>', 'Goal/objective for fire-and-forget task (use with -f)')
+  .option('-i, --inbox', 'Show notification inbox (completed tasks)')
+  .option('--inbox-clear', 'Mark all notifications as read')
+  .option('--inbox-count', 'Show unread notification count')
+  .option('--remote-fire <hostId>', 'Fire and forget to remote host')
   .action(async (promptParts: string[], options) => {
     const client = new DaemonClient();
 
@@ -338,10 +345,41 @@ program
         return;
       }
 
-      // If we have a prompt, send it
+      // Notification inbox commands
+      if (options.inbox) {
+        await showInbox(client);
+        return;
+      }
+
+      if (options.inboxClear) {
+        await clearInbox(client);
+        return;
+      }
+
+      if (options.inboxCount) {
+        await showInboxCount(client);
+        return;
+      }
+
+      // Remote fire-and-forget
+      if (options.remoteFire) {
+        if (promptParts.length === 0) {
+          console.error(chalk.red('Prompt required for remote fire-and-forget'));
+          return;
+        }
+        const prompt = promptParts.join(' ');
+        await fireRemotePrompt(client, options.remoteFire, prompt, options.goal);
+        return;
+      }
+
+      // If we have a prompt, send it (or fire-and-forget)
       if (promptParts.length > 0) {
         const prompt = promptParts.join(' ');
-        await sendPrompt(client, prompt);
+        if (options.fire) {
+          await fireAndForgetPrompt(client, prompt, options.goal);
+        } else {
+          await sendPrompt(client, prompt);
+        }
         return;
       }
 
@@ -616,7 +654,21 @@ async function sendPrompt(client: DaemonClient, prompt: string): Promise<void> {
   });
 
   // Listen for output and display it
+  // When using --output-format json, stdout is a JSON blob - extract the result field
+  let jsonAccumulator = '';
   client.on('output', (outputData: { content: string }) => {
+    jsonAccumulator += outputData.content;
+    // Try to parse as complete JSON (from --output-format json)
+    try {
+      const parsed = JSON.parse(jsonAccumulator.trim());
+      if (parsed.result !== undefined) {
+        process.stdout.write(parsed.result);
+        jsonAccumulator = '';
+        return;
+      }
+    } catch {
+      // Not complete JSON yet or not JSON at all - display raw for streaming
+    }
     process.stdout.write(outputData.content);
   });
 
@@ -984,6 +1036,139 @@ async function sendRemotePrompt(client: DaemonClient, hostId: string, prompt: st
   if (data.error) {
     console.log('');
     console.error(chalk.red(`Error: ${data.error}`));
+  }
+  process.exit(0);
+}
+
+// Fire-and-forget functions
+async function fireAndForgetPrompt(client: DaemonClient, prompt: string, goal?: string): Promise<void> {
+  const result = await client.send({
+    method: 'prompt.fire',
+    params: { prompt, goal }
+  });
+  client.close();
+
+  if (result.error) {
+    console.error(chalk.red(result.error));
+    process.exit(1);
+  }
+
+  const data = result.data as { sessionId: string; promptId: string; goal: string };
+  console.log(chalk.green('Task launched in background'));
+  console.log(`  Session: ${chalk.cyan(data.sessionId)}`);
+  console.log(`  Goal: ${chalk.gray(data.goal)}`);
+  console.log('');
+  console.log(chalk.gray('Check status:'));
+  console.log(`  ${chalk.yellow('cb -i')}          ${chalk.gray('# notification inbox')}`);
+  console.log(`  ${chalk.yellow('cb -l')}          ${chalk.gray('# view output')}`);
+  console.log(`  ${chalk.yellow('cb -w')}          ${chalk.gray('# watch live')}`);
+  process.exit(0);
+}
+
+async function fireRemotePrompt(client: DaemonClient, hostId: string, prompt: string, goal?: string): Promise<void> {
+  const result = await client.send({
+    method: 'orchestration.fire',
+    params: { hostId, prompt, goal }
+  });
+  client.close();
+
+  if (result.error) {
+    console.error(chalk.red(result.error));
+    process.exit(1);
+  }
+
+  const data = result.data as { trackingId: string; goal: string };
+  console.log(chalk.green('Remote task dispatched'));
+  console.log(`  Host: ${chalk.cyan(hostId)}`);
+  console.log(`  Goal: ${chalk.gray(data.goal)}`);
+  console.log('');
+  console.log(`  ${chalk.yellow('cb -i')}  ${chalk.gray('# check when done')}`);
+  process.exit(0);
+}
+
+// Notification inbox functions
+interface InboxNotification {
+  id: string;
+  timestamp: string;
+  sessionId: string;
+  sessionName?: string;
+  type: string;
+  goal?: string;
+  exitCode: number | null;
+  durationMs?: number;
+  costUsd?: number;
+  resultPreview?: string;
+  viewCommand: string;
+  read: boolean;
+}
+
+async function showInbox(client: DaemonClient): Promise<void> {
+  const result = await client.send({ method: 'notification.list', params: { unreadOnly: false } });
+  client.close();
+
+  if (result.error) {
+    console.error(chalk.red(result.error));
+    process.exit(1);
+  }
+
+  const data = result.data as { notifications: InboxNotification[] };
+  const notifications = data.notifications || [];
+
+  if (notifications.length === 0) {
+    console.log(chalk.gray('No notifications'));
+    process.exit(0);
+  }
+
+  console.log(chalk.bold('Notification Inbox:'));
+  console.log('');
+
+  for (const n of [...notifications].reverse()) {
+    const readMarker = n.read ? ' ' : chalk.green('*');
+    const statusIcon = n.type === 'prompt.completed' ? chalk.green('OK') : chalk.red('ERR');
+    const duration = n.durationMs ? `${(n.durationMs / 1000).toFixed(1)}s` : '';
+    const cost = n.costUsd ? `$${n.costUsd.toFixed(4)}` : '';
+    const time = new Date(n.timestamp).toLocaleTimeString();
+
+    console.log(`${readMarker} ${statusIcon} ${chalk.cyan(n.sessionName || n.sessionId)} ${chalk.gray(time)} ${chalk.gray(duration)} ${chalk.gray(cost)}`);
+    if (n.goal) {
+      console.log(`    ${chalk.gray(n.goal)}`);
+    }
+    if (n.resultPreview) {
+      const preview = n.resultPreview.slice(0, 80);
+      console.log(`    ${chalk.gray(preview)}${n.resultPreview.length > 80 ? '...' : ''}`);
+    }
+    console.log(`    ${chalk.yellow(n.viewCommand)}`);
+    console.log('');
+  }
+
+  process.exit(0);
+}
+
+async function clearInbox(client: DaemonClient): Promise<void> {
+  const result = await client.send({ method: 'notification.clear' });
+  client.close();
+  if (result.error) {
+    console.error(chalk.red(result.error));
+    process.exit(1);
+  }
+  const data = result.data as { cleared: number };
+  console.log(chalk.green(`Marked ${data.cleared} notification${data.cleared !== 1 ? 's' : ''} as read`));
+  process.exit(0);
+}
+
+async function showInboxCount(client: DaemonClient): Promise<void> {
+  const result = await client.send({ method: 'notification.count' });
+  client.close();
+  if (result.error) {
+    console.error(chalk.red(result.error));
+    process.exit(1);
+  }
+  const data = result.data as { total: number; unread: number };
+  if (data.unread > 0) {
+    console.log(chalk.yellow(`${data.unread} unread notification${data.unread !== 1 ? 's' : ''} (${data.total} total)`));
+    console.log(chalk.gray('View with: cb -i'));
+  } else {
+    console.log(chalk.gray(`No unread notifications (${data.total} total)`));
   }
   process.exit(0);
 }

@@ -59,8 +59,8 @@ export class SessionManager {
     await writeFile(this.indexPath, JSON.stringify(index, null, 2));
   }
 
-  async create(name?: string, model?: string): Promise<Session> {
-    const session = Session.create(name, this.configDir, model);
+  async create(name?: string, model?: string, goal?: string, fireAndForget?: boolean): Promise<Session> {
+    const session = Session.create(name, this.configDir, model, goal, fireAndForget);
     this.sessions.set(session.id, session);
 
     // Auto-select if no session is selected
@@ -98,6 +98,9 @@ export class SessionManager {
     status: string;
     selected: boolean;
     createdAt: string;
+    goal?: string;
+    fireAndForget?: boolean;
+    claudeSessionId?: string;
   }> {
     return Array.from(this.sessions.values()).map(session => ({
       id: session.id,
@@ -105,7 +108,10 @@ export class SessionManager {
       model: session.model,
       status: session.status,
       selected: session.id === this.selectedId,
-      createdAt: session.createdAt
+      createdAt: session.createdAt,
+      goal: session.goal,
+      fireAndForget: session.fireAndForget,
+      claudeSessionId: session.getClaudeSessionId(),
     }));
   }
 

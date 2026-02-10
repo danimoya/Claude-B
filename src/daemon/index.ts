@@ -2,11 +2,13 @@ import { createServer, Server, Socket } from 'net';
 import { homedir } from 'os';
 import { mkdir, writeFile, unlink, readFile } from 'fs/promises';
 import { existsSync } from 'fs';
+import { nanoid } from 'nanoid';
 import { SessionManager } from './session-manager.js';
 import { RestServer } from '../rest/server.js';
 import { HookEngine } from '../hooks/engine.js';
 import { HookEventType } from '../hooks/events.js';
 import { OrchestrationManager, createHost } from '../orchestration/index.js';
+import { NotificationInbox, NotificationInput } from '../notifications/inbox.js';
 
 interface DaemonConfig {
   socketPath: string;
@@ -26,6 +28,7 @@ class Daemon {
   private sessionManager: SessionManager;
   private hookEngine: HookEngine;
   private orchestrationManager: OrchestrationManager;
+  private notificationInbox: NotificationInbox;
   private clients: Set<Socket> = new Set();
   private startTime: number = Date.now();
   private restServer: RestServer | null = null;
@@ -45,6 +48,7 @@ class Daemon {
     this.sessionManager = new SessionManager(configDir);
     this.hookEngine = new HookEngine(configDir);
     this.orchestrationManager = new OrchestrationManager(configDir);
+    this.notificationInbox = new NotificationInbox(configDir);
   }
 
   async start(): Promise<void> {
@@ -269,6 +273,32 @@ class Daemon {
           params?.sessionId as string | undefined
         );
 
+      // Notification inbox
+      case 'notification.list':
+        return this.listNotifications(params?.unreadOnly as boolean | undefined);
+
+      case 'notification.count':
+        return this.getNotificationCount();
+
+      case 'notification.clear':
+        return this.clearNotifications();
+
+      // Fire-and-forget
+      case 'prompt.fire':
+        return this.fireAndForget(
+          params?.prompt as string,
+          params?.name as string | undefined,
+          params?.goal as string | undefined,
+          params?.model as string | undefined
+        );
+
+      case 'orchestration.fire':
+        return this.fireRemotePrompt(
+          params?.prompt as string,
+          params?.hostId as string | undefined,
+          params?.goal as string | undefined
+        );
+
       default:
         return { error: `Unknown method: ${method}` };
     }
@@ -438,6 +468,13 @@ class Daemon {
         }
       };
       session.on('prompt.completed', completionHandler);
+
+      // Listen for notification events to write to inbox
+      const notificationHandler = (notifData: NotificationInput) => {
+        this.notificationInbox.addNotification(notifData).catch(() => {});
+        session!.off('notification', notificationHandler);
+      };
+      session.on('notification', notificationHandler);
 
       return { data: { promptId, sessionId: session.id } };
     } catch (error) {
@@ -736,6 +773,117 @@ class Daemon {
     } catch (error) {
       return { error: error instanceof Error ? error.message : 'Failed to send remote prompt' };
     }
+  }
+
+  // Notification inbox methods
+  private async listNotifications(unreadOnly?: boolean): Promise<{ data?: Record<string, unknown>; error?: string }> {
+    const notifications = unreadOnly
+      ? await this.notificationInbox.getUnread()
+      : await this.notificationInbox.getAll(50);
+    return { data: { notifications } };
+  }
+
+  private async getNotificationCount(): Promise<{ data?: Record<string, unknown>; error?: string }> {
+    const counts = await this.notificationInbox.count();
+    return { data: counts };
+  }
+
+  private async clearNotifications(): Promise<{ data?: Record<string, unknown>; error?: string }> {
+    const cleared = await this.notificationInbox.markAllRead();
+    return { data: { cleared } };
+  }
+
+  // Fire-and-forget methods
+  private async fireAndForget(
+    prompt: string,
+    name?: string,
+    goal?: string,
+    model?: string
+  ): Promise<{ data?: Record<string, unknown>; error?: string }> {
+    if (!prompt) return { error: 'Prompt is required' };
+
+    try {
+      const session = await this.sessionManager.create(
+        name || `task-${nanoid(4)}`,
+        model,
+        goal || prompt.slice(0, 100),
+        true
+      );
+
+      const promptId = await session.sendPrompt(prompt);
+
+      // Listen for completion to write notification to inbox
+      const completionHandler = (info: { promptId?: string; code?: number }) => {
+        if (info.promptId === promptId) {
+          const structured = session.getStructuredResult();
+          this.notificationInbox.addNotification({
+            sessionId: session.id,
+            sessionName: session.name,
+            type: info.code === 0 || info.code === null ? 'prompt.completed' : 'prompt.error',
+            goal: session.goal,
+            exitCode: info.code ?? null,
+            durationMs: structured?.durationMs,
+            costUsd: structured?.costUsd,
+            resultPreview: structured?.result?.slice(0, 200) || session.getLastOutput().slice(0, 200),
+            viewCommand: `cb -l`,
+          }).catch(() => {});
+
+          this.hookEngine.dispatch('prompt.completed', {
+            sessionId: session.id,
+            promptId,
+            status: info.code === 0 || info.code === null ? 'success' : 'failed',
+            output: session.getLastOutput()
+          }).catch(() => {});
+
+          session.off('prompt.completed', completionHandler);
+        }
+      };
+      session.on('prompt.completed', completionHandler);
+
+      return { data: { sessionId: session.id, promptId, goal: session.goal } };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : 'Failed to fire task' };
+    }
+  }
+
+  private async fireRemotePrompt(
+    prompt: string,
+    hostId?: string,
+    goal?: string
+  ): Promise<{ data?: Record<string, unknown>; error?: string }> {
+    if (!prompt) return { error: 'Prompt is required' };
+
+    const trackingId = nanoid(8);
+    const taskGoal = goal || prompt.slice(0, 100);
+
+    // Fire asynchronously - don't await
+    this.orchestrationManager.sendPrompt(prompt, {
+      hostId,
+      timeout: 600000
+    }).then(async (result) => {
+      await this.notificationInbox.addNotification({
+        sessionId: result.sessionId,
+        sessionName: `remote:${result.host}`,
+        type: result.status === 'completed' ? 'prompt.completed' : 'prompt.error',
+        goal: taskGoal,
+        exitCode: result.status === 'completed' ? 0 : 1,
+        durationMs: result.latency,
+        resultPreview: result.output?.slice(0, 200),
+        viewCommand: `cb -i`,
+      });
+    }).catch(async (error) => {
+      await this.notificationInbox.addNotification({
+        sessionId: trackingId,
+        sessionName: `remote:${hostId || 'auto'}`,
+        type: 'prompt.error',
+        goal: taskGoal,
+        exitCode: 1,
+        resultPreview: error instanceof Error ? error.message : String(error),
+        viewCommand: `cb -i`,
+      });
+    });
+
+    return { data: { trackingId, goal: taskGoal, status: 'dispatched' } };
   }
 
   private log(message: string): void {

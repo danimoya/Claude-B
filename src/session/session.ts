@@ -1,5 +1,6 @@
 import { spawn, ChildProcess } from 'child_process';
 import { Socket } from 'net';
+import { randomUUID } from 'crypto';
 import { nanoid } from 'nanoid';
 import { EventEmitter } from 'events';
 import { mkdir, writeFile, readFile, appendFile } from 'fs/promises';
@@ -14,6 +15,14 @@ try {
   // node-pty not available, will use spawn fallback
 }
 
+export interface StructuredResult {
+  result: string;
+  durationMs: number;
+  costUsd: number;
+  numTurns: number;
+  isError: boolean;
+}
+
 export interface SessionState {
   id: string;
   name?: string;
@@ -23,6 +32,9 @@ export interface SessionState {
   workingDir: string;
   lastPromptId?: string;
   promptCount: number;
+  claudeSessionId?: string;  // Claude Code's own session UUID for conversation continuity
+  goal?: string;             // Task objective for fire-and-forget
+  fireAndForget?: boolean;   // Whether this is a fire-and-forget task
 }
 
 interface PromptEntry {
@@ -39,6 +51,8 @@ export class Session extends EventEmitter {
   public model?: string;
   public status: 'idle' | 'busy' = 'idle';
   public createdAt: string;
+  public goal?: string;
+  public fireAndForget: boolean = false;
 
   private workingDir: string;
   private configDir: string;
@@ -55,6 +69,9 @@ export class Session extends EventEmitter {
   private isProcessing = false;
   private isReady = false;
   private readyResolvers: Array<() => void> = [];
+  private claudeSessionId?: string;
+  private lastStructuredResult?: StructuredResult;
+  private jsonBuffer: string = '';
 
   constructor(state: SessionState, configDir: string) {
     super();
@@ -68,9 +85,12 @@ export class Session extends EventEmitter {
     this.sessionDir = `${configDir}/sessions/${this.id}`;
     this.lastPromptId = state.lastPromptId;
     this.promptCount = state.promptCount || 0;
+    this.claudeSessionId = state.claudeSessionId;
+    this.goal = state.goal;
+    this.fireAndForget = state.fireAndForget || false;
   }
 
-  static create(name: string | undefined, configDir: string, model?: string): Session {
+  static create(name: string | undefined, configDir: string, model?: string, goal?: string, fireAndForget?: boolean): Session {
     const state: SessionState = {
       id: nanoid(8),
       name,
@@ -78,7 +98,9 @@ export class Session extends EventEmitter {
       status: 'idle',
       createdAt: new Date().toISOString(),
       workingDir: process.cwd(),
-      promptCount: 0
+      promptCount: 0,
+      goal,
+      fireAndForget
     };
     return new Session(state, configDir);
   }
@@ -92,8 +114,19 @@ export class Session extends EventEmitter {
       createdAt: this.createdAt,
       workingDir: this.workingDir,
       lastPromptId: this.lastPromptId,
-      promptCount: this.promptCount
+      promptCount: this.promptCount,
+      claudeSessionId: this.claudeSessionId,
+      goal: this.goal,
+      fireAndForget: this.fireAndForget
     };
+  }
+
+  getClaudeSessionId(): string | undefined {
+    return this.claudeSessionId;
+  }
+
+  getStructuredResult(): StructuredResult | undefined {
+    return this.lastStructuredResult;
   }
 
   private async ensureSessionDir(): Promise<void> {
@@ -314,6 +347,7 @@ export class Session extends EventEmitter {
     this.status = 'busy';
     this.isProcessing = true;
     this.currentPromptOutput = [];
+    this.jsonBuffer = '';
 
     // Log the prompt
     await this.savePromptToHistory({
@@ -327,14 +361,20 @@ export class Session extends EventEmitter {
     this.broadcastStatus('processing', { promptId, prompt: prompt.slice(0, 100) });
 
     try {
-      // Always use --print mode for programmatic access
-      // PTY mode doesn't work well with Claude's TUI for automated prompts
-      // Spawn fresh process for each prompt
       const claudePath = getClaudePath();
-      const args = ['--print', '--dangerously-skip-permissions'];
+      const args = ['--print', '--dangerously-skip-permissions', '--output-format', 'json'];
       if (this.model) {
         args.push('--model', this.model);
       }
+
+      // Conversation continuity: resume existing Claude session or create new one
+      if (this.claudeSessionId) {
+        args.push('--resume', this.claudeSessionId);
+      } else {
+        const newSessionId = randomUUID();
+        args.push('--session-id', newSessionId);
+      }
+
       const proc = spawn(claudePath, args, {
         cwd: this.workingDir,
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -344,7 +384,9 @@ export class Session extends EventEmitter {
       this.process = proc;
 
       proc.stdout?.on('data', (chunk: Buffer) => {
-        this.handleOutput(chunk.toString());
+        const text = chunk.toString();
+        this.jsonBuffer += text;
+        this.handleOutput(text);
       });
 
       proc.stderr?.on('data', (chunk: Buffer) => {
@@ -352,6 +394,8 @@ export class Session extends EventEmitter {
       });
 
       proc.on('exit', (code) => {
+        // Parse JSON output before handling exit to extract session_id and structured result
+        this.parseClaudeJsonOutput(this.jsonBuffer);
         this.handleProcessExit(code);
       });
 
@@ -366,6 +410,26 @@ export class Session extends EventEmitter {
       this.isProcessing = false;
       this.status = 'idle';
       this.emit('prompt.error', { promptId, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  private parseClaudeJsonOutput(jsonStr: string): void {
+    try {
+      const parsed = JSON.parse(jsonStr.trim());
+      // Extract and store Claude's session ID for conversation continuity
+      if (parsed.session_id) {
+        this.claudeSessionId = parsed.session_id;
+      }
+      // Store structured result for richer notifications
+      this.lastStructuredResult = {
+        result: parsed.result || '',
+        durationMs: parsed.duration_ms || 0,
+        costUsd: parsed.total_cost_usd || 0,
+        numTurns: parsed.num_turns || 0,
+        isError: parsed.is_error || false,
+      };
+    } catch {
+      // Not valid JSON or partial output - ignore, use raw output
     }
   }
 
@@ -414,20 +478,52 @@ export class Session extends EventEmitter {
   }
 
   private notifyCompletion(code: number | null): void {
-    // Shell notification (using notify-send or similar)
-    const message = code === 0 || code === null
-      ? `Task completed (${this.name || this.id})`
-      : `Task failed with code ${code} (${this.name || this.id})`;
+    const sessionLabel = this.name || this.id;
+    const isSuccess = code === 0 || code === null;
+    const status = isSuccess ? 'completed' : `failed (exit ${code})`;
+    const viewCmd = `cb -l`;
 
+    const durationStr = this.lastStructuredResult?.durationMs
+      ? `${(this.lastStructuredResult.durationMs / 1000).toFixed(1)}s`
+      : '';
+    const costStr = this.lastStructuredResult?.costUsd
+      ? `$${this.lastStructuredResult.costUsd.toFixed(4)}`
+      : '';
+
+    const resultPreview = this.lastStructuredResult?.result?.slice(0, 200)
+      || this.lastOutput?.slice(0, 200)
+      || '';
+
+    // Channel 1: Terminal bell
+    try { process.stdout.write('\x07'); } catch { /* ignore */ }
+
+    // Channel 2: notify-send (desktop, fails silently)
     try {
-      const proc = spawn('notify-send', ['Claude-B', message], { detached: true, stdio: 'ignore' });
-      proc.on('error', () => {
-        // notify-send not available, silently ignore
-      });
+      const desktopMsg = `${sessionLabel}: ${status}\nView: ${viewCmd}`;
+      const proc = spawn('notify-send', ['Claude-B', desktopMsg], { detached: true, stdio: 'ignore' });
+      proc.on('error', () => {});
       proc.unref();
-    } catch {
-      // Notification not available, ignore
-    }
+    } catch { /* ignore */ }
+
+    // Channel 3: Emit structured notification event (daemon writes to inbox)
+    this.emit('notification', {
+      sessionId: this.id,
+      sessionName: this.name,
+      type: isSuccess ? 'prompt.completed' as const : 'prompt.error' as const,
+      goal: this.goal,
+      exitCode: code,
+      durationMs: this.lastStructuredResult?.durationMs,
+      costUsd: this.lastStructuredResult?.costUsd,
+      resultPreview,
+      viewCommand: viewCmd,
+    });
+
+    // Channel 4: Daemon log with copy-paste command
+    const logParts = [`[Claude-B] ${sessionLabel} ${status}`];
+    if (durationStr) logParts.push(durationStr);
+    if (costStr) logParts.push(costStr);
+    logParts.push(`| View: ${viewCmd}`);
+    console.log(logParts.join(' | '));
   }
 
   getLastOutput(): string {
