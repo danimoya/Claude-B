@@ -265,7 +265,7 @@ class Daemon {
         return this.unwatchSession(socket);
 
       case 'prompt.send':
-        return this.sendPrompt(params?.prompt as string);
+        return this.sendPrompt(params?.prompt as string, params?.model as string | undefined);
 
       case 'stdin':
         return this.handleStdin(params?.data as string, socket);
@@ -539,12 +539,12 @@ class Daemon {
     return { data: { success: true } };
   }
 
-  private async sendPrompt(prompt: string): Promise<{ data?: Record<string, unknown>; error?: string }> {
+  private async sendPrompt(prompt: string, model?: string): Promise<{ data?: Record<string, unknown>; error?: string }> {
     let session = this.sessionManager.current();
 
     // Auto-create session if none exists
     if (!session) {
-      const result = await this.createSession();
+      const result = await this.createSession(undefined, model);
       if (result.error) {
         return result;
       }
@@ -553,6 +553,12 @@ class Daemon {
 
     if (!session) {
       return { error: 'Failed to get or create session' };
+    }
+
+    // Apply model override if provided
+    if (model && session.model !== model) {
+      session.model = model;
+      this.sessionManager.save().catch(() => {});
     }
 
     try {

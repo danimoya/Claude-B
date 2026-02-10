@@ -131,7 +131,7 @@ program
   .option('-a, --attach <id>', 'Attach to session (foreground mode)')
   .option('-d, --detach', 'Detach from current session')
   .option('-n, --new [name]', 'Create new session')
-  .option('-m, --model <model>', 'Claude model to use (with --new)')
+  .option('-m, --model <model>', 'Claude model to use')
   .option('-k, --kill <id>', 'Kill/terminate session')
   .option('-w, --watch', 'Watch live output (tail -f style)')
   .option('-x, --select <id>', 'Select session for subsequent commands')
@@ -434,7 +434,7 @@ program
         if (options.fire) {
           await fireAndForgetPrompt(client, prompt, options.goal);
         } else {
-          await sendPrompt(client, prompt);
+          await sendPrompt(client, prompt, options.model);
         }
         return;
       }
@@ -687,15 +687,16 @@ async function showLogs(): Promise<void> {
   process.exit(0);
 }
 
-async function sendPrompt(client: DaemonClient, prompt: string): Promise<void> {
+async function sendPrompt(client: DaemonClient, prompt: string, model?: string): Promise<void> {
   console.log(chalk.gray('Sending prompt...'));
-  const result = await client.send({ method: 'prompt.send', params: { prompt } });
+  const result = await client.send({ method: 'prompt.send', params: { prompt, model } });
   if (result.error) {
     console.error(chalk.red(result.error));
     return;
   }
-  const data = result.data as PromptData | undefined;
-  console.log(chalk.green(`Prompt queued (ID: ${data?.promptId})`));
+  const data = result.data as PromptData & { sessionId?: string } | undefined;
+  const sessionInfo = data?.sessionId ? ` on ${chalk.cyan(data.sessionId)}` : '';
+  console.log(chalk.green(`Prompt queued (ID: ${data?.promptId})${sessionInfo}`));
   console.log(chalk.gray('Watching output (Ctrl+C to detach)...\n'));
 
   // Start watching for output immediately
