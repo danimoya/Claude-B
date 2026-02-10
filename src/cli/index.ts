@@ -180,7 +180,15 @@ program
   .option('--voice-setup <key>', 'Configure Speechmatics API key for voice')
   .option('--ai-provider <config>', 'Set AI provider: "anthropic <key>" or "openrouter <key>"')
   .option('--voice-status', 'Show voice pipeline status')
+  // Shell integration
+  .option('--shell-init', 'Output shell hook for inbox notifications (add to .bashrc/.zshrc)')
   .action(async (promptParts: string[], options) => {
+    // Shell init doesn't need daemon connection
+    if (options.shellInit) {
+      printShellInit();
+      return;
+    }
+
     const client = new DaemonClient();
 
     try {
@@ -1488,6 +1496,43 @@ async function showTelegramStatus(client: DaemonClient): Promise<void> {
     console.log(chalk.gray('Set up with: cb --telegram <token>'));
   }
   process.exit(0);
+}
+
+// Shell integration
+function printShellInit(): void {
+  // Output shell code that works in both bash and zsh
+  // Uses $HOME so it resolves at runtime per-user
+  const script = `
+# Claude-B inbox notification hook
+_cb_check_inbox() {
+  local marker="$HOME/.claude-b/inbox-new"
+  if [ -f "$marker" ]; then
+    local msg
+    msg=$(cat "$marker" 2>/dev/null)
+    rm -f "$marker"
+    printf '\\e[33m[Claude-B]\\e[0m %s — run \\e[1mcb -i\\e[0m to view\\n' "$msg"
+  fi
+}
+
+# Install into the appropriate shell
+if [ -n "$ZSH_VERSION" ]; then
+  autoload -Uz add-zsh-hook 2>/dev/null
+  if typeset -f add-zsh-hook >/dev/null 2>&1; then
+    add-zsh-hook precmd _cb_check_inbox
+  else
+    precmd_functions+=(_cb_check_inbox)
+  fi
+elif [ -n "$BASH_VERSION" ]; then
+  if [[ ! "$PROMPT_COMMAND" =~ _cb_check_inbox ]]; then
+    PROMPT_COMMAND="_cb_check_inbox\${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+  fi
+fi
+`.trim();
+
+  console.log(script);
+  // Print setup instructions to stderr so they don't pollute eval output
+  process.stderr.write('\n# Add to your shell config:\n');
+  process.stderr.write('#   eval "$(cb --shell-init)"    # in ~/.bashrc or ~/.zshrc\n\n');
 }
 
 // Voice pipeline functions

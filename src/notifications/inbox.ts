@@ -1,4 +1,4 @@
-import { appendFile, readFile, writeFile, mkdir } from 'fs/promises';
+import { appendFile, readFile, writeFile, mkdir, unlink } from 'fs/promises';
 import { existsSync } from 'fs';
 import { nanoid } from 'nanoid';
 
@@ -39,7 +39,19 @@ export class NotificationInbox {
       read: false,
     };
     await appendFile(this.inboxPath, JSON.stringify(notification) + '\n');
+    // Write marker file for shell prompt hook (like Postfix "You have new mail")
+    await this.writeMarker(notification);
     return notification;
+  }
+
+  private async writeMarker(notification: Notification): Promise<void> {
+    try {
+      const markerPath = `${this.configDir}/inbox-new`;
+      const label = notification.sessionName || notification.sessionId;
+      const status = notification.type === 'prompt.completed' ? 'completed' : 'failed';
+      const goal = notification.goal ? `: ${notification.goal.slice(0, 60)}` : '';
+      await writeFile(markerPath, `${label} ${status}${goal}\n`);
+    } catch { /* best effort */ }
   }
 
   async getUnread(): Promise<Notification[]> {
@@ -58,6 +70,7 @@ export class NotificationInbox {
     if (unreadCount === 0) return 0;
     const marked = all.map(n => ({ ...n, read: true }));
     await this.writeAll(marked);
+    await this.clearMarker();
     return unreadCount;
   }
 
@@ -67,6 +80,10 @@ export class NotificationInbox {
     if (!notification || notification.read) return false;
     notification.read = true;
     await this.writeAll(all);
+    // Clear marker if no more unread
+    if (!all.some(n => !n.read)) {
+      await this.clearMarker();
+    }
     return true;
   }
 
@@ -84,6 +101,12 @@ export class NotificationInbox {
       total: all.length,
       unread: all.filter(n => !n.read).length,
     };
+  }
+
+  private async clearMarker(): Promise<void> {
+    try {
+      await unlink(`${this.configDir}/inbox-new`);
+    } catch { /* ignore if not exists */ }
   }
 
   private async readAll(): Promise<Notification[]> {
