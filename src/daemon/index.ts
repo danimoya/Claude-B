@@ -57,7 +57,21 @@ class Daemon {
         const session = this.sessionManager.get(sessionId);
         if (!session) throw new Error('Session not found');
         this.sessionManager.select(sessionId);
-        await session.sendPrompt(prompt);
+        const promptId = await session.sendPrompt(prompt);
+
+        // Listen for completion to send result back via Telegram and write to inbox
+        const completionHandler = (info: { promptId?: string; code?: number }) => {
+          if (info.promptId === promptId) {
+            const notificationHandler = (notifData: NotificationInput) => {
+              this.notificationInbox.addNotification(notifData).catch(() => {});
+              this.forwardToTelegram(notifData);
+              session.off('notification', notificationHandler);
+            };
+            session.on('notification', notificationHandler);
+            session.off('prompt.completed', completionHandler);
+          }
+        };
+        session.on('prompt.completed', completionHandler);
       },
       getSessions: () => this.sessionManager.list(),
       getInboxCount: () => this.notificationInbox.count(),
