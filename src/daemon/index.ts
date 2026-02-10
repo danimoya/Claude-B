@@ -33,6 +33,7 @@ class Daemon {
   private telegramBot: ClaudeBTelegramBot;
   private clients: Set<Socket> = new Set();
   private startTime: number = Date.now();
+  private cleanupInterval: ReturnType<typeof setInterval> | null = null;
   private restServer: RestServer | null = null;
   private restConfig: RestConfig = {
     host: process.env.REST_HOST || '127.0.0.1',
@@ -57,21 +58,17 @@ class Daemon {
         const session = this.sessionManager.get(sessionId);
         if (!session) throw new Error('Session not found');
         this.sessionManager.select(sessionId);
-        const promptId = await session.sendPrompt(prompt);
 
-        // Listen for completion to send result back via Telegram and write to inbox
-        const completionHandler = (info: { promptId?: string; code?: number }) => {
-          if (info.promptId === promptId) {
-            const notificationHandler = (notifData: NotificationInput) => {
-              this.notificationInbox.addNotification(notifData).catch(() => {});
-              this.forwardToTelegram(notifData);
-              session.off('notification', notificationHandler);
-            };
-            session.on('notification', notificationHandler);
-            session.off('prompt.completed', completionHandler);
-          }
+        // Register notification listener BEFORE sending prompt to avoid race condition
+        // (notification event fires synchronously right after prompt.completed)
+        const notificationHandler = (notifData: NotificationInput) => {
+          this.notificationInbox.addNotification(notifData).catch(() => {});
+          this.forwardToTelegram(notifData);
+          session.off('notification', notificationHandler);
         };
-        session.on('prompt.completed', completionHandler);
+        session.on('notification', notificationHandler);
+
+        await session.sendPrompt(prompt);
       },
       getSessions: () => this.sessionManager.list(),
       getInboxCount: () => this.notificationInbox.count(),
@@ -108,6 +105,22 @@ class Daemon {
     await this.hookEngine.load();
     await this.orchestrationManager.load();
     this.orchestrationManager.startHealthChecks();
+
+    // Run initial cleanup of expired and completed fire-and-forget sessions
+    const expiredCount = await this.sessionManager.cleanupExpired();
+    const ffCount = await this.sessionManager.cleanupFireAndForget();
+    if (expiredCount > 0 || ffCount > 0) {
+      this.log(`Cleanup: ${expiredCount} expired, ${ffCount} fire-and-forget sessions removed`);
+    }
+
+    // Schedule periodic cleanup every hour
+    this.cleanupInterval = setInterval(async () => {
+      const expired = await this.sessionManager.cleanupExpired();
+      const ff = await this.sessionManager.cleanupFireAndForget();
+      if (expired > 0 || ff > 0) {
+        this.log(`Cleanup: ${expired} expired, ${ff} fire-and-forget sessions removed`);
+      }
+    }, 60 * 60 * 1000);
 
     // Auto-start Telegram bot if configured
     try {
@@ -497,6 +510,26 @@ class Daemon {
     }
 
     try {
+      // Register listeners BEFORE sending prompt to avoid race conditions
+      // (notification fires synchronously right after prompt.completed in same tick)
+      const completionHandler = (info: { promptId?: string; code?: number }) => {
+        this.hookEngine.dispatch('prompt.completed', {
+          sessionId: session!.id,
+          promptId: info.promptId || '',
+          status: info.code === 0 || info.code === null ? 'success' : 'failed',
+          output: session!.getLastOutput()
+        }).catch(() => {});
+        session!.off('prompt.completed', completionHandler);
+      };
+      session.on('prompt.completed', completionHandler);
+
+      const notificationHandler = (notifData: NotificationInput) => {
+        this.notificationInbox.addNotification(notifData).catch(() => {});
+        this.forwardToTelegram(notifData);
+        session!.off('notification', notificationHandler);
+      };
+      session.on('notification', notificationHandler);
+
       const promptId = await session.sendPrompt(prompt);
 
       // Dispatch prompt.received hook
@@ -505,28 +538,6 @@ class Daemon {
         promptId,
         prompt
       }).catch(() => {});
-
-      // Listen for completion to dispatch prompt.completed
-      const completionHandler = (info: { promptId?: string; code?: number }) => {
-        if (info.promptId === promptId) {
-          this.hookEngine.dispatch('prompt.completed', {
-            sessionId: session!.id,
-            promptId,
-            status: info.code === 0 || info.code === null ? 'success' : 'failed',
-            output: session!.getLastOutput()
-          }).catch(() => {});
-          session!.off('prompt.completed', completionHandler);
-        }
-      };
-      session.on('prompt.completed', completionHandler);
-
-      // Listen for notification events to write to inbox + forward to Telegram
-      const notificationHandler = (notifData: NotificationInput) => {
-        this.notificationInbox.addNotification(notifData).catch(() => {});
-        this.forwardToTelegram(notifData);
-        session!.off('notification', notificationHandler);
-      };
-      session.on('notification', notificationHandler);
 
       return { data: { promptId, sessionId: session.id } };
     } catch (error) {
@@ -560,6 +571,9 @@ class Daemon {
         port: this.restConfig.port,
         sessionManager: this.sessionManager,
         hookEngine: this.hookEngine,
+        notificationInbox: this.notificationInbox,
+        telegramBot: this.telegramBot,
+        orchestrationManager: this.orchestrationManager,
         configDir: this.config.configDir
       });
 
@@ -1053,6 +1067,11 @@ class Daemon {
       await this.restServer.stop();
       this.hookEngine.dispatch('rest.stopped', {}).catch(() => {});
       this.restServer = null;
+    }
+
+    // Stop cleanup interval
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
     }
 
     // Stop Telegram bot

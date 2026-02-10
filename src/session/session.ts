@@ -29,6 +29,7 @@ export interface SessionState {
   model?: string;  // Claude model to use (e.g., 'claude-3-opus', 'claude-3-sonnet')
   status: 'idle' | 'busy';
   createdAt: string;
+  lastActivityAt: string;    // Last prompt sent or completed
   workingDir: string;
   lastPromptId?: string;
   promptCount: number;
@@ -53,6 +54,7 @@ export class Session extends EventEmitter {
   public createdAt: string;
   public goal?: string;
   public fireAndForget: boolean = false;
+  public lastActivityAt: string;
 
   private workingDir: string;
   private configDir: string;
@@ -88,15 +90,18 @@ export class Session extends EventEmitter {
     this.claudeSessionId = state.claudeSessionId;
     this.goal = state.goal;
     this.fireAndForget = state.fireAndForget || false;
+    this.lastActivityAt = state.lastActivityAt || state.createdAt;
   }
 
   static create(name: string | undefined, configDir: string, model?: string, goal?: string, fireAndForget?: boolean): Session {
+    const now = new Date().toISOString();
     const state: SessionState = {
       id: nanoid(8),
       name,
       model,
       status: 'idle',
-      createdAt: new Date().toISOString(),
+      createdAt: now,
+      lastActivityAt: now,
       workingDir: process.cwd(),
       promptCount: 0,
       goal,
@@ -112,6 +117,7 @@ export class Session extends EventEmitter {
       model: this.model,
       status: this.status,
       createdAt: this.createdAt,
+      lastActivityAt: this.lastActivityAt,
       workingDir: this.workingDir,
       lastPromptId: this.lastPromptId,
       promptCount: this.promptCount,
@@ -258,6 +264,7 @@ export class Session extends EventEmitter {
 
     this.isProcessing = false;
     this.status = 'idle';
+    this.lastActivityAt = new Date().toISOString();
     this.lastOutput = this.currentPromptOutput.join('');
 
     // Save to history
@@ -345,6 +352,7 @@ export class Session extends EventEmitter {
     this.lastPromptId = promptId;
     this.promptCount++;
     this.status = 'busy';
+    this.lastActivityAt = new Date().toISOString();
     this.isProcessing = true;
     this.currentPromptOutput = [];
     this.jsonBuffer = '';
@@ -533,6 +541,20 @@ export class Session extends EventEmitter {
   }
 
   getLastOutput(): string {
+    // Return parsed result if available (from --output-format json)
+    if (this.lastStructuredResult?.result) {
+      return this.lastStructuredResult.result;
+    }
+    // Fall back to raw output, attempting JSON parse
+    const raw = this.lastOutput || this.outputBuffer.join('');
+    try {
+      const parsed = JSON.parse(raw.trim());
+      if (parsed.result !== undefined) return parsed.result;
+    } catch { /* not JSON */ }
+    return raw;
+  }
+
+  getLastRawOutput(): string {
     return this.lastOutput || this.outputBuffer.join('');
   }
 
@@ -648,6 +670,9 @@ export class Session extends EventEmitter {
 
     this.attachedSockets.clear();
     this.watchingSockets.clear();
+
+    // Remove all external event listeners to prevent memory leaks
+    this.removeAllListeners();
   }
 
   async exportTranscript(): Promise<string> {

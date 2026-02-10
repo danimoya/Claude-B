@@ -81,23 +81,26 @@ export class ClaudeBTelegramBot extends EventEmitter {
     const duration = notification.durationMs ? `${(notification.durationMs / 1000).toFixed(1)}s` : '';
     const cost = notification.costUsd ? ` · $${notification.costUsd.toFixed(4)}` : '';
 
-    let text = `${icon} *${escapeMarkdown(name)}* ${status}`;
-    if (duration) text += ` (${duration}${cost})`;
-    text += '\n';
+    // Build plain text message (safe for any content)
+    const lines: string[] = [];
+    lines.push(`${icon} ${name} ${status}${duration ? ` (${duration}${cost})` : ''}`);
 
     if (notification.goal) {
-      text += `\n_Goal: ${escapeMarkdown(notification.goal)}_\n`;
+      lines.push(`Goal: ${notification.goal}`);
     }
 
     if (notification.resultPreview) {
-      const preview = notification.resultPreview.slice(0, 500);
-      text += `\n\`\`\`\n${preview}\n\`\`\`\n`;
+      lines.push('');
+      lines.push(notification.resultPreview.slice(0, 500));
     }
 
-    text += `\nReply to follow up, or /select ${notification.sessionId.slice(0, 8)} to switch sessions.`;
+    lines.push('');
+    lines.push(`Reply to follow up, or /select ${notification.sessionId.slice(0, 8)}`);
+
+    const text = lines.join('\n');
 
     try {
-      const sent = await this.bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+      const sent = await this.bot.sendMessage(chatId, text);
 
       // Map this message to the session for reply routing
       await this.configManager.mapMessage(String(sent.message_id), notification.sessionId);
@@ -134,38 +137,51 @@ export class ClaudeBTelegramBot extends EventEmitter {
     return { enabled: config.enabled, chatIds: config.chatIds };
   }
 
+  // Safe send: try Markdown, fall back to plain text on parse error
+  private async safeSend(chatId: string, text: string, markdown = false): Promise<void> {
+    if (!this.bot) return;
+    try {
+      await this.bot.sendMessage(chatId, text, markdown ? { parse_mode: 'Markdown' } : {});
+    } catch {
+      // If Markdown fails, retry as plain text
+      if (markdown) {
+        try { await this.bot.sendMessage(chatId, text); } catch { /* give up */ }
+      }
+    }
+  }
+
   private async handleStart(msg: TelegramBot.Message): Promise<void> {
     const chatId = String(msg.chat.id);
     await this.configManager.addChatId(chatId);
 
     const text = [
-      '🤖 *Claude-B Telegram Integration*',
+      '🤖 Claude-B Telegram Integration',
       '',
-      'You are now registered for notifications\\.',
+      'You are now registered for notifications.',
       '',
-      '*Commands:*',
-      '/sessions \\- List active sessions',
-      '/select <id> \\- Select session for replies',
-      '/inbox \\- Show notification inbox',
-      '/help \\- Show this help',
+      'Commands:',
+      '/sessions - List active sessions',
+      '/select <id> - Select session for replies',
+      '/inbox - Show notification inbox',
+      '/help - Show this help',
       '',
-      'Send any text to prompt the selected session\\.',
+      'Send any text to prompt the selected session.',
     ].join('\n');
 
-    await this.bot?.sendMessage(chatId, text, { parse_mode: 'MarkdownV2' });
+    await this.safeSend(chatId, text);
   }
 
   private async handleSessions(msg: TelegramBot.Message): Promise<void> {
     const chatId = String(msg.chat.id);
 
     if (!this.options.getSessions) {
-      await this.bot?.sendMessage(chatId, 'Session listing not available');
+      await this.safeSend(chatId, 'Session listing not available');
       return;
     }
 
     const sessions = this.options.getSessions();
     if (sessions.length === 0) {
-      await this.bot?.sendMessage(chatId, 'No active sessions');
+      await this.safeSend(chatId, 'No active sessions');
       return;
     }
 
@@ -173,11 +189,11 @@ export class ClaudeBTelegramBot extends EventEmitter {
     const lines = sessions.map(s => {
       const marker = s.id === selected ? '▸ ' : '  ';
       const name = s.name ? ` (${s.name})` : '';
-      return `${marker}\`${s.id.slice(0, 8)}\`${name} [${s.status}]`;
+      return `${marker}${s.id.slice(0, 8)}${name} [${s.status}]`;
     });
 
-    const text = `*Sessions:*\n\n${lines.join('\n')}\n\nUse /select <id> to choose one.`;
-    await this.bot?.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+    const text = `Sessions:\n\n${lines.join('\n')}\n\nUse /select <id> to choose one.`;
+    await this.safeSend(chatId, text);
   }
 
   private async handleSelect(msg: TelegramBot.Message, match: RegExpMatchArray | null): Promise<void> {
@@ -185,7 +201,7 @@ export class ClaudeBTelegramBot extends EventEmitter {
     const sessionId = match?.[1]?.trim();
 
     if (!sessionId) {
-      await this.bot?.sendMessage(chatId, 'Usage: /select <session-id>');
+      await this.safeSend(chatId, 'Usage: /select <session-id>');
       return;
     }
 
@@ -196,36 +212,36 @@ export class ClaudeBTelegramBot extends EventEmitter {
       if (found) {
         this.selectedSession.set(chatId, found.id);
         const name = found.name ? ` (${found.name})` : '';
-        await this.bot?.sendMessage(chatId, `Selected session: \`${found.id.slice(0, 8)}\`${name}`, { parse_mode: 'Markdown' });
+        await this.safeSend(chatId, `Selected session: ${found.id.slice(0, 8)}${name}`);
         return;
       }
     }
 
     // Store as-is if we can't verify
     this.selectedSession.set(chatId, sessionId);
-    await this.bot?.sendMessage(chatId, `Selected session: \`${sessionId}\``, { parse_mode: 'Markdown' });
+    await this.safeSend(chatId, `Selected session: ${sessionId}`);
   }
 
   private async handleInbox(msg: TelegramBot.Message): Promise<void> {
     const chatId = String(msg.chat.id);
 
     if (!this.options.getInboxCount) {
-      await this.bot?.sendMessage(chatId, 'Inbox not available');
+      await this.safeSend(chatId, 'Inbox not available');
       return;
     }
 
     const counts = await this.options.getInboxCount();
     const text = counts.unread > 0
-      ? `📬 ${counts.unread} unread notification${counts.unread !== 1 ? 's' : ''} (${counts.total} total)\n\nUse \`cb -i\` on the server for full inbox.`
+      ? `📬 ${counts.unread} unread notification${counts.unread !== 1 ? 's' : ''} (${counts.total} total)\n\nUse cb -i on the server for full inbox.`
       : `📭 No unread notifications (${counts.total} total)`;
 
-    await this.bot?.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+    await this.safeSend(chatId, text);
   }
 
   private async handleHelp(msg: TelegramBot.Message): Promise<void> {
     const chatId = String(msg.chat.id);
     const text = [
-      '🤖 *Claude-B Commands*',
+      '🤖 Claude-B Commands',
       '',
       '/sessions - List active sessions',
       '/select <id> - Select session for replies',
@@ -236,7 +252,7 @@ export class ClaudeBTelegramBot extends EventEmitter {
       'Reply to a notification to follow up on that session.',
     ].join('\n');
 
-    await this.bot?.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+    await this.safeSend(chatId, text);
   }
 
   private async handleMessage(msg: TelegramBot.Message): Promise<void> {
@@ -247,12 +263,12 @@ export class ClaudeBTelegramBot extends EventEmitter {
     // Check if authorized
     const config = this.configManager.get();
     if (!config.chatIds.includes(chatId)) {
-      await this.bot?.sendMessage(chatId, 'Not authorized. Send /start first.');
+      await this.safeSend(chatId, 'Not authorized. Send /start first.');
       return;
     }
 
     if (!this.options.onPrompt) {
-      await this.bot?.sendMessage(chatId, 'Prompt routing not available');
+      await this.safeSend(chatId, 'Prompt routing not available');
       return;
     }
 
@@ -271,20 +287,16 @@ export class ClaudeBTelegramBot extends EventEmitter {
     }
 
     if (!targetSession) {
-      await this.bot?.sendMessage(chatId, 'No session selected. Use /select <id> or reply to a notification.');
+      await this.safeSend(chatId, 'No session selected. Use /select <id> or reply to a notification.');
       return;
     }
 
     try {
       await this.options.onPrompt(targetSession, text);
-      await this.bot?.sendMessage(chatId, `⏳ Prompt queued for session \`${targetSession.slice(0, 8)}\``, { parse_mode: 'Markdown' });
+      await this.safeSend(chatId, `⏳ Prompt queued for session ${targetSession.slice(0, 8)}`);
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      await this.bot?.sendMessage(chatId, `❌ Error: ${errMsg}`);
+      await this.safeSend(chatId, `❌ Error: ${errMsg}`);
     }
   }
-}
-
-function escapeMarkdown(text: string): string {
-  return text.replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
 }

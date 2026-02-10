@@ -144,6 +144,67 @@ export class SessionManager {
     await this.save();
   }
 
+  // Remove idle sessions older than maxAge (default: 30 days)
+  async cleanupExpired(maxAgeMs: number = 30 * 24 * 60 * 60 * 1000): Promise<number> {
+    const now = Date.now();
+    const expired: string[] = [];
+
+    for (const [id, session] of this.sessions) {
+      if (session.status === 'busy') continue; // don't kill active sessions
+      const lastActive = new Date(session.lastActivityAt || session.createdAt).getTime();
+      if (now - lastActive > maxAgeMs) {
+        expired.push(id);
+      }
+    }
+
+    for (const id of expired) {
+      const session = this.sessions.get(id);
+      if (session) {
+        await session.stop();
+        this.sessions.delete(id);
+        if (this.selectedId === id) {
+          this.selectedId = this.sessions.size > 0
+            ? this.sessions.keys().next().value || null
+            : null;
+        }
+      }
+    }
+
+    if (expired.length > 0) {
+      await this.save();
+    }
+    return expired.length;
+  }
+
+  // Remove completed fire-and-forget sessions that are idle
+  async cleanupFireAndForget(): Promise<number> {
+    const completed: string[] = [];
+
+    for (const [id, session] of this.sessions) {
+      if (session.fireAndForget && session.status === 'idle' && session.getState().promptCount > 0) {
+        completed.push(id);
+      }
+    }
+
+    for (const id of completed) {
+      const session = this.sessions.get(id);
+      if (session) {
+        await session.stop();
+        this.sessions.delete(id);
+        if (this.selectedId === id) {
+          this.selectedId = this.sessions.size > 0
+            ? this.sessions.keys().next().value || null
+            : null;
+        }
+      }
+    }
+
+    if (completed.length > 0) {
+      await this.save();
+    }
+    return completed.length;
+  }
+
   getAttachedSession(socket: Socket): Session | undefined {
     const sessionId = this.attachedSessions.get(socket);
     if (!sessionId) return undefined;

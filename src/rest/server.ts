@@ -5,16 +5,25 @@ import fastifyRateLimit from '@fastify/rate-limit';
 import fastifyWebsocket from '@fastify/websocket';
 import { SessionManager } from '../daemon/session-manager.js';
 import { HookEngine } from '../hooks/engine.js';
+import { NotificationInbox } from '../notifications/inbox.js';
+import { ClaudeBTelegramBot } from '../telegram/bot.js';
+import { OrchestrationManager } from '../orchestration/index.js';
 import { AuthManager } from './auth.js';
 import { registerSessionRoutes } from './routes/sessions.js';
 import { registerAuthRoutes } from './routes/auth.js';
 import { registerHookRoutes } from './routes/hooks.js';
+import { registerNotificationRoutes } from './routes/notifications.js';
+import { registerTelegramRoutes } from './routes/telegram.js';
+import { registerOrchestrationRoutes } from './routes/orchestration.js';
 
 export interface RestServerOptions {
   host: string;
   port: number;
   sessionManager: SessionManager;
   hookEngine?: HookEngine;
+  notificationInbox?: NotificationInbox;
+  telegramBot?: ClaudeBTelegramBot;
+  orchestrationManager?: OrchestrationManager;
   configDir: string;
 }
 
@@ -22,6 +31,9 @@ export class RestServer {
   private app: FastifyInstance;
   private sessionManager: SessionManager;
   private hookEngine: HookEngine | null;
+  private notificationInbox: NotificationInbox | null;
+  private telegramBot: ClaudeBTelegramBot | null;
+  private orchestrationManager: OrchestrationManager | null;
   private authManager: AuthManager;
   private host: string;
   private port: number;
@@ -31,6 +43,9 @@ export class RestServer {
     this.port = options.port;
     this.sessionManager = options.sessionManager;
     this.hookEngine = options.hookEngine || null;
+    this.notificationInbox = options.notificationInbox || null;
+    this.telegramBot = options.telegramBot || null;
+    this.orchestrationManager = options.orchestrationManager || null;
     this.authManager = new AuthManager(options.configDir);
 
     this.app = Fastify({
@@ -96,6 +111,21 @@ export class RestServer {
     // Register hook routes if hook engine is available
     if (this.hookEngine) {
       await registerHookRoutes(this.app, this.hookEngine);
+    }
+
+    // Register notification routes if inbox is available
+    if (this.notificationInbox) {
+      await registerNotificationRoutes(this.app, this.notificationInbox);
+    }
+
+    // Register telegram routes if bot is available
+    if (this.telegramBot) {
+      await registerTelegramRoutes(this.app, this.telegramBot);
+    }
+
+    // Register orchestration routes if manager is available
+    if (this.orchestrationManager) {
+      await registerOrchestrationRoutes(this.app, this.orchestrationManager);
     }
   }
 
