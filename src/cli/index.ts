@@ -1530,9 +1530,6 @@ fi
 `.trim();
 
   console.log(script);
-  // Print setup instructions to stderr so they don't pollute eval output
-  process.stderr.write('\n# Add to your shell config:\n');
-  process.stderr.write('#   eval "$(cb --shell-init)"    # in ~/.bashrc or ~/.zshrc\n\n');
 }
 
 // Voice pipeline functions
