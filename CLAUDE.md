@@ -15,20 +15,31 @@ Claude-B is a background-capable wrapper around Claude Code enabling async AI wo
 - `cb -n` - New session
 - `cb -x <id>` - Select session
 - `cb -r` - Start REST API
+- `cb -f <prompt>` - Fire-and-forget
+- `cb -i` - Interactive inbox
+- `cb --telegram <token>` - Setup Telegram
+- `cb --telegram-status` - Telegram status
+- `cb --inbox-count` - Unread count
 
 ### Architecture
-- **CLI** (`src/cli/`) - User interface
+- **CLI** (`src/cli/`) - User interface + interactive inbox TUI
 - **Daemon** (`src/daemon/`) - Background process manager
-- **Session** (`src/session/`) - Session state & persistence
-- **REST** (`src/rest/`) - HTTP/WebSocket API (planned)
-- **Hooks** (`src/hooks/`) - Event system (planned)
+- **Session** (`src/session/`) - Session state & conversation continuity
+- **Notifications** (`src/notifications/`) - JSONL-based inbox
+- **Telegram** (`src/telegram/`) - Bot + config for Telegram integration
+- **REST** (`src/rest/`) - HTTP/WebSocket API
+- **Hooks** (`src/hooks/`) - Shell hooks & webhooks
+- **Orchestration** (`src/orchestration/`) - Multi-host coordination
 
 ### Key Files
-- `src/cli/index.ts` - CLI entry point
-- `src/daemon/index.ts` - Daemon entry
+- `src/cli/index.ts` - CLI entry point + interactive inbox
+- `src/daemon/index.ts` - Daemon entry + IPC handlers
 - `src/daemon/session-manager.ts` - Session lifecycle
 - `src/daemon/client.ts` - IPC client for CLI
 - `src/session/session.ts` - Session class wrapping Claude Code
+- `src/notifications/inbox.ts` - Notification inbox store
+- `src/telegram/bot.ts` - Telegram bot implementation
+- `src/telegram/config.ts` - Telegram config persistence
 
 ### Development
 ```bash
@@ -62,6 +73,8 @@ Response:
 ### Storage Locations
 - Config: `~/.claude-b/config.json`
 - Sessions: `~/.claude-b/sessions/`
+- Notifications: `~/.claude-b/notifications.jsonl`
+- Telegram: `~/.claude-b/telegram.json`
 - Logs: `~/.claude-b/daemon.log`
 - Socket: `~/.claude-b/daemon.sock`
 - PID: `~/.claude-b/daemon.pid`

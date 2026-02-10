@@ -9,12 +9,15 @@
 Claude-B is a background-capable wrapper around [Claude Code](https://claude.ai/code) that enables:
 
 - **Async workflows** - Send prompts, continue working, check results when ready
-- **Session management** - Multiple concurrent AI sessions
+- **Session management** - Multiple concurrent AI sessions with conversation continuity
+- **Fire-and-forget** - Launch background tasks, get notified when done
+- **Notification inbox** - Interactive TUI to browse completed tasks with markdown rendering
+- **Telegram integration** - Get notifications and reply to sessions from Telegram
 - **Foreground attach** - Like `fg` in Linux, attach to see live output
 - **Auto-watch streaming** - Automatically streams output after sending prompts
-- **Status feedback** - Real-time processing/completed/error status messages
 - **REST API** - Control sessions remotely via HTTP/WebSocket
 - **Hooks** - Shell hooks and webhooks for notifications and automation
+- **Multi-host orchestration** - Distribute work across multiple Claude-B instances
 
 ## Installation
 
@@ -56,6 +59,8 @@ cb -a main
 
 ## Commands
 
+### Sessions & Prompts
+
 | Command | Short | Description |
 |---------|-------|-------------|
 | `cb <prompt>` | | Send prompt to current session |
@@ -66,88 +71,305 @@ cb -a main
 | `cb --attach <id>` | `-a` | Attach to session (fg-style) |
 | `cb --detach` | `-d` | Detach from session |
 | `cb --new [name]` | `-n` | Create new session |
+| `cb --model <model>` | `-m` | Claude model (with `--new`) |
 | `cb --kill <id>` | `-k` | Terminate session |
 | `cb --watch` | `-w` | Watch live output |
 | `cb --select <id>` | `-x` | Select session for commands |
 | `cb --current` | `-c` | Show current session |
+
+### Fire-and-Forget & Inbox
+
+| Command | Short | Description |
+|---------|-------|-------------|
+| `cb -f <prompt>` | | Launch task in background |
+| `cb -f -g "goal" <prompt>` | | Fire-and-forget with goal description |
+| `cb --inbox` | `-i` | Interactive notification inbox |
+| `cb --inbox-count` | | Show unread notification count |
+| `cb --inbox-clear` | | Mark all notifications as read |
+
+### Telegram
+
+| Command | Description |
+|---------|-------------|
+| `cb --telegram <token>` | Set up Telegram bot with token |
+| `cb --telegram-status` | Show Telegram bot status |
+| `cb --telegram-stop` | Disable Telegram notifications |
+
+### REST API & Hooks
+
+| Command | Short | Description |
+|---------|-------|-------------|
 | `cb --rest [port]` | `-r` | Start REST API server |
 | `cb --rest-stop` | | Stop REST API server |
+| `cb --api-key` | | Show REST API key |
 | `cb --status` | | Daemon status and health |
+| `cb --hook <event> <cmd>` | | Register shell hook |
+| `cb --unhook <id>` | | Remove shell hook |
+| `cb --hooks` | | List shell hooks |
+| `cb --webhook <url>` | | Register webhook |
+| `cb --unwebhook <id>` | | Remove webhook |
+| `cb --webhooks` | | List webhooks |
 
-## Workflows
+### Multi-Host Orchestration
 
-### Basic Async Workflow
+| Command | Description |
+|---------|-------------|
+| `cb --remote-add <url>` | Add remote host (with `--remote-key`) |
+| `cb --remote-hosts` | List remote hosts |
+| `cb --remote-health` | Health status of all hosts |
+| `cb --remote <hostId> <prompt>` | Send prompt to remote host |
+| `cb --remote-fire <hostId> <prompt>` | Fire-and-forget to remote host |
+| `cb --remote-stats` | Orchestration statistics |
+
+## Guides
+
+### Quick Start: Fire-and-Forget
+
+Launch tasks that run in the background and notify you when done:
+
 ```bash
-# Start a task
-cb "Refactor the authentication module"
+# Fire a task
+cb -f "Refactor the authentication module"
 
-# Do other work...
-vim other_file.ts
+# Fire with a descriptive goal
+cb -f -g "Add input validation to all API endpoints" "Review every route handler in src/routes/ and add zod validation"
 
-# Check status
-cb -l
+# Check your inbox for results
+cb -i
 ```
 
-### Multiple Sessions
+When tasks complete, you'll get a terminal bell notification. Use `cb -i` to browse results interactively.
+
+### Quick Start: Interactive Inbox
+
+The inbox (`cb -i`) is a full-screen TUI for browsing completed tasks:
+
+```
+── Inbox (1/3) * unread ──────────────────────────────
+
+  OK  deploy-nginx  14:32  12.3s  $0.004
+  Goal: Deploy nginx config and verify
+
+  Configuration updated successfully.
+  • nginx.conf validated
+  • Service reloaded with zero downtime
+
+  Resume: cb "your follow-up here"
+
+── n=next  p=prev  r=read  d=delete  q=quit ──────────
+```
+
+**Keys:**
+- `n` / `j` / `→` / `↓` — Next notification
+- `p` / `k` / `←` / `↑` — Previous notification
+- `r` — Mark current as read
+- `d` — Delete current notification
+- `q` / `Esc` / `Ctrl+C` — Quit
+
+The inbox renders markdown output (headers, bold, code blocks, lists, quotes) and shows a resume command for continuing the conversation.
+
+### Quick Start: Telegram Integration
+
+Get notifications on your phone and reply to sessions from Telegram.
+
+**Step 1: Create a Telegram bot**
+
+1. Open Telegram and message [@BotFather](https://t.me/BotFather)
+2. Send `/newbot`
+3. Choose a name (e.g., "My Claude-B")
+4. Choose a username (e.g., `my_claudeb_bot`)
+5. Copy the token BotFather gives you (looks like `123456789:ABCdef...`)
+
+**Step 2: Connect to Claude-B**
+
 ```bash
-# Create named sessions
+cb --telegram 123456789:ABCdefGHIjklMNO
+
+# Output:
+#   Telegram bot started!
+#   Bot: @my_claudeb_bot
+#   Send /start to your bot in Telegram to register.
+```
+
+**Step 3: Register in Telegram**
+
+Open your bot in Telegram and send `/start`. You're now registered for notifications.
+
+**Step 4: Use it**
+
+```bash
+# Fire a task — notification will arrive in Telegram
+cb -f "Analyze the codebase for security issues"
+```
+
+When the task completes, you'll get a Telegram message like:
+
+> ✅ **task-a1b2** completed (45.2s)
+>
+> ```
+> Found 3 potential issues in auth module...
+> ```
+>
+> Reply to this message to follow up, or /select a1b2 to switch sessions.
+
+**Telegram commands:**
+- `/start` — Register for notifications
+- `/sessions` — List active sessions
+- `/select <id>` — Select session for replies
+- `/inbox` — Show inbox summary
+- `/help` — Show all commands
+- **Any text** — Send as prompt to selected session
+- **Reply to notification** — Follow up on that specific session
+
+**Manage Telegram:**
+```bash
+cb --telegram-status    # Check if running
+cb --telegram-stop      # Disable and clear token
+```
+
+### Quick Start: Conversation Continuity
+
+Sessions maintain conversation context across prompts — Claude remembers previous interactions:
+
+```bash
+# First prompt creates a conversation
+cb "Explain the authentication flow in this codebase"
+
+# Follow-up prompt continues the same conversation
+cb "Now add rate limiting to the login endpoint"
+
+# Claude remembers the auth flow discussion
+cb "Add tests for what you just implemented"
+```
+
+### Quick Start: Multiple Sessions
+
+```bash
+# Create named sessions for different workstreams
 cb -n backend
 cb -n frontend
 
-# Select and use
+# Switch and work
 cb -x backend
 cb "Add rate limiting to API"
 
 cb -x frontend
 cb "Implement dark mode"
 
-# Check both
+# Check all sessions
 cb -s
+
+# Watch a specific session's live output
+cb -x backend
+cb -w
 ```
 
-### Live Monitoring
+### Quick Start: Hooks & Webhooks
+
 ```bash
-# Watch output as it streams
-cb -w
+# Get a desktop notification when any prompt completes
+cb --hook "prompt.completed" "notify-send 'Claude-B' 'Task done'"
 
-# Or attach for interactive mode
-cb -a backend
+# Send a webhook to Slack on completion
+cb --webhook "https://hooks.slack.com/services/T.../B.../xxx" --webhook-event "prompt.completed"
 
-# Detach with Ctrl+D
+# List active hooks
+cb --hooks
+cb --webhooks
+```
+
+### Quick Start: REST API
+
+```bash
+# Start REST server
+cb -r 3847
+
+# Get API key
+cb --api-key
+
+# Use from any HTTP client
+TOKEN=$(curl -s -X POST http://localhost:3847/api/auth/token \
+  -H "Content-Type: application/json" \
+  -d '{"api_key": "YOUR_KEY"}' | jq -r '.access_token')
+
+curl http://localhost:3847/api/sessions -H "Authorization: Bearer $TOKEN"
+```
+
+### Quick Start: Multi-Host Orchestration
+
+Distribute work across multiple servers running Claude-B:
+
+```bash
+# Each server needs REST API running
+# On server1: cb -r
+# On server2: cb -r
+
+# From your local machine, add remote hosts
+cb --remote-add http://server2:3847 --remote-key <api-key> --remote-name server2
+
+# Send work to specific hosts
+cb --remote server2 "Analyze the database schema"
+
+# Or fire-and-forget to remote hosts
+cb --remote-fire server2 "Run the full test suite"
+
+# Monitor health
+cb --remote-health
+cb --remote-stats
 ```
 
 ### Piped Input
+
 ```bash
 # Send file contents as prompt
 cb < requirements.txt
 
 # Pipe from other commands
 echo "Fix the bug in auth.ts" | cb
+
+# Combine with fire-and-forget
+echo "Analyze this log for errors" | cb -f
 ```
 
 ## Architecture
 
 ```
-┌──────────────┐
-│   cb CLI     │
-└──────┬───────┘
-       │ Unix Socket
-┌──────▼───────┐
-│   Daemon     │
-│              │
-│ ┌──────────┐ │
-│ │ Session  │ │──▶ claude --print
-│ │   Pool   │ │
-│ └──────────┘ │
-└──────────────┘
+┌──────────────┐    ┌────────────────┐
+│   cb CLI     │    │  Telegram Bot  │
+└──────┬───────┘    └───────┬────────┘
+       │ Unix Socket        │
+┌──────▼────────────────────▼──┐
+│           Daemon             │
+│                              │
+│ ┌──────────┐  ┌───────────┐  │
+│ │ Session  │  │   Hooks   │  │     ┌─────────────┐
+│ │   Pool   │  │  Engine   │  │────▶│  Webhooks   │
+│ └────┬─────┘  └───────────┘  │     └─────────────┘
+│      │        ┌───────────┐  │
+│      │        │  Inbox    │  │
+│      │        └───────────┘  │     ┌─────────────┐
+│      │        ┌───────────┐  │────▶│ Remote Host │
+│      │        │  Orch.    │  │     │ Remote Host │
+│      │        └───────────┘  │     └─────────────┘
+│      │                       │
+│ ┌────▼─────┐  ┌───────────┐  │
+│ │  Claude  │  │ REST API  │◀─────── HTTP clients
+│ │   Code   │  └───────────┘  │
+│ └──────────┘                 │
+└──────────────────────────────┘
 ```
 
 ### Components
 
-- **CLI** (`cb`) - Thin client that communicates with daemon
-- **Daemon** - Long-running process managing sessions
-- **Session** - Wraps Claude Code subprocess, manages I/O
-- **IPC** - Unix socket for local communication
+- **CLI** (`cb`) - Thin client with interactive inbox TUI
+- **Daemon** - Long-running process managing sessions, hooks, notifications, and integrations
+- **Session** - Wraps Claude Code subprocess with conversation continuity
+- **Notification Inbox** - JSONL-based store for completion notifications
+- **Telegram Bot** - Sends notifications, receives prompts via Telegram
+- **Hooks Engine** - Shell hooks and webhooks triggered by events
+- **Orchestration** - Multi-host coordination with health checks and failover
+- **REST API** - HTTP/WebSocket API for remote control
+- **IPC** - Unix socket for local CLI-daemon communication
 
 ## Configuration
 
@@ -170,13 +392,18 @@ Config file: `~/.claude-b/config.json`
 
 ```
 ~/.claude-b/
-├── config.json          # Configuration
-├── daemon.pid           # Daemon PID file
-├── daemon.sock          # Unix socket
+├── config.json              # Configuration
+├── daemon.pid               # Daemon PID file
+├── daemon.sock              # Unix socket
+├── daemon.log               # Daemon logs
+├── notifications.jsonl      # Notification inbox (append-only)
+├── telegram.json            # Telegram bot config & session map
 ├── sessions/
-│   ├── index.json       # Session index
-│   └── <session-id>/    # Per-session data
-└── logs/                # Log files
+│   ├── index.json           # Session index
+│   └── <session-id>/        # Per-session data
+│       └── history.jsonl    # Prompt/response history
+└── hooks/
+    └── config.json          # Hook & webhook definitions
 ```
 
 ## Docker
