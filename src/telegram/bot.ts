@@ -91,7 +91,8 @@ export class ClaudeBTelegramBot extends EventEmitter {
 
     if (notification.resultPreview) {
       lines.push('');
-      lines.push(notification.resultPreview.slice(0, 500));
+      // Telegram message limit is 4096 chars; leave room for header/footer
+      lines.push(notification.resultPreview.slice(0, 3000));
     }
 
     lines.push('');

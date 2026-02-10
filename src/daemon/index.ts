@@ -918,9 +918,15 @@ class Daemon {
     durationMs?: number;
     costUsd?: number;
     resultPreview?: string;
+    resultFull?: string;
   }): void {
     if (this.telegramBot.isRunning()) {
-      this.telegramBot.broadcastNotification(notification).catch(() => {});
+      // Use full result for Telegram (up to 3000 chars) instead of the short inbox preview
+      const telegramNotif = {
+        ...notification,
+        resultPreview: notification.resultFull?.slice(0, 3000) || notification.resultPreview
+      };
+      this.telegramBot.broadcastNotification(telegramNotif).catch(() => {});
     }
   }
 
@@ -972,6 +978,7 @@ class Daemon {
             durationMs: structured?.durationMs,
             costUsd: structured?.costUsd,
             resultPreview: fullResult.slice(0, 200),
+            resultFull: fullResult,
           });
 
           this.hookEngine.dispatch('prompt.completed', {

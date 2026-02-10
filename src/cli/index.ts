@@ -410,8 +410,11 @@ program
         if (error.message.includes('ECONNREFUSED') || error.message.includes('ENOENT')) {
           console.error(chalk.yellow('Daemon not running. Starting daemon...'));
           await startDaemon();
-          // Retry the command
-          console.log(chalk.green('Daemon started. Please retry your command.'));
+          await waitForDaemon();
+          console.log(chalk.green('Daemon started. Retrying...'));
+          // Re-run the command by re-parsing argv
+          await program.parseAsync(process.argv);
+          return;
         } else {
           console.error(chalk.red(`Error: ${error.message}`));
         }
@@ -720,6 +723,23 @@ async function startDaemon(): Promise<void> {
     stdio: 'ignore'
   });
   daemon.unref();
+}
+
+async function waitForDaemon(maxWaitMs = 5000): Promise<void> {
+  const interval = 200;
+  const maxAttempts = Math.ceil(maxWaitMs / interval);
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      const testClient = new DaemonClient();
+      const result = await testClient.send({ method: 'status' });
+      testClient.close();
+      if (result.data) return;
+    } catch {
+      // Not ready yet
+    }
+    await new Promise(resolve => setTimeout(resolve, interval));
+  }
+  throw new Error('Daemon failed to start within timeout');
 }
 
 // Hook management functions
