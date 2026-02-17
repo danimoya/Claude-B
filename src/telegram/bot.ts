@@ -20,6 +20,9 @@ export class ClaudeBTelegramBot extends EventEmitter {
   private selectedSession: Map<string, string> = new Map(); // chatId -> sessionId
   private editState: Map<string, string> = new Map(); // chatId -> messageId (awaiting edit)
   private voicePipeline: VoicePipeline | null;
+  private reconnectAttempts = 0;
+  private maxReconnectAttempts = 10;
+  private healthCheckInterval: NodeJS.Timeout | null = null;
 
   constructor(options: TelegramBotOptions) {
     super();
@@ -44,7 +47,23 @@ export class ClaudeBTelegramBot extends EventEmitter {
       await this.configManager.setToken(token);
     }
 
-    this.bot = new TelegramBot(botToken, { polling: true });
+    this.bot = new TelegramBot(botToken, {
+      polling: {
+        interval: 300,
+        autoStart: true,
+        params: {
+          timeout: 60,  // Telegram recommends 60s for long polling
+        },
+      },
+    });
+
+    // Handle polling errors — log + auto-reconnect on transient failures
+    this.bot.on('polling_error', (error) => {
+      console.error(`[Telegram Bot] Polling error: ${error.message}`);
+      if (this.shouldReconnect(error)) {
+        setTimeout(() => this.attemptReconnect(), 5000);
+      }
+    });
 
     // Register command handlers
     this.bot.onText(/\/start/, (msg) => this.handleStart(msg));
@@ -70,14 +89,24 @@ export class ClaudeBTelegramBot extends EventEmitter {
 
     // Get bot info
     const me = await this.bot.getMe();
+    this.reconnectAttempts = 0;
+    this.startHealthCheck();
     return { username: me.username };
   }
 
   async stop(): Promise<void> {
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+      this.healthCheckInterval = null;
+    }
     if (this.bot) {
       await this.bot.stopPolling();
       this.bot = null;
     }
+  }
+
+  async disable(): Promise<void> {
+    await this.stop();
     await this.configManager.disable();
   }
 
@@ -347,7 +376,7 @@ export class ClaudeBTelegramBot extends EventEmitter {
     }
 
     if (!this.voicePipeline) {
-      await this.safeSend(chatId, '🎤 Voice pipeline not configured.\nUse cb --voice-setup <speechmatics-key> on the server.');
+      await this.safeSend(chatId, '🎤 Voice pipeline not configured.\nUse cb --voice-setup <speechmatics|deepgram|openai> <api-key> on the server.');
       return;
     }
 
@@ -535,6 +564,57 @@ export class ClaudeBTelegramBot extends EventEmitter {
       const errMsg = err instanceof Error ? err.message : String(err);
       await this.safeSend(chatId, `🔊 TTS error: ${errMsg}`);
     }
+  }
+
+  // ─── Connection Stability ──────────────────────────────────────────
+
+  private shouldReconnect(error: Error): boolean {
+    const message = error.message.toLowerCase();
+    if (message.includes('unauthorized') || message.includes('not found')) {
+      return false;
+    }
+    if (message.includes('etelegram') || message.includes('timeout') ||
+        message.includes('network') || message.includes('econnrefused') ||
+        message.includes('econnreset') || message.includes('socket')) {
+      return this.reconnectAttempts < this.maxReconnectAttempts;
+    }
+    return false;
+  }
+
+  private async attemptReconnect(): Promise<void> {
+    if (!this.bot || this.reconnectAttempts >= this.maxReconnectAttempts) return;
+
+    this.reconnectAttempts++;
+    const delay = 5000 * this.reconnectAttempts;
+
+    console.log(`[Telegram Bot] Reconnect attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts} in ${delay}ms`);
+
+    try {
+      await this.bot.stopPolling();
+      await new Promise(resolve => setTimeout(resolve, delay));
+      await this.bot.startPolling();
+      this.reconnectAttempts = 0;
+      console.log('[Telegram Bot] Reconnected successfully');
+    } catch (error) {
+      console.error(`[Telegram Bot] Reconnect failed: ${error instanceof Error ? error.message : error}`);
+      if (this.reconnectAttempts < this.maxReconnectAttempts) {
+        setTimeout(() => this.attemptReconnect(), delay);
+      }
+    }
+  }
+
+  private startHealthCheck(): void {
+    if (this.healthCheckInterval) clearInterval(this.healthCheckInterval);
+
+    this.healthCheckInterval = setInterval(async () => {
+      if (!this.bot) return;
+      try {
+        await this.bot.getMe();
+      } catch (error) {
+        console.error(`[Telegram Bot] Health check failed: ${error instanceof Error ? error.message : error}`);
+        this.attemptReconnect();
+      }
+    }, 5 * 60 * 1000);  // Every 5 minutes
   }
 
   // ─── Text Message Handler ─────────────────────────────────────────

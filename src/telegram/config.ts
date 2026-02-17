@@ -25,6 +25,7 @@ export interface TelegramConfig {
   enabled: boolean;
   chatIds: string[];
   sessionMap: Record<string, string>; // telegramMessageId -> claudeSessionId
+  forwardAllSessions?: boolean; // Forward all session completions to Telegram (default: true)
   // Voice pipeline
   speechmaticsApiKey?: string;  // Legacy — use sttProvider instead
   sttProvider?: STTProviderConfig;
@@ -78,6 +79,15 @@ export class TelegramConfigManager {
 
   get(): TelegramConfig {
     return this.config;
+  }
+
+  shouldForwardSession(): boolean {
+    return this.config.forwardAllSessions ?? true;
+  }
+
+  async setForwardAllSessions(enabled: boolean): Promise<void> {
+    this.config.forwardAllSessions = enabled;
+    await this.save();
   }
 
   async setToken(token: string): Promise<void> {

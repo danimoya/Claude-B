@@ -157,8 +157,9 @@ class Daemon {
       this.log('Telegram bot started');
       // Initialize voice pipeline if configured
       await this.initVoicePipeline();
-    } catch {
+    } catch (err) {
       // No token configured or invalid — that's fine
+      this.log(`Telegram bot not started: ${err instanceof Error ? err.message : String(err)}`);
     }
 
     // Create server
@@ -395,6 +396,9 @@ class Daemon {
         return this.getTelegramStatus();
 
       // Voice pipeline
+      case 'telegram.setForward':
+        return this.setTelegramForward(params?.enabled as boolean);
+
       case 'voice.setup':
         return this.setupVoice(params?.provider as string, params?.apiKey as string);
 
@@ -932,6 +936,8 @@ class Daemon {
       }
       const info = await this.telegramBot.start(token);
       this.log(`Telegram bot started: @${info.username}`);
+      // Initialize voice pipeline if STT + AI are configured
+      await this.initVoicePipeline();
       return { data: { success: true, username: info.username } };
     } catch (error) {
       return { error: error instanceof Error ? error.message : 'Failed to start Telegram bot' };
@@ -940,8 +946,8 @@ class Daemon {
 
   private async stopTelegram(): Promise<{ data?: Record<string, unknown>; error?: string }> {
     try {
-      await this.telegramBot.stop();
-      this.log('Telegram bot stopped');
+      await this.telegramBot.disable();
+      this.log('Telegram bot stopped and disabled');
       return { data: { success: true } };
     } catch (error) {
       return { error: error instanceof Error ? error.message : 'Failed to stop Telegram bot' };
@@ -951,13 +957,25 @@ class Daemon {
   private getTelegramStatus(): { data?: Record<string, unknown>; error?: string } {
     const running = this.telegramBot.isRunning();
     const config = this.telegramBot.getConfig();
+    const configManager = this.telegramBot.getConfigManager();
     return {
       data: {
         running,
         enabled: config.enabled,
         chatIds: config.chatIds,
+        forwardAllSessions: configManager.shouldForwardSession(),
       },
     };
+  }
+
+  private async setTelegramForward(enabled: boolean): Promise<{ data?: Record<string, unknown>; error?: string }> {
+    try {
+      const configManager = this.telegramBot.getConfigManager();
+      await configManager.setForwardAllSessions(enabled);
+      return { data: { success: true, enabled } };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : 'Failed to set forward mode' };
+    }
   }
 
   private async setupVoice(provider: string, apiKey: string): Promise<{ data?: Record<string, unknown>; error?: string }> {
@@ -1027,14 +1045,17 @@ class Daemon {
     resultPreview?: string;
     resultFull?: string;
   }): void {
-    if (this.telegramBot.isRunning()) {
-      // Use full result for Telegram (up to 3000 chars) instead of the short inbox preview
-      const telegramNotif = {
-        ...notification,
-        resultPreview: notification.resultFull?.slice(0, 3000) || notification.resultPreview
-      };
-      this.telegramBot.broadcastNotification(telegramNotif).catch(() => {});
-    }
+    if (!this.telegramBot.isRunning()) return;
+
+    const configManager = this.telegramBot.getConfigManager();
+    if (!configManager.shouldForwardSession()) return;
+
+    // Use full result for Telegram (up to 3000 chars) instead of the short inbox preview
+    const telegramNotif = {
+      ...notification,
+      resultPreview: notification.resultFull?.slice(0, 3000) || notification.resultPreview
+    };
+    this.telegramBot.broadcastNotification(telegramNotif).catch(() => {});
   }
 
   // Fire-and-forget methods

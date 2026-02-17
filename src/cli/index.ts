@@ -176,6 +176,7 @@ program
   .option('--telegram <token>', 'Set up Telegram bot with token')
   .option('--telegram-stop', 'Disable Telegram notifications')
   .option('--telegram-status', 'Show Telegram bot status')
+  .option('--telegram-forward <on|off>', 'Toggle forwarding all session completions to Telegram')
   // Voice pipeline
   .option('--voice-setup <provider>', 'Configure STT provider: speechmatics, deepgram, or openai')
   .option('--ai-provider <config>', 'Set AI provider: "anthropic <key>" or "openrouter <key>"')
@@ -390,6 +391,12 @@ program
 
       if (options.telegramStatus) {
         await showTelegramStatus(client);
+        return;
+      }
+
+      if (options.telegramForward) {
+        const enabled = options.telegramForward === 'on';
+        await setTelegramForward(client, enabled);
         return;
       }
 
@@ -1486,7 +1493,7 @@ async function showTelegramStatus(client: DaemonClient): Promise<void> {
     process.exit(1);
   }
 
-  const data = result.data as { running: boolean; enabled: boolean; chatIds: string[] };
+  const data = result.data as { running: boolean; enabled: boolean; chatIds: string[]; forwardAllSessions?: boolean };
   const status = data.running ? chalk.green('running') : chalk.gray('stopped');
   console.log(chalk.bold('Telegram Bot:'));
   console.log(`  Status: ${status}`);
@@ -1496,11 +1503,28 @@ async function showTelegramStatus(client: DaemonClient): Promise<void> {
   } else {
     console.log(chalk.gray('  No registered chats (send /start to your bot)'));
   }
+  if (data.running) {
+    console.log(`  Forwarding: ${data.forwardAllSessions !== false ? chalk.green('all sessions') : chalk.gray('fire-and-forget only')}`);
+  }
 
   if (!data.running && !data.enabled) {
     console.log('');
     console.log(chalk.gray('Set up with: cb --telegram <token>'));
   }
+  process.exit(0);
+}
+
+async function setTelegramForward(client: DaemonClient, enabled: boolean): Promise<void> {
+  const result = await client.send({ method: 'telegram.setForward', params: { enabled } });
+  client.close();
+
+  if (result.error) {
+    console.error(chalk.red(result.error));
+    process.exit(1);
+  }
+
+  const status = enabled ? chalk.green('enabled') : chalk.gray('disabled');
+  console.log(`Telegram session forwarding: ${status}`);
   process.exit(0);
 }
 
