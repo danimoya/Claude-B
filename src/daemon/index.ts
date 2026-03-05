@@ -57,6 +57,12 @@ class Daemon {
     this.notificationInbox = new NotificationInbox(configDir);
     this.telegramBot = new ClaudeBTelegramBot({
       configDir,
+      onCreateSession: async () => {
+        const result = await this.createSession();
+        if (result.error || !result.data) return null;
+        const data = result.data as { sessionId: string; name?: string };
+        return { sessionId: data.sessionId, name: data.name };
+      },
       onPrompt: async (sessionId: string, prompt: string) => {
         const session = this.sessionManager.get(sessionId);
         if (!session) throw new Error('Session not found');

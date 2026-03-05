@@ -7,6 +7,7 @@ import { SessionContext } from './ai-provider.js';
 export interface TelegramBotOptions {
   configDir: string;
   onPrompt?: (sessionId: string, prompt: string) => Promise<void>;
+  onCreateSession?: () => Promise<{ sessionId: string; name?: string } | null>;
   getSessions?: () => Array<{ id: string; name?: string; status: string }>;
   getInboxCount?: () => Promise<{ total: number; unread: number }>;
   getSessionContext?: (sessionId: string) => SessionContext | undefined;
@@ -257,7 +258,7 @@ export class ClaudeBTelegramBot extends EventEmitter {
 
     const sessions = this.options.getSessions();
     if (sessions.length === 0) {
-      await this.safeSend(chatId, 'No active sessions');
+      await this.safeSend(chatId, 'No active sessions. Send a message to create one.');
       return;
     }
 
@@ -268,8 +269,22 @@ export class ClaudeBTelegramBot extends EventEmitter {
       return `${marker}${s.id.slice(0, 8)}${name} [${s.status}]`;
     });
 
-    const text = `Sessions:\n\n${lines.join('\n')}\n\nUse /select <id> to choose one.`;
-    await this.safeSend(chatId, text);
+    // Build inline keyboard — one button per session
+    const keyboard = sessions.map(s => {
+      const label = s.name || s.id.slice(0, 8);
+      const suffix = s.id === selected ? ' ✓' : '';
+      return [{ text: `${label}${suffix}`, callback_data: `select:${s.id}` }];
+    });
+
+    const text = `Sessions:\n\n${lines.join('\n')}`;
+    try {
+      await this.bot!.sendMessage(chatId, text, {
+        reply_markup: { inline_keyboard: keyboard },
+      });
+    } catch {
+      // Fallback to plain text if keyboard fails
+      await this.safeSend(chatId, `${text}\n\nUse /select <id> to choose one.`);
+    }
   }
 
   private async handleSelect(msg: TelegramBot.Message, match: RegExpMatchArray | null): Promise<void> {
@@ -390,9 +405,27 @@ export class ClaudeBTelegramBot extends EventEmitter {
     if (!targetSession) {
       targetSession = this.selectedSession.get(chatId);
     }
+    // Auto-create session if none selected
     if (!targetSession) {
-      await this.safeSend(chatId, 'No session selected. Use /select <id> first.');
-      return;
+      if (!this.options.onCreateSession) {
+        await this.safeSend(chatId, 'No session selected. Use /select <id> first.');
+        return;
+      }
+      try {
+        const created = await this.options.onCreateSession();
+        if (!created) {
+          await this.safeSend(chatId, '❌ Failed to create session');
+          return;
+        }
+        targetSession = created.sessionId;
+        this.selectedSession.set(chatId, targetSession);
+        const label = created.name || targetSession.slice(0, 8);
+        await this.safeSend(chatId, `New session created: ${label}`);
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        await this.safeSend(chatId, `❌ Failed to create session: ${errMsg}`);
+        return;
+      }
     }
 
     // Send status message
@@ -492,6 +525,8 @@ export class ClaudeBTelegramBot extends EventEmitter {
       await this.handleCancelPrompt(chatId, data.slice(7), query.message.message_id);
     } else if (data.startsWith('listen:')) {
       await this.handleListenTTS(chatId, data.slice(7));
+    } else if (data.startsWith('select:')) {
+      await this.handleSelectCallback(chatId, data.slice(7), query.message.message_id);
     }
   }
 
@@ -564,6 +599,44 @@ export class ClaudeBTelegramBot extends EventEmitter {
       const errMsg = err instanceof Error ? err.message : String(err);
       await this.safeSend(chatId, `🔊 TTS error: ${errMsg}`);
     }
+  }
+
+  private async handleSelectCallback(chatId: string, sessionId: string, messageId: number): Promise<void> {
+    // Verify session exists
+    if (this.options.getSessions) {
+      const sessions = this.options.getSessions();
+      const found = sessions.find(s => s.id === sessionId);
+      if (found) {
+        this.selectedSession.set(chatId, found.id);
+        const name = found.name ? ` (${found.name})` : '';
+        // Update the sessions message to reflect new selection
+        const selected = found.id;
+        const lines = sessions.map(s => {
+          const marker = s.id === selected ? '▸ ' : '  ';
+          const sName = s.name ? ` (${s.name})` : '';
+          return `${marker}${s.id.slice(0, 8)}${sName} [${s.status}]`;
+        });
+        const keyboard = sessions.map(s => {
+          const label = s.name || s.id.slice(0, 8);
+          const suffix = s.id === selected ? ' ✓' : '';
+          return [{ text: `${label}${suffix}`, callback_data: `select:${s.id}` }];
+        });
+        try {
+          await this.bot!.editMessageText(`Sessions:\n\n${lines.join('\n')}\n\nSelected: ${found.id.slice(0, 8)}${name}`, {
+            chat_id: chatId,
+            message_id: messageId,
+            reply_markup: { inline_keyboard: keyboard },
+          });
+        } catch {
+          await this.safeSend(chatId, `Selected session: ${found.id.slice(0, 8)}${name}`);
+        }
+        return;
+      }
+    }
+
+    // Fallback — store as-is
+    this.selectedSession.set(chatId, sessionId);
+    await this.safeSend(chatId, `Selected session: ${sessionId.slice(0, 8)}`);
   }
 
   // ─── Connection Stability ──────────────────────────────────────────
@@ -700,9 +773,28 @@ export class ClaudeBTelegramBot extends EventEmitter {
       targetSession = this.selectedSession.get(chatId);
     }
 
+    // Auto-create session if none selected
     if (!targetSession) {
-      await this.safeSend(chatId, 'No session selected. Use /select <id> or reply to a notification.');
-      return;
+      if (!this.options.onCreateSession) {
+        await this.safeSend(chatId, 'No session selected. Use /select <id> or reply to a notification.');
+        return;
+      }
+
+      try {
+        const created = await this.options.onCreateSession();
+        if (!created) {
+          await this.safeSend(chatId, '❌ Failed to create session');
+          return;
+        }
+        targetSession = created.sessionId;
+        this.selectedSession.set(chatId, targetSession);
+        const label = created.name || targetSession.slice(0, 8);
+        await this.safeSend(chatId, `New session created: ${label}`);
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        await this.safeSend(chatId, `❌ Failed to create session: ${errMsg}`);
+        return;
+      }
     }
 
     try {
