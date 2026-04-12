@@ -3,6 +3,7 @@ import { homedir } from 'os';
 import { mkdir, writeFile, unlink, readFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { nanoid } from 'nanoid';
+import { spawn, spawnSync } from 'child_process';
 import { SessionManager } from './session-manager.js';
 import { RestServer } from '../rest/server.js';
 import { HookEngine } from '../hooks/engine.js';
@@ -43,6 +44,13 @@ class Daemon {
     port: parseInt(process.env.REST_PORT || '3847', 10)
   };
 
+  // Maps virtual tmux session ids ("tmux:general:1.0") → Claude Code transcript
+  // path, populated by the cb-notify.sh hook via /api/notify. Used by the
+  // voice pipeline's context lookup so `optimizePrompt` knows what the pane
+  // was just working on. In-memory only, 24h TTL.
+  private tmuxTranscriptCache = new Map<string, { transcriptPath: string; lastSeen: number }>();
+  private static readonly TMUX_TRANSCRIPT_TTL_MS = 24 * 60 * 60 * 1000;
+
   constructor() {
     const configDir = `${homedir()}/.claude-b`;
     this.config = {
@@ -64,6 +72,16 @@ class Daemon {
         return { sessionId: data.sessionId, name: data.name };
       },
       onPrompt: async (sessionId: string, prompt: string) => {
+        // Virtual tmux-backed session: sessionId is "tmux:<target>" where
+        // <target> is a tmux target string like "general:1.0".
+        // Replies to notifications from external Claude Code panes land here;
+        // we type the reply directly into the pane via tmux send-keys.
+        if (sessionId.startsWith('tmux:')) {
+          const target = sessionId.slice('tmux:'.length);
+          await this.sendToTmuxPane(target, prompt);
+          return;
+        }
+
         const session = this.sessionManager.get(sessionId);
         if (!session) throw new Error('Session not found');
         this.sessionManager.select(sessionId);
@@ -79,9 +97,19 @@ class Daemon {
 
         await session.sendPrompt(prompt);
       },
-      getSessions: () => this.sessionManager.list(),
+      getSessions: () => [
+        ...this.sessionManager.list(),
+        ...this.listTmuxClaudePanes(),
+      ],
       getInboxCount: () => this.notificationInbox.count(),
       getSessionContext: (sessionId: string) => {
+        // tmux-hosted session: resolve from the cached transcript populated
+        // by the Stop hook via /api/notify. Context is built by walking the
+        // JSONL backwards for the last few real user↔assistant turn pairs,
+        // skipping tool_result wrappers and system reminders.
+        if (sessionId.startsWith('tmux:')) {
+          return this.buildTmuxSessionContext(sessionId);
+        }
         const session = this.sessionManager.get(sessionId);
         if (!session) return undefined;
         return {
@@ -635,7 +663,9 @@ class Daemon {
         notificationInbox: this.notificationInbox,
         telegramBot: this.telegramBot,
         orchestrationManager: this.orchestrationManager,
-        configDir: this.config.configDir
+        configDir: this.config.configDir,
+        onTmuxTranscript: (sessionId, transcriptPath) =>
+          this.rememberTmuxTranscript(sessionId, transcriptPath),
       });
 
       const address = await this.restServer.start();
@@ -1038,6 +1068,230 @@ class Daemon {
         pipelineActive: !!config.sttProvider && !!config.aiProvider,
       },
     };
+  }
+
+  /**
+   * Enumerate live tmux panes that are running `claude` and expose them
+   * as virtual sessions so they show up in the Telegram /sessions list and
+   * are targetable by /select.
+   *
+   * Virtual session id = "tmux:<session:window.pane>" — the same opaque
+   * identifier format used by the Stop hook's /api/notify payloads, so the
+   * Telegram bot's existing sessionMap (for reply-to-notification routing)
+   * and the /select handler line up with zero changes.
+   *
+   * Status is inferred from the first glyph of the pane title — Claude Code
+   * uses `✳` when idle/waiting and a braille spinner char (`⠂⠄⠠⠐⠈⠁⠃⠇`…)
+   * while working. Anything that isn't `✳` is treated as busy.
+   */
+  private listTmuxClaudePanes(): Array<{
+    id: string;
+    name: string;
+    status: string;
+    selected: boolean;
+    createdAt: string;
+    goal?: string;
+  }> {
+    try {
+      const out = spawnSync(
+        'tmux',
+        ['list-panes', '-a', '-F', '#{session_name}:#{window_index}.#{pane_index}|#{pane_current_command}|#{pane_title}'],
+        { encoding: 'utf8', timeout: 2000 }
+      );
+      if (out.status !== 0 || !out.stdout) return [];
+
+      const panes: ReturnType<Daemon['listTmuxClaudePanes']> = [];
+      for (const line of out.stdout.split('\n')) {
+        if (!line) continue;
+        const [target, cmd, rawTitle] = line.split('|', 3);
+        if (cmd !== 'claude') continue;
+
+        const title = (rawTitle || '').trim();
+        // First grapheme is the busy/idle glyph; everything after is the slug.
+        // We split on the first space after the glyph.
+        const spaceIdx = title.indexOf(' ');
+        const glyph = spaceIdx >= 0 ? title.slice(0, spaceIdx) : title;
+        const slug = spaceIdx >= 0 ? title.slice(spaceIdx + 1) : '';
+        const status = glyph === '✳' ? 'idle' : 'busy';
+
+        panes.push({
+          id: `tmux:${target}`,
+          name: title ? `${target} ${title}` : target,
+          status,
+          selected: false,
+          createdAt: '', // unknown for external panes
+          goal: slug || undefined,
+        });
+      }
+      return panes;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Record a tmux session → Claude Code transcript mapping. Called from
+   * /api/notify when the cb-notify.sh hook forwards a Stop event with a
+   * transcriptPath. Prunes entries older than TMUX_TRANSCRIPT_TTL_MS.
+   */
+  private rememberTmuxTranscript(sessionId: string, transcriptPath: string): void {
+    if (!sessionId.startsWith('tmux:') || !transcriptPath) return;
+    const now = Date.now();
+    this.tmuxTranscriptCache.set(sessionId, { transcriptPath, lastSeen: now });
+
+    // Opportunistic TTL prune — cheap, runs at write time.
+    for (const [key, entry] of this.tmuxTranscriptCache) {
+      if (now - entry.lastSeen > Daemon.TMUX_TRANSCRIPT_TTL_MS) {
+        this.tmuxTranscriptCache.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Build a SessionContext for a tmux-hosted session so the Telegram voice
+   * pipeline can ground `optimizePrompt` with real conversation history.
+   *
+   * Looks up the cached transcript, pulls the pane's current name/goal/status
+   * from a fresh tmux enumeration, and walks the JSONL backwards to extract
+   * the last N real user↔assistant turn pairs. Tool-result wrappers
+   * (<task-notification>, <system-reminder>, tool_result content arrays) are
+   * filtered out — they'd just confuse the optimizer with internal noise.
+   */
+  private buildTmuxSessionContext(sessionId: string): {
+    sessionName?: string;
+    goal?: string;
+    lastOutput: string;
+    status: string;
+  } | undefined {
+    const target = sessionId.slice('tmux:'.length);
+
+    // Find the current pane entry for labels/status. If the pane has gone
+    // away we still return context from the transcript if we have one.
+    const panes = this.listTmuxClaudePanes();
+    const pane = panes.find((p) => p.id === sessionId);
+
+    const cached = this.tmuxTranscriptCache.get(sessionId);
+    if (!cached && !pane) return undefined;
+
+    let lastOutput = '';
+    if (cached) {
+      try {
+        lastOutput = this.readLastTurnsFromTranscript(cached.transcriptPath, 3);
+      } catch {
+        // transcript file moved/rotated — drop the cache entry so we don't
+        // keep retrying a dead path
+        this.tmuxTranscriptCache.delete(sessionId);
+      }
+    }
+
+    return {
+      sessionName: pane?.name || target,
+      goal: pane?.goal,
+      lastOutput,
+      status: pane?.status || 'unknown',
+    };
+  }
+
+  /**
+   * Read the last `turns` user↔assistant exchanges from a Claude Code
+   * transcript JSONL file and render them as a compact text block that can
+   * be handed to `optimizePrompt`.
+   *
+   * Heuristics:
+   *  - a "real" user message has `.message.content` as a string and does
+   *    NOT start with "<" (which would indicate a <task-notification> or
+   *    <system-reminder> tool-result wrapper)
+   *  - an assistant message is `.type == "assistant"` and we join all
+   *    `content[]` items where `type == "text"`
+   *  - each captured turn is trimmed to ~600 chars so the total output
+   *    stays well under the 2000-char budget the bot already uses
+   */
+  private readLastTurnsFromTranscript(path: string, turns: number): string {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const fs = require('fs') as typeof import('fs');
+    const raw = fs.readFileSync(path, 'utf8');
+    const lines = raw.split('\n').filter((l) => l.length > 0);
+
+    type Turn = { role: 'user' | 'assistant'; text: string };
+    const collected: Turn[] = [];
+
+    // Walk backwards — most recent first. Stop once we have `turns` user
+    // messages AND `turns` assistant messages (or run out of file).
+    let userCount = 0;
+    let assistantCount = 0;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (userCount >= turns && assistantCount >= turns) break;
+
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(lines[i]);
+      } catch {
+        continue;
+      }
+
+      const type = parsed.type as string | undefined;
+      const message = parsed.message as { role?: string; content?: unknown } | undefined;
+      if (!type || !message) continue;
+
+      if (type === 'user' && userCount < turns) {
+        const content = message.content;
+        if (typeof content !== 'string') continue; // skip tool_result arrays
+        const trimmed = content.trim();
+        if (!trimmed || trimmed.startsWith('<')) continue; // skip wrappers
+        collected.push({ role: 'user', text: trimmed.slice(0, 600) });
+        userCount++;
+      } else if (type === 'assistant' && assistantCount < turns) {
+        const content = message.content;
+        if (!Array.isArray(content)) continue;
+        const text = (content as Array<{ type?: string; text?: string }>)
+          .filter((block) => block.type === 'text' && typeof block.text === 'string')
+          .map((block) => (block.text as string).trim())
+          .filter((t) => t.length > 0)
+          .join('\n');
+        if (!text) continue;
+        collected.push({ role: 'assistant', text: text.slice(0, 600) });
+        assistantCount++;
+      }
+    }
+
+    // Reverse to chronological order and format.
+    collected.reverse();
+    return collected
+      .map((turn) => (turn.role === 'user' ? `USER: ${turn.text}` : `ASSISTANT: ${turn.text}`))
+      .join('\n\n');
+  }
+
+  /**
+   * Type a prompt into an external Claude Code pane via tmux send-keys.
+   * Used when Telegram replies target a "tmux:<target>" virtual session ID.
+   *
+   * Uses `send-keys -l` so the text is sent literally (no key-name expansion,
+   * no risk of a stray "Enter" in the middle of a prompt), followed by a
+   * separate Enter to submit. This is the equivalent of pasting + pressing
+   * Return inside the pane.
+   */
+  private async sendToTmuxPane(target: string, text: string): Promise<void> {
+    // Accept only sane tmux targets — session:window.pane style. Reject
+    // anything containing shell metacharacters to avoid process injection
+    // even though we're using argv (defense in depth).
+    if (!/^[A-Za-z0-9_./:%@+-]+$/.test(target)) {
+      throw new Error(`Invalid tmux target: ${target}`);
+    }
+
+    const runTmux = (args: string[]) => new Promise<void>((resolve, reject) => {
+      const proc = spawn('tmux', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+      let stderr = '';
+      proc.stderr?.on('data', (c: Buffer) => { stderr += c.toString(); });
+      proc.on('error', reject);
+      proc.on('exit', (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`tmux exited ${code}: ${stderr.trim()}`));
+      });
+    });
+
+    // Type the text literally (no key-name interpretation), then press Enter.
+    await runTmux(['send-keys', '-t', target, '-l', text]);
+    await runTmux(['send-keys', '-t', target, 'Enter']);
   }
 
   private forwardToTelegram(notification: {

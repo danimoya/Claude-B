@@ -10,6 +10,11 @@ export interface AIProviderConfig {
 export interface STTProviderConfig {
   provider: 'speechmatics' | 'deepgram' | 'openai';
   apiKey: string;
+  // Optional TTS tuning — currently honored by the OpenAI provider.
+  // Edit these fields in telegram.json and re-run `cb --voice-setup openai <key>`
+  // (or restart the daemon) to apply. Defaults: 'gpt-4o-mini-tts' / 'alloy'.
+  ttsModel?: string;
+  ttsVoice?: string;
 }
 
 export interface PendingPrompt {

@@ -546,11 +546,25 @@ export class ClaudeBTelegramBot extends EventEmitter {
       await this.options.onPrompt(pending.sessionId, pending.optimizedPrompt);
       this.configManager.removePendingPrompt(pendingId);
 
-      // Update the message to show it was sent
-      await this.bot!.editMessageText(
-        `⏳ Prompt sent to session ${pending.sessionId.slice(0, 8)}\n\n${pending.optimizedPrompt}`,
-        { chat_id: chatId, message_id: messageId }
-      ).catch(() => {});
+      // Debug / audit view: keep both the raw transcript and the optimized
+      // prompt visible after send so the user can see "what I said" vs
+      // "what was actually submitted to the session".
+      const sentLabel = pending.sessionId.startsWith('tmux:')
+        ? pending.sessionId.slice('tmux:'.length)
+        : pending.sessionId.slice(0, 8);
+      const confirmedText = [
+        `⏳ Prompt sent → ${sentLabel}`,
+        '',
+        `🎤 Transcript:`,
+        `"${pending.transcript}"`,
+        '',
+        `📝 Submitted prompt:`,
+        pending.optimizedPrompt,
+      ].join('\n');
+      await this.bot!.editMessageText(confirmedText, {
+        chat_id: chatId,
+        message_id: messageId,
+      }).catch(() => {});
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       await this.safeSend(chatId, `❌ Error: ${errMsg}`);

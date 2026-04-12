@@ -79,6 +79,103 @@ Response:
 - Socket: `~/.claude-b/daemon.sock`
 - PID: `~/.claude-b/daemon.pid`
 
+### Telegram ↔ Tmux Integration
+
+Claude-B bridges live Claude Code sessions running in tmux panes with
+Telegram, enabling a mobile-first workflow: get notified when sessions
+complete, listen to audio summaries (OpenAI TTS), select sessions, and
+reply — all from your phone.
+
+#### How It Works
+
+1. **Stop hook** (`bin/cb-notify.sh`) — registered in `~/.claude/settings.json`
+   as a `Stop` hook. Fires after every top-level Claude Code response in any
+   tmux pane. Reads the hook JSON from stdin, parses the Claude transcript
+   JSONL, and POSTs a notification to `POST /api/notify`.
+
+2. **`/api/notify` route** (`src/rest/routes/notify.ts`) — localhost-only,
+   API-key-authenticated ingest endpoint. Accepts `{sessionId, sessionName,
+   resultPreview, transcriptPath, ...}`. Routes to
+   `telegramBot.broadcastNotification()` (existing), caches `transcriptPath`
+   for voice context (new).
+
+3. **Virtual tmux sessions** — session IDs use the format `tmux:<target>`
+   (e.g. `tmux:general:2.0`). The daemon's `onPrompt` handler recognises
+   this prefix and routes replies via `tmux send-keys` instead of
+   `sessionManager.sendPrompt`. `/sessions` in Telegram merges Claude-B's
+   own sessions with live tmux panes (via `tmux list-panes -a`).
+
+4. **Voice pipeline** — sends a voice note in Telegram → Whisper STT →
+   `optimizePrompt(transcript, sessionContext)` → confirm/edit/cancel.
+   Context for tmux sessions comes from the cached transcript path
+   (last 3 user + 3 assistant turns, tool-result wrappers filtered out).
+
+#### Stop Hook Configuration
+
+```json
+// ~/.claude/settings.json
+{
+  "hooks": {
+    "Stop": [{
+      "hooks": [{
+        "type": "command",
+        "command": "$HOME/Claude-B/bin/cb-notify.sh"
+      }]
+    }]
+  }
+}
+```
+
+#### TTS Configuration
+
+Model and voice are read from `~/.claude-b/telegram.json` under
+`sttProvider.ttsModel` / `sttProvider.ttsVoice`. Defaults: `gpt-4o-mini-tts`
+/ `alloy`. To change:
+
+```bash
+# Edit the config
+jq '.sttProvider.ttsModel = "tts-1" | .sttProvider.ttsVoice = "nova"' \
+  ~/.claude-b/telegram.json > /tmp/tg.json && mv /tmp/tg.json ~/.claude-b/telegram.json
+# Restart the daemon to pick up the change
+sudo systemctl restart cb-daemon.service
+```
+
+Available models: `tts-1`, `tts-1-hd`, `gpt-4o-mini-tts`.
+Available voices: `alloy`, `ash`, `ballad`, `coral`, `echo`, `fable`,
+`nova`, `onyx`, `sage`, `shimmer`, `verse`.
+
+#### Caveats
+
+- **Hook pickup**: the Stop hook in `settings.json` is read at Claude Code
+  startup. Running panes that were started before the hook was added will
+  not fire it. Restart those panes (`/exit` + relaunch `claude`) or wait
+  for natural session turnover.
+
+- **Cold transcript cache**: voice prompt optimisation uses session context
+  from a cached transcript path. The cache populates when `/api/notify`
+  receives a `transcriptPath` (i.e. after the pane's first Stop hook fires
+  since the last daemon restart). Before that, `optimizePrompt` still works
+  but with no turn-history grounding.
+
+- **`/sessions` enumeration is synchronous**: the daemon spawns
+  `tmux list-panes -a` on each `/sessions` call. At ~22 panes this is
+  <10ms. At hundreds of panes, consider caching the result with a short TTL.
+
+- **Inline keyboard button labels**: Telegram buttons with long labels
+  (60+ chars) truncate visually on narrow phone screens. Pane titles like
+  `helios:3.0 ✳ wire-baas-layer-heliosdb` render fine; very long slugs
+  get clipped but remain tappable.
+
+- **Reply routing via `tmux send-keys`**: replies typed into a Telegram
+  notification are injected into the target tmux pane literally. Multi-line
+  replies are sent as a single keystroke sequence + Enter. If the target
+  pane is in the middle of something (e.g. Claude is currently outputting),
+  the injected text may interleave. Best practice: reply to idle panes.
+
+- **Daemon restart**: restarting `cb-daemon.service` clears the in-memory
+  transcript cache and reconnects the Telegram bot. Active Claude-B sessions
+  survive (persisted to disk); tmux panes are unaffected.
+
 ### Session Lifecycle
 1. `cb -n myproject` - Create named session
 2. `cb "analyze code"` - Send prompt (auto-creates if needed)

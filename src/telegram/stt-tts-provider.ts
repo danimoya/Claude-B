@@ -9,6 +9,8 @@ import { execFile } from 'child_process';
 export interface STTProviderConfig {
   provider: 'speechmatics' | 'deepgram' | 'openai';
   apiKey: string;
+  ttsModel?: string;
+  ttsVoice?: string;
 }
 
 export interface STTTTSProvider {
@@ -25,7 +27,7 @@ export function createSTTTTSProvider(config: STTProviderConfig, tempDir: string)
     case 'deepgram':
       return new DeepgramProvider(config.apiKey);
     case 'openai':
-      return new OpenAIProvider(config.apiKey, tempDir);
+      return new OpenAIProvider(config.apiKey, tempDir, config.ttsModel, config.ttsVoice);
     default:
       throw new Error(`Unknown STT provider: ${config.provider}`);
   }
@@ -154,10 +156,14 @@ class DeepgramProvider implements STTTTSProvider {
 class OpenAIProvider implements STTTTSProvider {
   private apiKey: string;
   private tempDir: string;
+  private ttsModel: string;
+  private ttsVoice: string;
 
-  constructor(apiKey: string, tempDir: string) {
+  constructor(apiKey: string, tempDir: string, ttsModel?: string, ttsVoice?: string) {
     this.apiKey = apiKey;
     this.tempDir = tempDir;
+    this.ttsModel = ttsModel || 'gpt-4o-mini-tts';
+    this.ttsVoice = ttsVoice || 'alloy';
   }
 
   async transcribe(audioBuffer: Buffer, language = 'en'): Promise<string> {
@@ -184,7 +190,9 @@ class OpenAIProvider implements STTTTSProvider {
   }
 
   async synthesize(text: string): Promise<Buffer> {
-    // OpenAI TTS — request opus format (OGG Opus container)
+    // Model and voice come from STTProviderConfig (telegram.json). Defaults
+    // were set in the constructor. Edit telegram.json → restart daemon to
+    // switch model/voice without code changes.
     const response = await fetch('https://api.openai.com/v1/audio/speech', {
       method: 'POST',
       headers: {
@@ -192,9 +200,9 @@ class OpenAIProvider implements STTTTSProvider {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'tts-1',
-        input: text.slice(0, 4096), // OpenAI TTS limit
-        voice: 'alloy',
+        model: this.ttsModel,
+        input: text.slice(0, 4096), // OpenAI TTS input limit
+        voice: this.ttsVoice,
         response_format: 'opus',
       }),
     });
@@ -204,13 +212,15 @@ class OpenAIProvider implements STTTTSProvider {
       throw new Error(`OpenAI TTS failed (${response.status}): ${errText}`);
     }
 
-    // OpenAI returns raw Opus — wrap in OGG container via ffmpeg
-    const opusBuffer = Buffer.from(await response.arrayBuffer());
-    return convertOpusToOggOpus(opusBuffer, this.tempDir);
+    // OpenAI's `opus` response_format returns a complete Ogg Opus container
+    // (verified: `file` reports "Ogg data, Opus audio" for all TTS models).
+    // Send straight to Telegram as audio/ogg — no ffmpeg re-mux needed.
+    return Buffer.from(await response.arrayBuffer());
   }
 
   async isTTSAvailable(): Promise<boolean> {
-    return checkFfmpeg();
+    // OpenAI returns Ogg Opus directly — no ffmpeg dependency.
+    return true;
   }
 
   getInfo() { return { provider: 'OpenAI Whisper' }; }

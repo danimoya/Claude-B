@@ -15,6 +15,7 @@ import { registerHookRoutes } from './routes/hooks.js';
 import { registerNotificationRoutes } from './routes/notifications.js';
 import { registerTelegramRoutes } from './routes/telegram.js';
 import { registerOrchestrationRoutes } from './routes/orchestration.js';
+import { registerNotifyRoutes } from './routes/notify.js';
 
 export interface RestServerOptions {
   host: string;
@@ -25,6 +26,10 @@ export interface RestServerOptions {
   telegramBot?: ClaudeBTelegramBot;
   orchestrationManager?: OrchestrationManager;
   configDir: string;
+  // Optional hook invoked by /api/notify when the payload carries a
+  // transcriptPath. Daemon uses this to cache tmux session → transcript
+  // mappings for the voice pipeline's context lookup.
+  onTmuxTranscript?: (sessionId: string, transcriptPath: string) => void;
 }
 
 export class RestServer {
@@ -35,6 +40,7 @@ export class RestServer {
   private telegramBot: ClaudeBTelegramBot | null;
   private orchestrationManager: OrchestrationManager | null;
   private authManager: AuthManager;
+  private onTmuxTranscript: ((sessionId: string, transcriptPath: string) => void) | null;
   private host: string;
   private port: number;
 
@@ -46,6 +52,7 @@ export class RestServer {
     this.notificationInbox = options.notificationInbox || null;
     this.telegramBot = options.telegramBot || null;
     this.orchestrationManager = options.orchestrationManager || null;
+    this.onTmuxTranscript = options.onTmuxTranscript || null;
     this.authManager = new AuthManager(options.configDir);
 
     this.app = Fastify({
@@ -121,6 +128,16 @@ export class RestServer {
     // Register telegram routes if bot is available
     if (this.telegramBot) {
       await registerTelegramRoutes(this.app, this.telegramBot);
+
+      // Register /api/notify ingest — external hook sink for tmux-hosted
+      // Claude Code sessions. Only available when the bot is running.
+      await registerNotifyRoutes(
+        this.app,
+        this.telegramBot,
+        this.authManager,
+        this.notificationInbox,
+        this.onTmuxTranscript
+      );
     }
 
     // Register orchestration routes if manager is available
