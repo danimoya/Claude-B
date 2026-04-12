@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/Claude-B.png" alt="Claude-B Logo" width="800">
+  <img src="assets/Claude-B.png" alt="Claude-B Logo" width="991" height="555">
 </p>
 
 # Claude-B
@@ -12,7 +12,8 @@ Claude-B is a background-capable wrapper around [Claude Code](https://claude.ai/
 - **Session management** - Multiple concurrent AI sessions with conversation continuity
 - **Fire-and-forget** - Launch background tasks, get notified when done
 - **Notification inbox** - Interactive TUI to browse completed tasks with markdown rendering
-- **Telegram integration** - Get notifications and reply to sessions from Telegram
+- **Telegram integration** - Get notifications, voice input, TTS summaries, and reply to sessions from Telegram
+- **Tmux bridge** - Notifications for live Claude Code sessions in tmux panes via Stop hook
 - **Foreground attach** - Like `fg` in Linux, attach to see live output
 - **Auto-watch streaming** - Automatically streams output after sending prompts
 - **REST API** - Control sessions remotely via HTTP/WebSocket
@@ -87,13 +88,16 @@ cb -a main
 | `cb --inbox-count` | | Show unread notification count |
 | `cb --inbox-clear` | | Mark all notifications as read |
 
-### Telegram
+### Telegram & Voice
 
 | Command | Description |
 |---------|-------------|
 | `cb --telegram <token>` | Set up Telegram bot with token |
 | `cb --telegram-status` | Show Telegram bot status |
 | `cb --telegram-stop` | Disable Telegram notifications |
+| `cb --voice-setup <provider> <key>` | Configure STT/TTS: `openai`, `speechmatics`, or `deepgram` |
+| `cb --ai-provider <provider> <key>` | Configure AI prompt optimizer: `anthropic` or `openrouter` |
+| `cb --voice-status` | Show voice pipeline status |
 
 ### REST API & Hooks
 
@@ -225,6 +229,186 @@ When the task completes, you'll get a Telegram message like:
 ```bash
 cb --telegram-status    # Check if running
 cb --telegram-stop      # Disable and clear token
+```
+
+### Voice Pipeline Setup
+
+Enable voice messages in Telegram: dictate prompts from your phone, get AI-optimized rewrites grounded in session context, and listen to audio summaries of completed tasks.
+
+The voice pipeline has three components — **STT** (speech-to-text), **AI** (prompt optimizer), and **TTS** (text-to-speech). Each is configured independently.
+
+**Step 1: Configure STT provider**
+
+Choose one of three providers. The same provider handles both STT (transcription of your voice messages) and TTS (audio playback of results).
+
+```bash
+# OpenAI — Whisper STT + gpt-4o-mini-tts (recommended)
+cb --voice-setup openai sk-proj-YOUR_OPENAI_KEY
+
+# Speechmatics — enhanced accuracy, batch API
+cb --voice-setup speechmatics YOUR_SPEECHMATICS_KEY
+
+# Deepgram — Nova-3 STT + Aura TTS, no ffmpeg needed
+cb --voice-setup deepgram YOUR_DEEPGRAM_KEY
+```
+
+**Step 2: Configure AI provider for prompt optimization**
+
+When you send a voice message, the raw transcript is rewritten into a well-structured prompt by an AI model. This step uses a separate provider from STT/TTS.
+
+```bash
+# Anthropic Claude (recommended — best at prompt rewriting)
+cb --ai-provider anthropic sk-ant-YOUR_ANTHROPIC_KEY
+
+# OpenRouter (access to multiple models)
+cb --ai-provider openrouter YOUR_OPENROUTER_KEY
+```
+
+**Step 3: Verify**
+
+```bash
+cb --voice-status
+
+# Output:
+#   Voice Pipeline:
+#     STT Provider: openai
+#     AI Provider: anthropic (default)
+#     Pipeline: active
+```
+
+**Step 4: Use it**
+
+In Telegram, send a voice message to the bot. You'll see:
+
+1. `🎤 Transcribing...` — your audio is converted to text
+2. `🎤 Transcribed. Optimizing prompt...` — the AI rewrites it using session context
+3. A confirmation with the raw transcript and the optimized prompt:
+   - **✅ Send** — submit the prompt to the selected session
+   - **✏️ Edit** — type a corrected version manually
+   - **❌ Cancel** — discard
+
+After a session completes, each notification includes a **🔊 Listen** button that generates an audio summary using TTS.
+
+**Customizing TTS model and voice**
+
+The TTS model and voice are stored in `~/.claude-b/telegram.json` and can be changed without a code rebuild:
+
+```bash
+# Switch to a different model and voice
+jq '.sttProvider.ttsModel = "tts-1" | .sttProvider.ttsVoice = "nova"' \
+  ~/.claude-b/telegram.json > /tmp/tg.json && mv /tmp/tg.json ~/.claude-b/telegram.json
+
+# Restart the daemon to apply
+sudo systemctl restart cb-daemon.service   # if using systemd
+# or: kill the daemon process and re-run cb to restart it
+```
+
+| Model | Price | Latency | Notes |
+|-------|-------|---------|-------|
+| `gpt-4o-mini-tts` | ~$12/1M chars | ~500ms | Newest, cheapest, supports tone instructions |
+| `tts-1` | $15/1M chars | ~400ms | Fastest, battle-tested |
+| `tts-1-hd` | $30/1M chars | ~800ms | Highest quality |
+
+Available voices: `alloy`, `ash`, `ballad`, `coral`, `echo`, `fable`, `nova`, `onyx`, `sage`, `shimmer`, `verse`.
+
+### Tmux Session Notifications
+
+If you run Claude Code interactively in tmux panes, Claude-B can bridge those sessions to Telegram — get notified when any pane finishes a response, listen to audio summaries, select sessions, and reply from your phone.
+
+This works alongside (not instead of) Claude-B's own session management. Your tmux panes keep running as-is; Claude-B just observes them.
+
+**Prerequisites:**
+- Telegram bot already configured (see above)
+- REST API running (`cb -r`)
+- tmux sessions with `claude` processes
+
+**Step 1: Install the Stop hook**
+
+Add this to `~/.claude/settings.json` (create it if it doesn't exist):
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Claude-B/bin/cb-notify.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hook fires after every top-level Claude Code response. It reads the session transcript, extracts the last assistant text, and POSTs it to Claude-B's REST API.
+
+> **Note:** Claude Code reads `settings.json` at startup. Panes that were already running won't pick up the hook until restarted. Either `/exit` + relaunch `claude` in each pane, or let them turn over naturally.
+
+**Step 2: Start the REST API**
+
+The hook script sends notifications to the REST API on `localhost:3847`:
+
+```bash
+cb -r 3847
+```
+
+If you use systemd, the `start-daemon.sh` script handles this automatically.
+
+**Step 3: Use it from Telegram**
+
+Once the hook is active:
+
+- **Automatic notifications** — every time a tmux pane's Claude session finishes a response, you receive a Telegram message with the result text, duration, and a 🔊 Listen button.
+- **`/sessions`** — shows all active tmux panes (with idle/busy status) alongside Claude-B's own sessions. Tap one to select it.
+- **`/select`** — pick a tmux session by name or target (e.g. `/select general:2.0`).
+- **Reply to a notification** — your text is typed directly into the originating tmux pane via `tmux send-keys`.
+- **Voice messages** — dictate a prompt, get an AI-optimized rewrite grounded in the session's recent conversation history (last 3 turns), confirm, and it's typed into the pane.
+
+**How it works under the hood:**
+
+```
+tmux pane (claude) ──Stop hook──> bin/cb-notify.sh
+                                    │
+                                    │ parses transcript JSONL
+                                    │ resolves tmux target + title
+                                    ▼
+                              POST /api/notify
+                                    │
+                                    ▼
+                              Claude-B daemon
+                              ├── broadcastNotification → Telegram
+                              ├── cache transcriptPath (for voice context)
+                              └── persist to notification inbox
+```
+
+Reply path:
+```
+Telegram reply ──> bot.onPrompt("tmux:general:2.0", text)
+                     │
+                     ▼
+                   daemon recognises tmux: prefix
+                     │
+                     ▼
+                   tmux send-keys -t general:2.0 -l "text" Enter
+```
+
+**Troubleshooting:**
+
+```bash
+# Check if the hook is firing
+tail -f ~/.claude-b/cb-notify.log
+
+# Check REST API is reachable
+curl http://127.0.0.1:3847/api/health
+
+# Check Telegram bot is connected
+cb --telegram-status
+
+# Check voice pipeline
+cb --voice-status
 ```
 
 ### Quick Start: Conversation Continuity
@@ -396,14 +580,15 @@ Config file: `~/.claude-b/config.json`
 ├── daemon.pid               # Daemon PID file
 ├── daemon.sock              # Unix socket
 ├── daemon.log               # Daemon logs
+├── cb-notify.log            # Stop hook delivery log
+├── api.key                  # REST API key (mode 600)
 ├── notifications.jsonl      # Notification inbox (append-only)
-├── telegram.json            # Telegram bot config & session map
+├── telegram.json            # Telegram bot config, session map, voice settings
 ├── sessions/
 │   ├── index.json           # Session index
 │   └── <session-id>/        # Per-session data
 │       └── history.jsonl    # Prompt/response history
-└── hooks/
-    └── config.json          # Hook & webhook definitions
+└── hooks.json               # Shell hooks & webhook definitions
 ```
 
 ## Docker
