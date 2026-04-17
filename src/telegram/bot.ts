@@ -18,7 +18,20 @@ function markdownToTelegramHtml(md: string): string {
     return `\x00CB${codeBlocks.length - 1}\x00`;
   });
 
-  // 2. Extract inline code spans.
+  // 2. Extract markdown tables (lines starting with |) and wrap in <pre>.
+  //    Telegram has no <table> support, so monospace preserves alignment.
+  const tables: string[] = [];
+  html = html.replace(/(?:^|\n)((?:\|.*\|[ \t]*\n?)+)/g, (_m, table: string) => {
+    // Strip the separator row (e.g. |---|---|) for cleaner output
+    const cleaned = table
+      .split('\n')
+      .filter((line: string) => !/^\|[\s:|-]+\|$/.test(line.trim()))
+      .join('\n');
+    tables.push(cleaned.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'));
+    return `\x00TB${tables.length - 1}\x00`;
+  });
+
+  // 3. Extract inline code spans.
   const inlineCode: string[] = [];
   html = html.replace(/`([^`]+)`/g, (_m, code: string) => {
     inlineCode.push(code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'));
@@ -37,8 +50,9 @@ function markdownToTelegramHtml(md: string): string {
   // 6. Strikethrough: ~~text~~
   html = html.replace(/~~(.+?)~~/g, '<s>$1</s>');
 
-  // 7. Re-insert code blocks and inline code.
+  // 8. Re-insert code blocks, tables, and inline code.
   html = html.replace(/\x00CB(\d+)\x00/g, (_m, i) => `<pre>${codeBlocks[Number(i)]}</pre>`);
+  html = html.replace(/\x00TB(\d+)\x00/g, (_m, i) => `<pre>${tables[Number(i)]}</pre>`);
   html = html.replace(/\x00IC(\d+)\x00/g, (_m, i) => `<code>${inlineCode[Number(i)]}</code>`);
 
   return html;
