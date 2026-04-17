@@ -18,16 +18,48 @@ function markdownToTelegramHtml(md: string): string {
     return `\x00CB${codeBlocks.length - 1}\x00`;
   });
 
-  // 2. Extract markdown tables (lines starting with |) and wrap in <pre>.
-  //    Telegram has no <table> support, so monospace preserves alignment.
+  // 2. Extract markdown tables and render with Unicode box-drawing chars.
+  //    Telegram has no <table> support; box-drawing inside <pre> gives
+  //    bordered tables that look clean on both desktop and mobile.
   const tables: string[] = [];
   html = html.replace(/(?:^|\n)((?:\|.*\|[ \t]*\n?)+)/g, (_m, table: string) => {
-    // Strip the separator row (e.g. |---|---|) for cleaner output
-    const cleaned = table
+    const rows = table
       .split('\n')
-      .filter((line: string) => !/^\|[\s:|-]+\|$/.test(line.trim()))
-      .join('\n');
-    tables.push(cleaned.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'));
+      .filter((line: string) => line.trim().length > 0)
+      .filter((line: string) => !/^\|[\s:|-]+\|$/.test(line.trim())); // strip separator
+
+    if (rows.length === 0) return _m;
+
+    // Parse cells and compute column widths
+    const parsed = rows.map((row: string) =>
+      row.replace(/^\||\|$/g, '').split('|').map((c: string) => c.trim())
+    );
+    const colCount = Math.max(...parsed.map((r: string[]) => r.length));
+    const colWidths = Array.from({ length: colCount }, (_, ci) =>
+      Math.max(...parsed.map((r: string[]) => (r[ci] || '').length), 1)
+    );
+
+    const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const pad = (s: string, w: number) => s + ' '.repeat(Math.max(0, w - s.length));
+
+    const hLine = (l: string, m: string, r: string, f: string) =>
+      l + colWidths.map((w: number) => f.repeat(w + 2)).join(m) + r;
+
+    const dataRow = (cells: string[]) =>
+      '│' + colWidths.map((w: number, i: number) => ` ${pad(esc(cells[i] || ''), w)} `).join('│') + '│';
+
+    const lines: string[] = [];
+    lines.push(hLine('┌', '┬', '┐', '─'));
+    lines.push(dataRow(parsed[0]));
+    if (parsed.length > 1) {
+      lines.push(hLine('├', '┼', '┤', '─'));
+      for (let i = 1; i < parsed.length; i++) {
+        lines.push(dataRow(parsed[i]));
+      }
+    }
+    lines.push(hLine('└', '┴', '┘', '─'));
+
+    tables.push(lines.join('\n'));
     return `\x00TB${tables.length - 1}\x00`;
   });
 
