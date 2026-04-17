@@ -1278,8 +1278,10 @@ class Daemon {
       throw new Error(`Invalid tmux target: ${target}`);
     }
 
-    const runTmux = (args: string[]) => new Promise<void>((resolve, reject) => {
-      const proc = spawn('tmux', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    const runTmux = (args: string[], stdin?: string) => new Promise<void>((resolve, reject) => {
+      const proc = spawn('tmux', args, {
+        stdio: [stdin !== undefined ? 'pipe' : 'ignore', 'ignore', 'pipe'],
+      });
       let stderr = '';
       proc.stderr?.on('data', (c: Buffer) => { stderr += c.toString(); });
       proc.on('error', reject);
@@ -1287,10 +1289,21 @@ class Daemon {
         if (code === 0) resolve();
         else reject(new Error(`tmux exited ${code}: ${stderr.trim()}`));
       });
+      if (stdin !== undefined) proc.stdin?.end(stdin);
     });
 
-    // Type the text literally (no key-name interpretation), then press Enter.
-    await runTmux(['send-keys', '-t', target, '-l', text]);
+    // Stage the text in a tmux paste buffer, then paste it with bracketed-
+    // paste markers (-p). Claude Code's TUI uses the explicit start/end
+    // markers to finalize the [Pasted N lines] block deterministically.
+    // Using send-keys -l instead races: characters arrive fast, the TUI
+    // detects a paste heuristically, and the trailing Enter can land
+    // inside the paste-settle window — pasted content visible, never
+    // submitted. The settle delay below covers any residual lag before
+    // Enter submits the input.
+    const bufferName = `cb-${process.pid}-${Date.now()}`;
+    await runTmux(['load-buffer', '-b', bufferName, '-'], text);
+    await runTmux(['paste-buffer', '-p', '-d', '-b', bufferName, '-t', target]);
+    await new Promise((r) => setTimeout(r, 150));
     await runTmux(['send-keys', '-t', target, 'Enter']);
   }
 

@@ -52,7 +52,7 @@ export function createAIProvider(config: AIProviderConfig): AIProvider {
       if (context) {
         parts.push('Session context:');
         if (context.sessionName) parts.push(`  Session: ${context.sessionName}`);
-        if (context.goal) parts.push(`  Goal: ${context.goal}`);
+        if (context.goal) parts.push(`  PWD: ${context.goal}`);
         if (context.status) parts.push(`  Status: ${context.status}`);
         if (context.lastOutput) {
           parts.push(`  Last output (tail):\n${context.lastOutput.slice(-1500)}`);

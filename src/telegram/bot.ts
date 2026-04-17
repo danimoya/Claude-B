@@ -4,6 +4,46 @@ import { TelegramConfigManager } from './config.js';
 import { VoicePipeline } from './voice.js';
 import { SessionContext } from './ai-provider.js';
 
+/**
+ * Convert common Markdown patterns to Telegram-safe HTML.
+ * Handles code blocks, inline code, bold, and italic while escaping
+ * HTML entities. Intentionally skips underscore-based italic to avoid
+ * false positives on file paths like some_file_name.ts.
+ */
+function markdownToTelegramHtml(md: string): string {
+  // 1. Extract fenced code blocks before escaping so their contents stay raw.
+  const codeBlocks: string[] = [];
+  let html = md.replace(/```[\w]*\n?([\s\S]*?)```/g, (_m, code: string) => {
+    codeBlocks.push(code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'));
+    return `\x00CB${codeBlocks.length - 1}\x00`;
+  });
+
+  // 2. Extract inline code spans.
+  const inlineCode: string[] = [];
+  html = html.replace(/`([^`]+)`/g, (_m, code: string) => {
+    inlineCode.push(code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'));
+    return `\x00IC${inlineCode.length - 1}\x00`;
+  });
+
+  // 3. Escape remaining HTML entities.
+  html = html.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  // 4. Bold: **text**
+  html = html.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+
+  // 5. Italic: *text* (single asterisk only — underscores skipped)
+  html = html.replace(/\*(.+?)\*/g, '<i>$1</i>');
+
+  // 6. Strikethrough: ~~text~~
+  html = html.replace(/~~(.+?)~~/g, '<s>$1</s>');
+
+  // 7. Re-insert code blocks and inline code.
+  html = html.replace(/\x00CB(\d+)\x00/g, (_m, i) => `<pre>${codeBlocks[Number(i)]}</pre>`);
+  html = html.replace(/\x00IC(\d+)\x00/g, (_m, i) => `<code>${inlineCode[Number(i)]}</code>`);
+
+  return html;
+}
+
 export interface TelegramBotOptions {
   configDir: string;
   onPrompt?: (sessionId: string, prompt: string) => Promise<void>;
@@ -130,18 +170,19 @@ export class ClaudeBTelegramBot extends EventEmitter {
     const duration = notification.durationMs ? `${(notification.durationMs / 1000).toFixed(1)}s` : '';
     const cost = notification.costUsd ? ` · $${notification.costUsd.toFixed(4)}` : '';
 
-    // Build plain text message (safe for any content)
+    // Build HTML-formatted message so markdown in Claude Code output renders
+    const escHtml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
     const lines: string[] = [];
-    lines.push(`${icon} ${name} ${status}${duration ? ` (${duration}${cost})` : ''}`);
+    lines.push(`${icon} <b>${escHtml(name)}</b> ${status}${duration ? ` (${duration}${cost})` : ''}`);
 
     if (notification.goal) {
-      lines.push(`Goal: ${notification.goal}`);
+      lines.push(`PWD: ${escHtml(notification.goal)}`);
     }
 
     if (notification.resultPreview) {
       lines.push('');
       // Telegram message limit is 4096 chars; leave room for header/footer
-      lines.push(notification.resultPreview.slice(0, 3000));
+      lines.push(markdownToTelegramHtml(notification.resultPreview.slice(0, 3000)));
     }
 
     lines.push('');
@@ -150,9 +191,15 @@ export class ClaudeBTelegramBot extends EventEmitter {
     const text = lines.join('\n');
 
     try {
-      // Build send options with optional Listen button
-      const opts: TelegramBot.SendMessageOptions = {};
-      const sent = await this.bot.sendMessage(chatId, text, opts);
+      // Build send options with HTML parsing
+      const opts: TelegramBot.SendMessageOptions = { parse_mode: 'HTML' };
+      let sent: TelegramBot.Message;
+      try {
+        sent = await this.bot.sendMessage(chatId, text, opts);
+      } catch {
+        // If HTML parse fails (malformed markup), fall back to plain text
+        sent = await this.bot.sendMessage(chatId, lines.join('\n').replace(/<[^>]+>/g, ''));
+      }
 
       // Map this message to the session for reply routing
       await this.configManager.mapMessage(String(sent.message_id), notification.sessionId);
@@ -208,14 +255,14 @@ export class ClaudeBTelegramBot extends EventEmitter {
     return this.configManager;
   }
 
-  // Safe send: try Markdown, fall back to plain text on parse error
-  private async safeSend(chatId: string, text: string, markdown = false): Promise<void> {
+  // Safe send: try with parse_mode, fall back to plain text on parse error
+  private async safeSend(chatId: string, text: string, parseMode?: 'Markdown' | 'MarkdownV2' | 'HTML'): Promise<void> {
     if (!this.bot) return;
     try {
-      await this.bot.sendMessage(chatId, text, markdown ? { parse_mode: 'Markdown' } : {});
+      await this.bot.sendMessage(chatId, text, parseMode ? { parse_mode: parseMode } : {});
     } catch {
-      // If Markdown fails, retry as plain text
-      if (markdown) {
+      // If formatted send fails, retry as plain text
+      if (parseMode) {
         try { await this.bot.sendMessage(chatId, text); } catch { /* give up */ }
       }
     }

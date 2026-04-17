@@ -64,6 +64,13 @@ fi
 # assistant turns end with tool_use blocks only (e.g. a final Edit/Bash
 # without commentary); those are skipped backwards until a text-bearing
 # message is found.
+#
+# Small delay: the Stop hook fires right after the response completes but
+# the transcript file may still have unflushed data in kernel/process
+# buffers. Without this, grep can miss the final lines and return an
+# intermediate assistant message instead of the actual summary.
+sleep 0.5
+
 last_assistant=""
 if [[ -n "$transcript_path" && -f "$transcript_path" ]]; then
   last_assistant=$(
