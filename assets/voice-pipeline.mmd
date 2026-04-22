@@ -1,0 +1,23 @@
+sequenceDiagram
+    autonumber
+    actor U as 📱 You
+    participant B as Claude-B
+    participant STT as STT<br/>Whisper · Speechmatics · Deepgram
+    participant O as Optimizer<br/>Claude Haiku 4.5
+    participant C as Claude Code<br/>Sonnet / Opus
+    participant T as TTS<br/>OpenAI · Deepgram
+
+    U->>B: 🎤 voice note
+    B->>STT: Opus audio
+    STT-->>B: raw transcript
+    B->>O: transcript + last 3 turns of<br/>session context
+    O-->>B: polished prompt
+    B-->>U: preview · confirm / edit / cancel
+    U->>B: ✅ confirm
+    B->>C: execute
+    C-->>B: response
+    B-->>U: 📝 markdown reply
+    U->>B: 🔊 tap to listen
+    B->>T: text
+    T-->>B: Opus audio
+    B-->>U: 🎧 voice reply

@@ -20,6 +20,46 @@ Claude-B is a background-capable wrapper around [Claude Code](https://claude.ai/
 - **Hooks** - Shell hooks and webhooks for notifications and automation
 - **Multi-host orchestration** - Distribute work across multiple Claude-B instances
 
+## The voice pipeline
+
+Other Telegram/WhatsApp AI integrations forward your message to one model and
+play the reply back. Claude-B chains **four specialised models** per
+voice-to-voice round-trip — the middle step, prompt optimisation with fresh
+session context, is what makes the difference between *"um, can you uh, fix
+the thing we were just working on"* and an actionable prompt Claude Code can
+actually execute.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as 📱 You
+    participant B as Claude-B
+    participant STT as STT<br/>Whisper · Speechmatics · Deepgram
+    participant O as Optimizer<br/>Claude Haiku 4.5
+    participant C as Claude Code<br/>Sonnet / Opus
+    participant T as TTS<br/>OpenAI · Deepgram
+
+    U->>B: 🎤 voice note
+    B->>STT: Opus audio
+    STT-->>B: raw transcript
+    B->>O: transcript + last 3 turns of<br/>session context
+    O-->>B: polished prompt
+    B-->>U: preview · confirm / edit / cancel
+    U->>B: ✅ confirm
+    B->>C: execute
+    C-->>B: response
+    B-->>U: 📝 markdown reply
+    U->>B: 🔊 tap to listen
+    B->>T: text
+    T-->>B: Opus audio
+    B-->>U: 🎧 voice reply
+```
+
+Every stage is provider-swappable via `~/.claude-b/telegram.json`. Default
+stack: Whisper → Claude Haiku 4.5 → your session's main model → OpenAI
+`gpt-4o-mini-tts`. Confirm-before-execute is baked in, so a botched
+transcription never becomes a rogue `rm -rf`.
+
 ## Installation
 
 ```bash

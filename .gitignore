@@ -19,3 +19,4 @@ Thumbs.db
 
 # Config (contains sensitive data)
 .claude-b/
+.claude/

@@ -18,6 +18,19 @@
 - **Stateless on config, stateful on data.** One `.env` file configures everything. All session
   state lives in a mounted volume.
 
+## The voice pipeline — the actual differentiator
+
+Other Telegram/WhatsApp AI integrations forward your voice note to one model and play the reply
+back. Claude-B chains **four specialised models** per voice-to-voice round-trip, and the middle
+step — prompt optimisation with fresh session context — turns *"um, can you uh, fix the thing
+we were just working on"* into an actionable prompt Claude Code can execute.
+
+![Voice pipeline](https://raw.githubusercontent.com/danimoya/Claude-B/main/assets/voice-pipeline.png)
+
+Every stage is provider-swappable. Default stack: Whisper → Claude Haiku 4.5 → your session's
+main model (Sonnet / Opus) → OpenAI `gpt-4o-mini-tts`. Confirm-before-execute is baked in, so
+a botched transcription never becomes a rogue `rm -rf`.
+
 ## Quick start
 
 Pull the image and run — everything reads from `~/.claude-b/.env`, created by `cb init` on
