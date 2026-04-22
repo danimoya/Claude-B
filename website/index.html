@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Claude-B — background Claude Code</title>
+  <meta name="description" content="Claude-B: background-capable Claude Code with async workflows, Telegram bot, and multi-host orchestration." />
+  <style>
+    :root {
+      --bg: #0b0d10; --fg: #e6edf3; --mute: #8b949e; --accent: #79c0ff; --border: #30363d;
+      --code-bg: #161b22;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg); font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace; line-height: 1.55; }
+    main { max-width: 720px; margin: 0 auto; padding: 4rem 1.5rem 6rem; }
+    h1 { font-size: 2rem; margin: 0 0 0.25rem; }
+    h2 { font-size: 1.15rem; margin: 2.5rem 0 0.75rem; color: var(--accent); }
+    .tag { color: var(--mute); font-size: 0.95rem; margin-bottom: 2.5rem; }
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 1rem 1.1rem;
+      overflow-x: auto;
+      font-size: 0.92rem;
+    }
+    code { color: var(--accent); }
+    pre code { color: var(--fg); }
+    a { color: var(--accent); }
+    ul { padding-left: 1.25rem; }
+    li { margin: 0.3rem 0; }
+    .cta { display: inline-block; margin-top: 0.5rem; font-size: 0.9rem; color: var(--mute); }
+    .footer { margin-top: 4rem; color: var(--mute); font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Claude-B</h1>
+    <p class="tag">Background-capable Claude Code — async workflows, Telegram bot, REST API.</p>
+
+    <h2>Install</h2>
+    <pre><code>curl -fsSL https://cb.danielmoya.cv | bash</code></pre>
+    <p class="cta">Auto-detects <code>npm</code> or <code>docker</code>. Use <code>--method docker</code> to force.</p>
+
+    <h2>Configure</h2>
+    <pre><code>cb init</code></pre>
+    <p class="cta">Interactive wizard — connects the Telegram bot and writes <code>~/.claude-b/.env</code>.</p>
+
+    <h2>What you get</h2>
+    <ul>
+      <li>Background Claude Code sessions with async prompts</li>
+      <li>Telegram bot for remote control + voice notes (Whisper + TTS)</li>
+      <li>REST API + WebSocket for programmatic access</li>
+      <li>Multi-host orchestration across machines</li>
+    </ul>
+
+    <h2>Manual install</h2>
+    <pre><code># npm
+npm i -g claude-b
+
+# Docker
+docker run -d \
+  -v ~/.claude-b:/root/.claude-b \
+  --env-file ~/.claude-b/.env \
+  ghcr.io/danimoya/claude-b:latest</code></pre>
+
+    <p class="footer">
+      Source: <a href="https://github.com/danimoya/Claude-B">github.com/danimoya/Claude-B</a> ·
+      License: AGPL-3.0
+    </p>
+  </main>
+</body>
+</html>

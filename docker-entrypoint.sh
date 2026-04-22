@@ -6,7 +6,7 @@ node /app/dist/daemon/index.js &
 DAEMON_PID=$!
 
 # Wait for socket to be ready
-SOCKET_PATH="$HOME/.claude-b/daemon.sock"
+SOCKET_PATH="${CB_DATA_DIR:-$HOME/.claude-b}/daemon.sock"
 echo "Waiting for daemon..."
 for i in $(seq 1 30); do
   if [ -S "$SOCKET_PATH" ]; then
@@ -18,7 +18,7 @@ done
 
 # Start REST API
 echo "Starting REST API..."
-node /app/dist/cli/index.js --rest ${REST_PORT:-3847}
+node /app/dist/cli/index.js --rest ${CB_REST_PORT:-${REST_PORT:-3847}}
 
 # Keep container running
 wait $DAEMON_PID

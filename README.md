@@ -23,21 +23,58 @@ Claude-B is a background-capable wrapper around [Claude Code](https://claude.ai/
 ## Installation
 
 ```bash
-# Clone and build
-git clone https://github.com/your-org/claude-b.git
-cd claude-b
-pnpm install
-pnpm build
+# One-line install (auto-detects npm or docker)
+curl -fsSL https://cb.danielmoya.cv | bash
 
-# Link globally
-pnpm link --global
+# Or via npm
+npm i -g claude-b
+
+# Or via Docker
+docker run -d \
+  -v ~/.claude-b:/root/.claude-b \
+  --env-file ~/.claude-b/.env \
+  ghcr.io/danimoya/claude-b:latest
 ```
 
-## Prerequisites
+Then configure everything interactively:
 
-- Node.js 20+
+```bash
+cb init
+```
+
+`cb init` walks you through BotFather, auto-captures your Telegram chat id,
+and writes `~/.claude-b/.env`. Re-run it any time to update settings.
+
+### Configuration
+
+Claude-B reads from environment variables with this precedence:
+**process env** > `~/.claude-b/.env` > `./.env`
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `ANTHROPIC_API_KEY` | yes | Claude Code authentication |
+| `TELEGRAM_BOT_TOKEN` | no | Enables Telegram remote control |
+| `TELEGRAM_ALLOWED_CHAT_IDS` | no | Comma-separated chat ids allowed to use the bot |
+| `OPENAI_API_KEY` | no | Whisper STT + TTS for voice notes |
+| `SPEECHMATICS_API_KEY` / `DEEPGRAM_API_KEY` | no | Alternative STT providers |
+| `CB_DATA_DIR` | no | Override `~/.claude-b` (useful in containers) |
+| `CB_REST_HOST` / `CB_REST_PORT` | no | REST API bind address (defaults `127.0.0.1:3847`) |
+| `CB_REST_API_KEY` | no | Pre-set REST API key (auto-generated otherwise) |
+
+See `.env.example` for a starter template.
+
+### Prerequisites
+
+- Node.js 20+ (if installing via npm) or Docker
 - [Claude Code](https://claude.ai/code) installed and configured
-- `ANTHROPIC_API_KEY` environment variable set
+
+### From source
+
+```bash
+git clone https://github.com/danimoya/Claude-B.git
+cd Claude-B
+pnpm install && pnpm build && pnpm link --global
+```
 
 ## Quick Start
 

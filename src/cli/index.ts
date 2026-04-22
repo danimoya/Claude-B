@@ -1,10 +1,15 @@
 #!/usr/bin/env node
 
+import { loadEnv } from '../config/env.js';
+
+loadEnv();
+
 import { Command } from 'commander';
 import chalk from 'chalk';
 import { DaemonClient } from '../daemon/client.js';
 import { version } from '../utils/version.js';
 import { detectClaude } from '../utils/claude-detector.js';
+import { runInit } from './init.js';
 
 // Type definitions for API responses
 interface SessionInfo {
@@ -122,6 +127,19 @@ program
   .name('cb')
   .description('Claude-B: Background Claude Code with async workflows')
   .version(version);
+
+program
+  .command('init')
+  .description('Interactive setup: writes ~/.claude-b/.env, connects Telegram bot')
+  .action(async () => {
+    try {
+      await runInit();
+      process.exit(0);
+    } catch (err) {
+      console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+      process.exit(1);
+    }
+  });
 
 // Default command: send prompt
 program

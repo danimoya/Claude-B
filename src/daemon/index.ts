@@ -1,3 +1,7 @@
+import { loadEnv } from '../config/env.js';
+
+loadEnv();
+
 import { createServer, Server, Socket } from 'net';
 import { homedir } from 'os';
 import { mkdir, writeFile, unlink, readFile } from 'fs/promises';
@@ -40,8 +44,8 @@ class Daemon {
   private cleanupInterval: ReturnType<typeof setInterval> | null = null;
   private restServer: RestServer | null = null;
   private restConfig: RestConfig = {
-    host: process.env.REST_HOST || '127.0.0.1',
-    port: parseInt(process.env.REST_PORT || '3847', 10)
+    host: process.env.CB_REST_HOST || process.env.REST_HOST || '127.0.0.1',
+    port: parseInt(process.env.CB_REST_PORT || process.env.REST_PORT || '3847', 10)
   };
 
   // Maps virtual tmux session ids ("tmux:general:1.0") → Claude Code transcript
@@ -52,7 +56,7 @@ class Daemon {
   private static readonly TMUX_TRANSCRIPT_TTL_MS = 24 * 60 * 60 * 1000;
 
   constructor() {
-    const configDir = `${homedir()}/.claude-b`;
+    const configDir = process.env.CB_DATA_DIR || `${homedir()}/.claude-b`;
     this.config = {
       socketPath: `${configDir}/daemon.sock`,
       pidFile: `${configDir}/daemon.pid`,
