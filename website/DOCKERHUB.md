@@ -115,3 +115,11 @@ cd Claude-B && pnpm install && pnpm build && pnpm link --global
 - **Issues:** https://github.com/danimoya/Claude-B/issues
 - **GHCR mirror:** `ghcr.io/danimoya/claude-b`
 - **License:** AGPL-3.0
+
+## Topics
+
+AI agents · Anthropic Claude · Claude Code · coding assistant · AI automation ·
+background jobs · async workflows · Telegram bot · voice assistant · Whisper STT ·
+OpenAI TTS · REST API · WebSocket · CLI tool · developer tools · DevOps · tmux ·
+multi-host orchestration · self-hosted · Node.js · TypeScript
+

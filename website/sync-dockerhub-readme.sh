@@ -14,11 +14,12 @@ CREDS_FILE="${1:-$HOME/.dockerhub-credentials}"
 if [ -z "${DOCKERHUB_USERNAME:-}" ] || [ -z "${DOCKERHUB_TOKEN:-}" ]; then
   [ -f "$CREDS_FILE" ] || { echo "no creds in env, and $CREDS_FILE missing" >&2; exit 1; }
   # shellcheck disable=SC1090
-  . "$CREDS_FILE"
+  set -a; . "$CREDS_FILE"; set +a
 fi
+export DOCKERHUB_USERNAME DOCKERHUB_TOKEN
 
 REPO="${REPO:-danimoya/claude-b}"
-SHORT="${SHORT:-Background-capable Claude Code: async workflows, Telegram bot, REST API, multi-host orchestration.}"
+SHORT="${SHORT:-AI agent CLI: background Claude Code, Telegram bot, voice, REST API, multi-host orchestration.}"
 
 python3 - <<PY
 import json, os, urllib.request, sys
