@@ -30,29 +30,49 @@ the thing we were just working on"* and an actionable prompt Claude Code can
 actually execute.
 
 ```mermaid
+%%{init: {'theme':'base', 'themeVariables': {
+  'background': '#fdf7e9',
+  'primaryColor': '#fff9e7',
+  'primaryTextColor': '#2d2a22',
+  'primaryBorderColor': '#c9b87a',
+  'lineColor': '#8a7338',
+  'actorBkg': '#fff9e7',
+  'actorBorder': '#c9b87a',
+  'actorTextColor': '#2d2a22',
+  'activationBkgColor': '#fff2c6',
+  'activationBorderColor': '#c9b87a',
+  'noteBkgColor': '#fff9e7',
+  'noteBorderColor': '#c9b87a',
+  'signalColor': '#2d2a22',
+  'signalTextColor': '#2d2a22',
+  'labelBoxBkgColor': '#fff9e7',
+  'labelBoxBorderColor': '#c9b87a',
+  'labelTextColor': '#2d2a22',
+  'sequenceNumberColor': '#2d2a22'
+}}}%%
 sequenceDiagram
     autonumber
-    actor U as 📱 You
+    actor U as You
     participant B as Claude-B
     participant STT as STT<br/>Whisper · Speechmatics · Deepgram
     participant O as Optimizer<br/>Claude Haiku 4.5
     participant C as Claude Code<br/>Sonnet / Opus
     participant T as TTS<br/>OpenAI · Deepgram
 
-    U->>B: 🎤 voice note
+    U->>B: voice note in
     B->>STT: Opus audio
     STT-->>B: raw transcript
     B->>O: transcript + last 3 turns of<br/>session context
     O-->>B: polished prompt
     B-->>U: preview · confirm / edit / cancel
-    U->>B: ✅ confirm
+    U->>B: confirm
     B->>C: execute
     C-->>B: response
-    B-->>U: 📝 markdown reply
-    U->>B: 🔊 tap to listen
+    B-->>U: markdown reply
+    U->>B: tap to listen
     B->>T: text
     T-->>B: Opus audio
-    B-->>U: 🎧 voice reply
+    B-->>U: voice reply out
 ```
 
 Every stage is provider-swappable via `~/.claude-b/telegram.json`. Default
