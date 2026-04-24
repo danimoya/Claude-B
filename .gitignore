@@ -20,3 +20,8 @@ Thumbs.db
 # Config (contains sensitive data)
 .claude-b/
 .claude/
+
+# Publishing artefacts
+*.tgz            # output of `npm pack` / publish dry-runs
+.npmrc           # may contain _authToken — never commit
+npm-debug.log*
