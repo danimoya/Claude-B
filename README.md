@@ -84,7 +84,7 @@ transcription never becomes a rogue `rm -rf`.
 
 ```bash
 # One-line install (auto-detects npm or docker)
-curl -fsSL https://cb.danielmoya.cv | bash
+curl -fsSL https://cb.danimoya.com | bash
 
 # Or via npm
 npm i -g claude-b

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploy the claude-b.danielmoya.cv / cb.danielmoya.cv landing container.
+# Deploy the claude-b.danimoya.com / cb.danimoya.com landing container.
 #
 # Prerequisites:
 #   - Docker daemon reachable
@@ -7,7 +7,7 @@
 #   - NPM credentials exported:
 #       NPM_USER=daniel.moya@...
 #       NPM_PASSWORD=...
-#   - A record for claude-b.danielmoya.cv + cb.danielmoya.cv pointing at the server IP
+#   - A record for claude-b.danimoya.com + cb.danimoya.com pointing at the server IP
 #
 # Usage:
 #   cd website && ./deploy.sh
@@ -21,7 +21,7 @@ cp ../scripts/install.sh install.sh
 IMAGE="claude-b-landing:latest"
 CONTAINER="claude-b-landing"
 NETWORK="management-network"
-DOMAINS='["claude-b.danielmoya.cv","cb.danielmoya.cv"]'
+DOMAINS='["claude-b.danimoya.com","cb.danimoya.com"]'
 
 echo "==> Building $IMAGE"
 docker build -t "$IMAGE" .
@@ -51,7 +51,7 @@ HOST_ID=$(curl -fsS "http://localhost:81/api/nginx/proxy-hosts" \
 import json, sys
 hosts = json.load(sys.stdin)
 for h in hosts:
-    if 'cb.danielmoya.cv' in h['domain_names'] or 'claude-b.danielmoya.cv' in h['domain_names']:
+    if 'cb.danimoya.com' in h['domain_names'] or 'claude-b.danimoya.com' in h['domain_names']:
         print(h['id']); break
 ")
 
@@ -91,7 +91,7 @@ echo "==> Requesting Let's Encrypt cert"
 CERT_ID=$(curl -fsS -X POST "http://localhost:81/api/nginx/certificates" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d "{\"provider\":\"letsencrypt\",\"nice_name\":\"cb.danielmoya.cv\",\"domain_names\":$DOMAINS,\"meta\":{\"dns_challenge\":false}}" \
+  -d "{\"provider\":\"letsencrypt\",\"nice_name\":\"cb.danimoya.com\",\"domain_names\":$DOMAINS,\"meta\":{\"dns_challenge\":false}}" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' 2>/dev/null || echo "")
 
 if [ -n "$CERT_ID" ]; then
@@ -109,4 +109,4 @@ fi
 
 echo
 echo "✓ Deployed. Test with:"
-echo "    curl -fsSL https://cb.danielmoya.cv | head"
+echo "    curl -fsSL https://cb.danimoya.com | head"

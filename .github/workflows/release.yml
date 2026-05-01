@@ -134,7 +134,7 @@ jobs:
 
             ```bash
             # One-line install
-            curl -fsSL https://cb.danielmoya.cv | bash
+            curl -fsSL https://cb.danimoya.com | bash
 
             # Or via npm
             npm i -g claude-b

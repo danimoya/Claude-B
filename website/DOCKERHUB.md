@@ -112,7 +112,7 @@ Graviton).
 
 ```bash
 # One-line install — auto-detects npm or docker
-curl -fsSL https://cb.danielmoya.cv | bash
+curl -fsSL https://cb.danimoya.com | bash
 
 # npm (requires Node.js 20+)
 npm i -g claude-b && cb init

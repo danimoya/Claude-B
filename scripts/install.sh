@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Claude-B installer
 # Usage:
-#   curl -fsSL https://cb.danielmoya.cv | bash
-#   curl -fsSL https://cb.danielmoya.cv | bash -s -- --method npm
+#   curl -fsSL https://cb.danimoya.com | bash
+#   curl -fsSL https://cb.danimoya.com | bash -s -- --method npm
 #
 # Methods (auto-detected, override with --method):
 #   npm     — requires node >= 20

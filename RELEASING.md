@@ -102,7 +102,7 @@ docker manifest inspect danimoya/claude-b:latest | jq '.manifests[] | .platform'
 docker pull ghcr.io/danimoya/claude-b:latest
 
 # End-to-end: the landing script
-curl -fsSL https://cb.danielmoya.cv | head
+curl -fsSL https://cb.danimoya.com | head
 ```
 
 ## Keeping the Docker Hub README in sync
