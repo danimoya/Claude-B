@@ -5,54 +5,281 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="icon" type="image/png" href="/favicon.png" />
   <link rel="apple-touch-icon" href="/favicon.png" />
-  <title>Claude-B — background Claude Code</title>
-  <meta name="description" content="Claude-B: background-capable Claude Code with async workflows, Telegram bot, and multi-host orchestration." />
+  <title>Claude-B — background Claude Code with a multi-LLM voice pipeline</title>
+  <meta name="description" content="Claude-B runs Claude Code in the background. Telegram bot, REST API, multi-host orchestration, and a four-stage STT → optimizer → Claude → TTS voice pipeline that turns rambling voice notes into structured prompts grounded in your session." />
+  <meta property="og:title" content="Claude-B — background Claude Code" />
+  <meta property="og:description" content="Async Claude Code sessions, Telegram bot, and a multi-LLM voice-to-voice pipeline that grounds prompt optimization in live session context." />
+  <meta property="og:image" content="/voice-pipeline.png" />
   <style>
     :root {
-      --bg: #0b0d10; --fg: #e6edf3; --mute: #8b949e; --accent: #79c0ff; --border: #30363d;
-      --code-bg: #161b22;
+      --bg: #0b0d10; --fg: #e6edf3; --mute: #8b949e; --accent: #79c0ff;
+      --accent-dim: #1f6feb33; --border: #30363d; --code-bg: #161b22;
+      --hl: #d29922;
     }
     * { box-sizing: border-box; }
-    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg); font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace; line-height: 1.55; }
-    main { max-width: 720px; margin: 0 auto; padding: 4rem 1.5rem 6rem; }
-    h1 { font-size: 2rem; margin: 0 0 0.25rem; }
-    h2 { font-size: 1.15rem; margin: 2.5rem 0 0.75rem; color: var(--accent); }
-    .tag { color: var(--mute); font-size: 0.95rem; margin-bottom: 2.5rem; }
+    html, body {
+      margin: 0; padding: 0;
+      background: var(--bg); color: var(--fg);
+      font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+      line-height: 1.55;
+    }
+    main { max-width: 880px; margin: 0 auto; padding: 4rem 1.5rem 6rem; }
+    header { margin-bottom: 3rem; }
+    h1 { font-size: 2.4rem; margin: 0 0 0.4rem; letter-spacing: -0.02em; }
+    h2 {
+      font-size: 1.2rem; margin: 3rem 0 1rem;
+      color: var(--accent); letter-spacing: -0.01em;
+    }
+    h3 { font-size: 1rem; margin: 1.5rem 0 0.5rem; color: var(--fg); }
+    .tag { color: var(--mute); font-size: 1rem; margin: 0; }
+    .lede { color: var(--fg); font-size: 1.05rem; margin: 1rem 0 0.5rem; max-width: 640px; }
     pre {
       background: var(--code-bg);
       border: 1px solid var(--border);
-      border-radius: 6px;
+      border-radius: 8px;
       padding: 1rem 1.1rem;
       overflow-x: auto;
       font-size: 0.92rem;
     }
     code { color: var(--accent); }
     pre code { color: var(--fg); }
-    a { color: var(--accent); }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
     ul { padding-left: 1.25rem; }
-    li { margin: 0.3rem 0; }
-    .cta { display: inline-block; margin-top: 0.5rem; font-size: 0.9rem; color: var(--mute); }
-    .footer { margin-top: 4rem; color: var(--mute); font-size: 0.85rem; }
+    li { margin: 0.35rem 0; }
+    .cta { display: block; margin-top: 0.4rem; font-size: 0.9rem; color: var(--mute); }
+    .footer { margin-top: 4rem; color: var(--mute); font-size: 0.85rem; border-top: 1px solid var(--border); padding-top: 1.5rem; }
+
+    /* Pipeline diagram */
+    .pipeline-figure {
+      margin: 1.5rem 0 0.5rem;
+      padding: 1rem;
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+    .pipeline-figure img { max-width: 100%; height: auto; display: block; }
+    .pipeline-caption {
+      font-size: 0.85rem;
+      color: var(--mute);
+      margin: 0.5rem 0 0;
+      text-align: center;
+    }
+
+    /* Step list */
+    .steps {
+      counter-reset: step;
+      list-style: none;
+      padding: 0;
+      margin: 1rem 0;
+    }
+    .steps li {
+      counter-increment: step;
+      position: relative;
+      padding: 0.6rem 0 0.6rem 2.4rem;
+      border-left: 1px solid var(--border);
+      margin-left: 1rem;
+    }
+    .steps li::before {
+      content: counter(step);
+      position: absolute;
+      left: -0.9rem; top: 0.55rem;
+      width: 1.8rem; height: 1.8rem;
+      background: var(--accent-dim);
+      color: var(--accent);
+      border: 1px solid var(--accent);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 600;
+      font-size: 0.85rem;
+    }
+    .steps li strong { color: var(--accent); display: block; margin-bottom: 0.15rem; }
+
+    /* API requirements table */
+    .api-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 1rem 0;
+      font-size: 0.92rem;
+    }
+    .api-table th, .api-table td {
+      padding: 0.65rem 0.8rem;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    .api-table th { color: var(--mute); font-weight: 600; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; }
+    .api-table td:first-child { white-space: nowrap; color: var(--fg); }
+    .api-table td.muted { color: var(--mute); }
+    .pill {
+      display: inline-block;
+      padding: 0.1rem 0.5rem;
+      font-size: 0.75rem;
+      border-radius: 3px;
+      background: var(--accent-dim);
+      color: var(--accent);
+      margin-right: 0.3rem;
+    }
+    .pill.req { background: rgba(248, 81, 73, 0.15); color: #f85149; }
+    .pill.opt { background: rgba(63, 185, 80, 0.12); color: #3fb950; }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.2rem;
+      margin: 1rem 0;
+    }
+    @media (max-width: 600px) {
+      .grid-2 { grid-template-columns: 1fr; }
+      h1 { font-size: 2rem; }
+    }
   </style>
 </head>
 <body>
   <main>
-    <h1>Claude-B</h1>
-    <p class="tag">Background-capable Claude Code — async workflows, Telegram bot, REST API.</p>
+    <header>
+      <h1>Claude-B</h1>
+      <p class="tag">Background Claude Code · Telegram bot · REST API · multi-host orchestration.</p>
+      <p class="lede">
+        Run Claude Code as a daemon, talk to it from your phone, and let a
+        four-stage <strong style="color:var(--hl)">multi-LLM voice pipeline</strong>
+        turn rambling voice notes into structured prompts grounded in your live
+        session context.
+      </p>
+    </header>
 
     <h2>Install</h2>
     <pre><code>curl -fsSL https://cb.danimoya.com | bash</code></pre>
-    <p class="cta">Auto-detects <code>npm</code> or <code>docker</code>. Use <code>--method docker</code> to force.</p>
+    <span class="cta">Auto-detects <code>npm</code> or <code>docker</code>. Force with <code>--method docker</code>.</span>
 
     <h2>Configure</h2>
     <pre><code>cb init</code></pre>
-    <p class="cta">Interactive wizard — connects the Telegram bot and writes <code>~/.claude-b/.env</code>.</p>
+    <span class="cta">Interactive wizard — connects the Telegram bot, configures the voice pipeline, writes <code>~/.claude-b/.env</code>.</span>
+
+    <h2>The voice pipeline</h2>
+    <p>
+      Most Telegram-AI bots forward your voice note to one model and play the
+      reply back. Claude-B chains <strong>four specialised models</strong> per
+      round-trip. The differentiator is the middle stage — a prompt optimiser
+      that reads your raw transcript <em>and the last few turns of the target
+      session</em>, then rewrites the request as something Claude Code can
+      actually execute.
+    </p>
+
+    <figure class="pipeline-figure">
+      <img src="/voice-pipeline.png" alt="Sequence diagram of the Claude-B voice pipeline: Telegram → STT → Optimizer → Claude Code → TTS → Telegram" />
+      <figcaption class="pipeline-caption">Voice in, structured prompt out, voice summary back — four LLMs, one trip.</figcaption>
+    </figure>
+
+    <ol class="steps">
+      <li>
+        <strong>STT — speech to text</strong>
+        Voice note arrives from Telegram (.ogg). Transcribed by your chosen
+        STT provider into raw text. Picks up filler words, mishears domain
+        terms, doesn't know what you're working on.
+      </li>
+      <li>
+        <strong>Context gathering</strong>
+        Reads the target session's transcript path (cached from the most recent
+        <code>Stop</code> hook) and pulls the last 3 user + 3 assistant turns,
+        plus the working directory and current status. No turn history? The
+        next stage runs ungrounded.
+      </li>
+      <li>
+        <strong>Optimiser — transcript to structured prompt</strong>
+        A fast model (default: <code>claude-haiku-4-5</code>) gets the raw
+        transcript and the session context, with a system prompt instructing it
+        to fix STT errors, drop filler, add specificity from context, and
+        preserve intent without inventing requirements. Output: an actionable
+        prompt for Claude Code. You see it on Telegram with confirm / edit /
+        cancel buttons before it runs.
+      </li>
+      <li>
+        <strong>Claude Code — execution</strong>
+        The optimised prompt is routed to the right session: a long-running
+        Claude-B session via the daemon, or a live tmux pane via
+        <code>tmux send-keys</code>. Claude Code runs as it would in your
+        terminal — tool calls, edits, the lot.
+      </li>
+      <li>
+        <strong>TTS — text to speech</strong>
+        When Claude responds, the result is summarised and synthesised into a
+        voice note that plays back in Telegram. You can listen on your commute
+        instead of staring at a transcript.
+      </li>
+    </ol>
+
+    <p>
+      Each stage's provider is independent — pick what you have keys for, mix
+      and match, and swap any one without touching the others.
+    </p>
+
+    <h2>API requirements</h2>
+    <p>
+      The voice pipeline needs three things wired up: an STT provider, a
+      prompt-optimiser provider, and a Telegram bot token. TTS reuses the STT
+      provider's account where supported.
+    </p>
+
+    <table class="api-table">
+      <thead>
+        <tr><th>Stage</th><th>Provider options</th><th>API key env / command</th><th>Notes</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><span class="pill req">required</span> Telegram bot</td>
+          <td>BotFather token</td>
+          <td><code>cb --telegram &lt;TOKEN&gt;</code></td>
+          <td class="muted">No bot, no voice in/out. Free; create via <a href="https://t.me/BotFather">@BotFather</a>.</td>
+        </tr>
+        <tr>
+          <td><span class="pill req">required</span> STT (speech-in)</td>
+          <td>OpenAI Whisper · Speechmatics · Deepgram</td>
+          <td><code>cb --voice-setup &lt;provider&gt; &lt;KEY&gt;</code></td>
+          <td class="muted">Same key handles TTS where the provider supports it (OpenAI, Speechmatics, Deepgram all do).</td>
+        </tr>
+        <tr>
+          <td><span class="pill req">required</span> Optimiser (LLM)</td>
+          <td>Anthropic direct · OpenRouter</td>
+          <td><code>cb --ai-provider anthropic &lt;KEY&gt;</code><br/><code>cb --ai-provider openrouter &lt;KEY&gt;</code></td>
+          <td class="muted">Default model: <code>claude-haiku-4-5</code> (fast, cheap, accurate enough for prompt rewriting). OpenRouter routes to any model.</td>
+        </tr>
+        <tr>
+          <td><span class="pill opt">optional</span> Claude Code execution</td>
+          <td>Anthropic <code>claude</code> CLI</td>
+          <td><code>ANTHROPIC_API_KEY</code></td>
+          <td class="muted">Already configured if <code>claude</code> works in your terminal. Sonnet / Opus per your subscription.</td>
+        </tr>
+        <tr>
+          <td><span class="pill opt">optional</span> ffmpeg</td>
+          <td>system package</td>
+          <td><code>apt install ffmpeg</code></td>
+          <td class="muted">Required only for TTS (Telegram voice replies). STT-only flows work without it.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>Minimum to be voice-active</h3>
+    <pre><code># 1. Bot
+cb --telegram &lt;BOT_TOKEN_FROM_BOTFATHER&gt;
+
+# 2. Speech-to-text + text-to-speech (one provider, one key)
+cb --voice-setup openai sk-proj-...
+
+# 3. Prompt optimiser (Anthropic direct — recommended)
+cb --ai-provider anthropic sk-ant-...
+
+# Verify
+cb --voice-status</code></pre>
 
     <h2>What you get</h2>
     <ul>
-      <li>Background Claude Code sessions with async prompts</li>
-      <li>Telegram bot for remote control + voice notes (Whisper + TTS)</li>
+      <li>Background Claude Code sessions with async, fire-and-forget prompts</li>
+      <li>Telegram bot — text and voice in, voice out, inline confirm / edit / cancel</li>
       <li>REST API + WebSocket for programmatic access</li>
+      <li>Live tmux pane integration via <code>send-keys</code></li>
       <li>Multi-host orchestration across machines</li>
     </ul>
 
@@ -66,9 +293,19 @@ docker run -d \
   --env-file ~/.claude-b/.env \
   ghcr.io/danimoya/claude-b:latest</code></pre>
 
+    <h2>Pair with a dashboard</h2>
+    <p>
+      <a href="https://github.com/danimoya/Claude-Dashboard">Claude-Dashboard</a>
+      is a self-hosted web GUI that surfaces Claude-B's inbox, session
+      transcripts, and live tmux panes — same daemon, browser instead of phone.
+      Both use the recommended single-database tier on
+      <a href="https://github.com/Dimensigon/HDB-HeliosDB-Nano">HeliosDB-Nano</a>.
+    </p>
+
     <p class="footer">
       Source: <a href="https://github.com/danimoya/Claude-B">github.com/danimoya/Claude-B</a> ·
-      License: Apache-2.0
+      License: Apache-2.0 ·
+      Diagram: <a href="/voice-pipeline.png">voice-pipeline.png</a>
     </p>
   </main>
 </body>
