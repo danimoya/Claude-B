@@ -162,7 +162,7 @@ Feature requests are welcome! Please:
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the AGPL-3.0 license.
+By contributing, you agree that your contributions will be licensed under the Apache-2.0 license.
 
 ## Questions?
 

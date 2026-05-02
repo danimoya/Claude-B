@@ -127,7 +127,7 @@ cd Claude-B && pnpm install && pnpm build && pnpm link --global
 - **Source & docs:** https://github.com/danimoya/Claude-B
 - **Issues:** https://github.com/danimoya/Claude-B/issues
 - **GHCR mirror:** `ghcr.io/danimoya/claude-b`
-- **License:** AGPL-3.0
+- **License:** Apache-2.0
 
 ## Topics
 

@@ -934,4 +934,4 @@ cb transform register my-parser --script ./parse.js
 
 ## License
 
-AGPL-3.0 - See [LICENSE](LICENSE) for details.
+Apache-2.0 - See [LICENSE](LICENSE) for details.
