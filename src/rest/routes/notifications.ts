@@ -63,4 +63,22 @@ export async function registerNotificationRoutes(
     const cleared = await inbox.markAllRead();
     return { success: true, cleared };
   });
+
+  // Bulk delete — atomic single-write. The dashboard used to fan out N
+  // independent DELETEs, racing the inbox's read-modify-write cycle and
+  // corrupting notifications.jsonl mid-rewrite. These endpoints do the
+  // work in a single rewrite under the inbox mutex.
+  app.post('/api/notifications/delete-all', {
+    preHandler: [app.authenticate]
+  }, async () => {
+    const deleted = await inbox.deleteAll();
+    return { success: true, deleted };
+  });
+
+  app.post('/api/notifications/delete-read', {
+    preHandler: [app.authenticate]
+  }, async () => {
+    const deleted = await inbox.deleteAll({ onlyRead: true });
+    return { success: true, deleted };
+  });
 }
