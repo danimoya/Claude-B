@@ -316,6 +316,18 @@ export class ClaudeBTelegramBot extends EventEmitter {
 
   private async handleStart(msg: TelegramBot.Message): Promise<void> {
     const chatId = String(msg.chat.id);
+
+    // Optional allow-list. When TELEGRAM_ALLOWED_CHAT_IDS is set (comma-separated),
+    // only listed chat IDs may register. Empty/unset = legacy open behaviour.
+    const allowedRaw = process.env.TELEGRAM_ALLOWED_CHAT_IDS?.trim();
+    if (allowedRaw) {
+      const allowed = allowedRaw.split(',').map(s => s.trim()).filter(Boolean);
+      if (allowed.length > 0 && !allowed.includes(chatId)) {
+        await this.safeSend(chatId, '⛔ This bot is private. Your chat is not authorised.');
+        return;
+      }
+    }
+
     await this.configManager.addChatId(chatId);
 
     const voiceStatus = this.voicePipeline ? '🎤 Voice input: Active' : '🎤 Voice input: Not configured';
