@@ -3,6 +3,7 @@ import { EventEmitter } from 'events';
 import { TelegramConfigManager } from './config.js';
 import { VoicePipeline } from './voice.js';
 import { SessionContext } from './ai-provider.js';
+import { isChatAllowed } from './allow-list.js';
 
 /**
  * Convert common Markdown patterns to Telegram-safe HTML.
@@ -317,15 +318,11 @@ export class ClaudeBTelegramBot extends EventEmitter {
   private async handleStart(msg: TelegramBot.Message): Promise<void> {
     const chatId = String(msg.chat.id);
 
-    // Optional allow-list. When TELEGRAM_ALLOWED_CHAT_IDS is set (comma-separated),
-    // only listed chat IDs may register. Empty/unset = legacy open behaviour.
-    const allowedRaw = process.env.TELEGRAM_ALLOWED_CHAT_IDS?.trim();
-    if (allowedRaw) {
-      const allowed = allowedRaw.split(',').map(s => s.trim()).filter(Boolean);
-      if (allowed.length > 0 && !allowed.includes(chatId)) {
-        await this.safeSend(chatId, '⛔ This bot is private. Your chat is not authorised.');
-        return;
-      }
+    // Allow-list gate. Set TELEGRAM_ALLOWED_CHAT_IDS (comma-separated) to
+    // restrict /start. Empty/unset preserves legacy open behaviour.
+    if (!isChatAllowed(chatId, process.env.TELEGRAM_ALLOWED_CHAT_IDS)) {
+      await this.safeSend(chatId, '⛔ This bot is private. Your chat is not authorised.');
+      return;
     }
 
     await this.configManager.addChatId(chatId);
