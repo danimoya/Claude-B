@@ -397,6 +397,7 @@ export function createHost(
     };
   }
 ): RemoteHost {
+  const hc = options?.healthCheck;
   return {
     id: nanoid(8),
     name: options?.name || new URL(url).hostname,
@@ -404,6 +405,12 @@ export function createHost(
     apiKey,
     enabled: options?.enabled ?? true,
     priority: options?.priority ?? 1,
-    healthCheck: options?.healthCheck
+    healthCheck: hc
+      ? {
+          interval: hc.interval ?? 30000,
+          timeout: hc.timeout ?? 5000,
+          unhealthyThreshold: hc.unhealthyThreshold ?? 3,
+        }
+      : undefined,
   };
 }

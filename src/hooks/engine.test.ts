@@ -186,7 +186,7 @@ describe('HookEngine', () => {
     it('should match wildcard hooks', async () => {
       await engine.addShellHook('*', 'echo "catch all"');
 
-      const result = await engine.dispatch('prompt.completed', { sessionId: 'test', promptId: 'p1' });
+      const result = await engine.dispatch('prompt.completed', { sessionId: 'test', promptId: 'p1', status: 'ok' });
 
       expect(result.shellResults.length).toBe(1);
     });

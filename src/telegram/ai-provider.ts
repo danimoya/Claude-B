@@ -1,7 +1,7 @@
 // AI provider abstraction for prompt optimization
 // Supports Anthropic (direct) and OpenRouter (via Anthropic SDK with custom baseURL)
 
-import Anthropic from '@anthropic-ai/sdk';
+import Anthropic, { ClientOptions } from '@anthropic-ai/sdk';
 
 export interface SessionContext {
   sessionName?: string;
@@ -35,7 +35,7 @@ export interface AIProvider {
 export function createAIProvider(config: AIProviderConfig): AIProvider {
   const model = config.model || DEFAULT_MODELS[config.provider] || 'claude-haiku-4-5-20251001';
 
-  const clientOptions: Anthropic.ClientOptions = {
+  const clientOptions: ClientOptions = {
     apiKey: config.apiKey,
   };
 

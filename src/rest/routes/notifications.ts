@@ -16,9 +16,9 @@ export async function registerNotificationRoutes(
 ): Promise<void> {
 
   // List notifications
-  app.get('/api/notifications', {
+  app.get<{ Querystring: ListNotificationsQuery }>('/api/notifications', {
     preHandler: [app.authenticate]
-  }, async (request: FastifyRequest<{ Querystring: ListNotificationsQuery }>) => {
+  }, async (request) => {
     const unreadOnly = request.query.unread === 'true';
     const limit = request.query.limit ? parseInt(request.query.limit, 10) : undefined;
     const notifications = unreadOnly

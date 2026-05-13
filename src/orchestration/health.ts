@@ -1,7 +1,7 @@
 // Health monitoring for remote Claude-B instances
 
 import { EventEmitter } from 'events';
-import { RemoteClient, RemoteHostStatus } from './remote-client.js';
+import { RemoteClient } from './remote-client.js';
 
 export interface HealthCheckConfig {
   interval: number;        // Check interval in ms
@@ -49,13 +49,11 @@ export class HealthMonitor extends EventEmitter {
   private isHealthy = true;
   private consecutiveFailures = 0;
   private consecutiveSuccesses = 0;
-  private startTime: number;
 
   constructor(client: RemoteClient, config?: Partial<HealthCheckConfig>) {
     super();
     this.client = client;
     this.config = { ...DEFAULT_CONFIG, ...config };
-    this.startTime = Date.now();
   }
 
   start(): void {

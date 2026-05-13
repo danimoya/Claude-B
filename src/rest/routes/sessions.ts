@@ -203,7 +203,7 @@ export async function registerSessionRoutes(
   // Get current selected session
   app.get('/api/sessions/current', {
     preHandler: [app.authenticate]
-  }, async (request: FastifyRequest, reply: FastifyReply) => {
+  }, async (_request: FastifyRequest, reply: FastifyReply) => {
     const session = sessionManager.current();
 
     if (!session) {

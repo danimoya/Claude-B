@@ -64,6 +64,7 @@ describe('Session', () => {
         model: 'haiku',
         status: 'idle',
         createdAt: '2024-01-01T00:00:00.000Z',
+        lastActivityAt: '2024-01-01T00:00:00.000Z',
         workingDir: '/tmp',
         promptCount: 5,
         lastPromptId: 'xyz789'

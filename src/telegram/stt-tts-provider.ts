@@ -27,7 +27,7 @@ export function createSTTTTSProvider(config: STTProviderConfig, tempDir: string)
     case 'deepgram':
       return new DeepgramProvider(config.apiKey);
     case 'openai':
-      return new OpenAIProvider(config.apiKey, tempDir, config.ttsModel, config.ttsVoice);
+      return new OpenAIProvider(config.apiKey, config.ttsModel, config.ttsVoice);
     default:
       throw new Error(`Unknown STT provider: ${config.provider}`);
   }
@@ -155,13 +155,11 @@ class DeepgramProvider implements STTTTSProvider {
 
 class OpenAIProvider implements STTTTSProvider {
   private apiKey: string;
-  private tempDir: string;
   private ttsModel: string;
   private ttsVoice: string;
 
-  constructor(apiKey: string, tempDir: string, ttsModel?: string, ttsVoice?: string) {
+  constructor(apiKey: string, ttsModel?: string, ttsVoice?: string) {
     this.apiKey = apiKey;
-    this.tempDir = tempDir;
     this.ttsModel = ttsModel || 'gpt-4o-mini-tts';
     this.ttsVoice = ttsVoice || 'alloy';
   }
@@ -260,27 +258,3 @@ async function convertPcmToOggOpus(pcmBuffer: Buffer, tempDir: string): Promise<
   }
 }
 
-async function convertOpusToOggOpus(opusBuffer: Buffer, tempDir: string): Promise<Buffer> {
-  await mkdir(tempDir, { recursive: true });
-  const id = randomBytes(8).toString('hex');
-  const inputFile = join(tempDir, `tts-${id}.opus`);
-  const outputFile = join(tempDir, `tts-${id}.ogg`);
-  await writeFile(inputFile, opusBuffer);
-
-  try {
-    await new Promise<void>((resolve, reject) => {
-      execFile('ffmpeg', [
-        '-i', inputFile,
-        '-c:a', 'libopus', '-b:a', '64k', '-f', 'ogg',
-        outputFile,
-      ], { timeout: 30000 }, (error) => {
-        if (error) reject(new Error(`ffmpeg Opus→OGG failed: ${error.message}`));
-        else resolve();
-      });
-    });
-    return await readFile(outputFile);
-  } finally {
-    await unlink(inputFile).catch(() => {});
-    await unlink(outputFile).catch(() => {});
-  }
-}

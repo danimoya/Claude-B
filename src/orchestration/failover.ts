@@ -1,7 +1,7 @@
 // Failover and retry mechanisms for multi-host orchestration
 
 import { EventEmitter } from 'events';
-import { RemoteClient, RemoteClientManager, RemoteHostStatus, RemotePromptResult } from './remote-client.js';
+import { RemoteClient, RemoteClientManager, RemoteHostStatus } from './remote-client.js';
 
 export interface RetryConfig {
   maxRetries: number;

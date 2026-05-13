@@ -1,7 +1,7 @@
 // Pipeline orchestration for multi-host AI workflows
 
 import { EventEmitter } from 'events';
-import { RemoteClient, RemoteClientManager, RemotePromptResult } from './remote-client.js';
+import { RemoteClient, RemoteClientManager } from './remote-client.js';
 
 export type StepResult = {
   stepId: string;
@@ -301,7 +301,7 @@ export class PipelineExecutor extends EventEmitter {
     context: PipelineContext,
     startTime: string
   ): Promise<StepResult> {
-    const promises = step.steps.map(s => this.executeStep(s, context));
+    const promises = step.steps.map(s => this.executeStep(s as AnyPipelineStep, context));
 
     let results: StepResult[];
     if (step.waitForAll !== false) {
@@ -311,7 +311,7 @@ export class PipelineExecutor extends EventEmitter {
       results = await Promise.race([
         Promise.all(promises),
         new Promise<StepResult[]>((resolve) => {
-          promises.forEach(async (p, i) => {
+          promises.forEach(async (p) => {
             const result = await p;
             if (result.status === 'completed') {
               resolve([result]);
@@ -373,7 +373,7 @@ export class PipelineExecutor extends EventEmitter {
       };
     }
 
-    const result = await this.executeStep(stepToExecute, context);
+    const result = await this.executeStep(stepToExecute as AnyPipelineStep, context);
 
     return {
       stepId: step.id,

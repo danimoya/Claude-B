@@ -48,9 +48,9 @@ export async function registerHookRoutes(
   });
 
   // Get event history
-  app.get('/api/hooks/history', {
+  app.get<{ Querystring: { limit?: string } }>('/api/hooks/history', {
     preHandler: [app.authenticate]
-  }, async (request: FastifyRequest<{ Querystring: { limit?: string } }>) => {
+  }, async (request) => {
     const limit = request.query.limit ? parseInt(request.query.limit, 10) : 50;
     return { events: hookEngine.getEventHistory(limit) };
   });
