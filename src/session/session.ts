@@ -6,14 +6,9 @@ import { EventEmitter } from 'events';
 import { mkdir, writeFile, readFile, appendFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { getClaudePath } from '../utils/claude-detector.js';
-
-// Try to import node-pty, fall back to regular spawn if not available
-let pty: typeof import('node-pty') | null = null;
-try {
-  pty = await import('node-pty');
-} catch {
-  // node-pty not available, will use spawn fallback
-}
+import type * as NodePty from 'node-pty';
+// Node-pty types are kept for the NodePty.IPty branches in write/resize/kill,
+// but the active spawn path uses ChildProcess via `claude --print`.
 
 export interface StructuredResult {
   result: string;
@@ -57,9 +52,8 @@ export class Session extends EventEmitter {
   public lastActivityAt: string;
 
   private workingDir: string;
-  private configDir: string;
   private sessionDir: string;
-  private process: ChildProcess | pty.IPty | null = null;
+  private process: ChildProcess | NodePty.IPty | null = null;
   private outputBuffer: string[] = [];
   private currentPromptOutput: string[] = [];
   private lastOutput: string = '';
@@ -83,7 +77,6 @@ export class Session extends EventEmitter {
     this.status = state.status;
     this.createdAt = state.createdAt;
     this.workingDir = state.workingDir;
-    this.configDir = configDir;
     this.sessionDir = `${configDir}/sessions/${this.id}`;
     this.lastPromptId = state.lastPromptId;
     this.promptCount = state.promptCount || 0;
@@ -180,15 +173,6 @@ export class Session extends EventEmitter {
     await appendFile(historyPath, JSON.stringify(entry) + '\n');
   }
 
-  private waitForReady(): Promise<void> {
-    if (this.isReady) {
-      return Promise.resolve();
-    }
-    return new Promise((resolve) => {
-      this.readyResolvers.push(resolve);
-    });
-  }
-
   private markReady(): void {
     if (this.isReady) return;
     this.isReady = true;
@@ -196,59 +180,6 @@ export class Session extends EventEmitter {
       resolver();
     }
     this.readyResolvers = [];
-  }
-
-  private async startClaudeProcess(): Promise<void> {
-    if (this.process) {
-      return; // Already running
-    }
-
-    await this.ensureSessionDir();
-
-    // Try to use PTY for full interactive support
-    const claudePath = getClaudePath();
-    if (pty) {
-      this.process = pty.spawn(claudePath, ['--dangerously-skip-permissions'], {
-        name: 'xterm-256color',
-        cols: 120,
-        rows: 40,
-        cwd: this.workingDir,
-        env: { ...process.env, TERM: 'xterm-256color' }
-      });
-
-      (this.process as pty.IPty).onData((data: string) => {
-        this.handleOutput(data);
-      });
-
-      (this.process as pty.IPty).onExit(({ exitCode }) => {
-        this.handleProcessExit(exitCode);
-      });
-    } else {
-      // Fallback to regular spawn with pipe
-      const proc = spawn(claudePath, ['--print'], {
-        cwd: this.workingDir,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env }
-      });
-
-      this.process = proc;
-
-      proc.stdout?.on('data', (chunk: Buffer) => {
-        this.handleOutput(chunk.toString());
-      });
-
-      proc.stderr?.on('data', (chunk: Buffer) => {
-        this.handleOutput(chunk.toString());
-      });
-
-      proc.on('exit', (code) => {
-        this.handleProcessExit(code);
-      });
-
-      proc.on('error', (error) => {
-        this.handleProcessError(error);
-      });
-    }
   }
 
   private handleOutput(data: string): void {
@@ -644,7 +575,7 @@ export class Session extends EventEmitter {
     if (this.process) {
       if ('write' in this.process) {
         // PTY
-        (this.process as pty.IPty).write(data);
+        (this.process as NodePty.IPty).write(data);
       } else if ((this.process as ChildProcess).stdin?.writable) {
         // Regular process
         (this.process as ChildProcess).stdin?.write(data);
@@ -654,7 +585,7 @@ export class Session extends EventEmitter {
 
   resize(cols: number, rows: number): void {
     if (this.process && 'resize' in this.process) {
-      (this.process as pty.IPty).resize(cols, rows);
+      (this.process as NodePty.IPty).resize(cols, rows);
     }
   }
 
@@ -663,7 +594,7 @@ export class Session extends EventEmitter {
       if ('kill' in this.process && typeof this.process.kill === 'function') {
         if ('pid' in this.process) {
           // PTY
-          (this.process as pty.IPty).kill();
+          (this.process as NodePty.IPty).kill();
         } else {
           // ChildProcess
           (this.process as ChildProcess).kill('SIGTERM');
@@ -685,7 +616,7 @@ export class Session extends EventEmitter {
           if (this.process && 'kill' in this.process) {
             try {
               if ('pid' in this.process) {
-                process.kill((this.process as pty.IPty).pid, 'SIGKILL');
+                process.kill((this.process as NodePty.IPty).pid, 'SIGKILL');
               } else {
                 (this.process as ChildProcess).kill('SIGKILL');
               }
@@ -726,29 +657,4 @@ export class Session extends EventEmitter {
   }
 }
 
-// Type augmentation for node-pty
-declare namespace pty {
-  interface IPty {
-    pid: number;
-    cols: number;
-    rows: number;
-    process: string;
-    onData(callback: (data: string) => void): void;
-    onExit(callback: (e: { exitCode: number; signal?: number }) => void): void;
-    write(data: string): void;
-    resize(cols: number, rows: number): void;
-    kill(signal?: string): void;
-  }
-
-  function spawn(
-    file: string,
-    args: string[],
-    options: {
-      name?: string;
-      cols?: number;
-      rows?: number;
-      cwd?: string;
-      env?: NodeJS.ProcessEnv;
-    }
-  ): IPty;
-}
+// Types come from `import type * as NodePty from 'node-pty'` at the top of the file.

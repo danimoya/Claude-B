@@ -92,7 +92,7 @@ export async function registerAuthRoutes(
   // Verify current token
   app.get('/api/auth/verify', {
     preHandler: [app.authenticate]
-  }, async (request: FastifyRequest, reply: FastifyReply) => {
+  }, async (request: FastifyRequest, _reply: FastifyReply) => {
     return {
       valid: true,
       user: request.user
