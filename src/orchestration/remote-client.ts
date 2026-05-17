@@ -150,13 +150,16 @@ export class RemoteClient extends EventEmitter {
 
     try {
       const start = Date.now();
+      const headers: Record<string, string> = {
+        'Authorization': `Bearer ${token}`
+      };
+      if (body !== undefined) {
+        headers['Content-Type'] = 'application/json';
+      }
       const response = await fetch(`${this.host.url}${path}`, {
         method,
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        },
-        body: body ? JSON.stringify(body) : undefined,
+        headers,
+        body: body !== undefined ? JSON.stringify(body) : undefined,
         signal: controller.signal
       });
 
@@ -206,21 +209,21 @@ export class RemoteClient extends EventEmitter {
   }
 
   async createSession(name?: string): Promise<RemoteSession> {
-    const result = await this.request<{ session: RemoteSession }>(
+    const result = await this.request<RemoteSession>(
       'POST',
       '/api/sessions',
-      name ? { name } : undefined
+      name ? { name } : {}
     );
-    return { ...result.session, host: this.host.id };
+    return { ...result, host: this.host.id };
   }
 
   async getSession(sessionId: string): Promise<RemoteSession | null> {
     try {
-      const result = await this.request<{ session: RemoteSession }>(
+      const result = await this.request<RemoteSession>(
         'GET',
         `/api/sessions/${sessionId}`
       );
-      return { ...result.session, host: this.host.id };
+      return { ...result, host: this.host.id };
     } catch {
       return null;
     }
