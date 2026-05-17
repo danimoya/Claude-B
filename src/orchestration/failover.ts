@@ -170,11 +170,16 @@ export class FailoverHandler extends EventEmitter {
     let hosts = this.clientManager.getHealthyHosts()
       .filter(h => !excludeHosts?.includes(h.id));
 
-    // Move preferred host to front if specified
+    // Move preferred host to front if specified. Accept either the
+    // auto-generated id (`JXqlNCzL`) or the user-facing name (`gb`) so that
+    // `cb --remote-fire gb` resolves correctly — the CLI passes the name,
+    // not the id.
     if (preferredHost) {
-      const preferred = hosts.find(h => h.id === preferredHost);
+      const preferred = hosts.find(
+        h => h.id === preferredHost || h.name === preferredHost
+      );
       if (preferred) {
-        hosts = [preferred, ...hosts.filter(h => h.id !== preferredHost)];
+        hosts = [preferred, ...hosts.filter(h => h.id !== preferred.id)];
         return hosts;
       }
     }
