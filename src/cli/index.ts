@@ -10,6 +10,7 @@ import { DaemonClient } from '../daemon/client.js';
 import { version } from '../utils/version.js';
 import { detectClaude } from '../utils/claude-detector.js';
 import { runInit } from './init.js';
+import * as tunnel from '../tunnel/manager.js';
 
 // Type definitions for API responses
 interface SessionInfo {
@@ -190,6 +191,14 @@ program
   .option('--inbox-clear', 'Mark all notifications as read')
   .option('--inbox-count', 'Show unread notification count')
   .option('--remote-fire <hostId>', 'Fire and forget to remote host')
+  // Cross-host tunnel management (autossh + systemd) — see USE CASES section in --help
+  .option('--install-tunnel <name>', 'Install a persistent SSH tunnel (autossh + systemd) so --remote-fire can reach a remote daemon')
+  .option('--tunnel-ssh-host <host>', 'SSH host alias to tunnel to (required with --install-tunnel)')
+  .option('--tunnel-local-port <port>', 'Local TCP port to bind (default: auto-pick 13847+)')
+  .option('--tunnel-remote-port <port>', 'Remote port on the target host (default: 3847)')
+  .option('--tunnel-system', 'Install at /etc/systemd/system instead of user scope (requires sudo)')
+  .option('--remove-tunnel <name>', 'Remove an installed tunnel and its systemd unit')
+  .option('--list-tunnels', 'List installed tunnels (user and system scope)')
   // Telegram integration
   .option('--telegram <token>', 'Set up Telegram bot with token')
   .option('--telegram-stop', 'Disable Telegram notifications')
@@ -201,6 +210,48 @@ program
   .option('--voice-status', 'Show voice pipeline status')
   // Shell integration
   .option('--shell-init', 'Output shell hook for inbox notifications (add to .bashrc/.zshrc)')
+  .addHelpText('after', `
+USE CASES — when to reach for which group of commands:
+
+  Local sessions (default)
+    cb "prompt"                       send a prompt; auto-creates a session
+    cb -s / -l / -w / -a <id>         list / last output / live tail / attach
+    cb -f -g "<goal>" "<prompt>"      fire-and-forget on this host
+
+  Cross-host orchestration  (talk to a Claude-B daemon on another machine)
+    cb --remote-add <url> --remote-key <k> --remote-name <name>
+                                      register a remote daemon
+    cb --remote-fire <name> "..."     fire-and-forget on the named host
+    cb --remote      <name> "..."     synchronous send to that host
+    cb --remote-hosts / --remote-health / --remote-stats
+                                      inspect orchestration state
+    cb -i                             read replies (notification inbox)
+
+  Cross-host plumbing  (only needed if --remote-fire can't reach the target)
+    cb --install-tunnel <name> --tunnel-ssh-host <ssh-alias>
+                                      installs an autossh systemd unit so
+                                      a local port forwards to the remote
+                                      daemon's 127.0.0.1:3847. Survives
+                                      reboots and network blips.
+    cb --remove-tunnel <name>         undoes it
+    cb --list-tunnels                 shows installed tunnels
+
+  The daemon binds 127.0.0.1:3847 only, so cross-host orchestration always
+  needs a TCP path. If both hosts share a private network and you can
+  reconfigure the daemon, bind it to that interface directly. If not (the
+  usual case), install a tunnel and point --remote-add at localhost:<port>.
+
+  Typical first-time setup, host A → host B:
+    1. cb --install-tunnel b --tunnel-ssh-host hostB
+    2. cb --remote-add http://localhost:13847 \\
+                       --remote-key "$(ssh hostB cat ~/.claude-b/api.key)" \\
+                       --remote-name b
+    3. cb --remote-fire b "hello from A"
+
+  Read in --help-as-documentation order: local → remote → tunnels.
+  --remote-fire is the verb you'll type day to day; --install-tunnel is a
+  one-time install on each pair of hosts.
+`)
   .action(async (promptParts: string[], options) => {
     // Shell init doesn't need daemon connection
     if (options.shellInit) {
@@ -444,6 +495,30 @@ program
 
       if (options.voiceStatus) {
         await showVoiceStatus(client);
+        return;
+      }
+
+      // Tunnel management — handle BEFORE the daemon-connection-required ones
+      // below, since tunnels are pure local config and don't need the daemon.
+      if (options.installTunnel) {
+        client.close();
+        await installTunnelCmd({
+          name: options.installTunnel,
+          sshHost: options.tunnelSshHost,
+          localPort: options.tunnelLocalPort ? Number(options.tunnelLocalPort) : undefined,
+          remotePort: options.tunnelRemotePort ? Number(options.tunnelRemotePort) : undefined,
+          system: Boolean(options.tunnelSystem)
+        });
+        return;
+      }
+      if (options.removeTunnel) {
+        client.close();
+        await removeTunnelCmd(options.removeTunnel, Boolean(options.tunnelSystem));
+        return;
+      }
+      if (options.listTunnels) {
+        client.close();
+        await listTunnelsCmd();
         return;
       }
 
@@ -1191,6 +1266,69 @@ async function fireRemotePrompt(client: DaemonClient, hostId: string, prompt: st
   console.log('');
   console.log(`  ${chalk.yellow('cb -i')}  ${chalk.gray('# check when done')}`);
   process.exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// Tunnel management — autossh + systemd plumbing for cross-host orchestration.
+// These commands do not talk to the daemon; they manage local systemd units.
+// ---------------------------------------------------------------------------
+
+async function installTunnelCmd(spec: tunnel.TunnelSpec): Promise<void> {
+  try {
+    const result = await tunnel.install(spec);
+    console.log(chalk.green('Tunnel installed'));
+    console.log(`  Name:        ${chalk.cyan(result.spec.name)}`);
+    console.log(`  Unit:        ${chalk.gray(result.unitPath)}`);
+    console.log(`  Forward:     ${chalk.cyan(`127.0.0.1:${result.spec.localPort}`)} → ${chalk.cyan(`${result.spec.sshHost}:${result.spec.remotePort}`)}`);
+    console.log(`  Scope:       ${result.spec.system ? 'system (sudo systemctl)' : 'user (systemctl --user)'}`);
+    console.log(`  Active:      ${result.active ? chalk.green('yes') : chalk.yellow('not yet — check `systemctl status`')}`);
+    console.log('');
+    console.log(chalk.gray('Next:'));
+    console.log(`  cb --remote-add http://localhost:${result.spec.localPort} \\`);
+    console.log(`     --remote-key "$(ssh ${result.spec.sshHost} cat ~/.claude-b/api.key)" \\`);
+    console.log(`     --remote-name ${result.spec.name}`);
+    console.log(`  cb --remote-fire ${result.spec.name} "your prompt"`);
+    process.exit(0);
+  } catch (err) {
+    console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+    process.exit(1);
+  }
+}
+
+async function removeTunnelCmd(name: string, system: boolean): Promise<void> {
+  try {
+    const result = await tunnel.remove(name, system);
+    if (result.removed) {
+      console.log(chalk.green(`Tunnel removed: ${name}`));
+      console.log(chalk.gray(`  ${result.unitPath}`));
+    } else {
+      console.log(chalk.yellow(`No tunnel named "${name}" in ${system ? 'system' : 'user'} scope`));
+    }
+    process.exit(0);
+  } catch (err) {
+    console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+    process.exit(1);
+  }
+}
+
+async function listTunnelsCmd(): Promise<void> {
+  try {
+    const tunnels = await tunnel.list();
+    if (tunnels.length === 0) {
+      console.log(chalk.gray('No tunnels installed.'));
+      console.log(chalk.gray('Install one with: cb --install-tunnel <name> --tunnel-ssh-host <host>'));
+      process.exit(0);
+    }
+    console.log(chalk.bold('Installed tunnels:'));
+    for (const t of tunnels) {
+      const status = t.active ? chalk.green('active') : chalk.red('inactive');
+      console.log(`  ${chalk.cyan(t.name.padEnd(20))} ${status.padEnd(20)} ${chalk.gray(`${t.scope}:`)} ${chalk.gray(t.unitPath)}`);
+    }
+    process.exit(0);
+  } catch (err) {
+    console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+    process.exit(1);
+  }
 }
 
 // Notification inbox functions
