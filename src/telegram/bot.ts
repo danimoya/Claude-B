@@ -217,56 +217,118 @@ export class ClaudeBTelegramBot extends EventEmitter {
     const duration = notification.durationMs ? `${(notification.durationMs / 1000).toFixed(1)}s` : '';
     const cost = notification.costUsd ? ` · $${notification.costUsd.toFixed(4)}` : '';
 
-    // Build HTML-formatted message so markdown in Claude Code output renders
+    // Build HTML-formatted message so markdown in Claude Code output renders.
+    // Long bodies are chunked across multiple messages to stay under Telegram's
+    // 4096-char per-message hard limit. The first message holds header / PWD,
+    // owns the session->message_id mapping, and carries the Listen button.
     const escHtml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    const lines: string[] = [];
-    lines.push(`${icon} <b>${escHtml(name)}</b> ${status}${duration ? ` (${duration}${cost})` : ''}`);
 
-    if (notification.goal) {
-      lines.push(`PWD: ${escHtml(notification.goal)}`);
+    const header = `${icon} <b>${escHtml(name)}</b> ${status}${duration ? ` (${duration}${cost})` : ''}`;
+    const pwdLine = notification.goal ? `PWD: ${escHtml(notification.goal)}` : '';
+    const footer = `Reply to follow up, or /select ${notification.sessionId.slice(0, 8)}`;
+
+    // Markdown -> HTML expands (tables, fences, bold), so budget raw input per
+    // chunk well below 4096. 2800 leaves headroom for the wrappers + headers.
+    const RAW_CHUNK_BUDGET = 2800;
+    const HARD_LIMIT = 4096;
+
+    const rawBody = notification.resultPreview || '';
+    const rawChunks: string[] = [];
+    if (rawBody) {
+      const inLines = rawBody.split('\n');
+      let cur = '';
+      const flush = () => { if (cur) { rawChunks.push(cur); cur = ''; } };
+      for (const ln of inLines) {
+        // Hard-split any single line longer than the budget
+        let remaining = ln;
+        while (remaining.length > RAW_CHUNK_BUDGET) {
+          flush();
+          rawChunks.push(remaining.slice(0, RAW_CHUNK_BUDGET));
+          remaining = remaining.slice(RAW_CHUNK_BUDGET);
+        }
+        if (cur.length + remaining.length + 1 > RAW_CHUNK_BUDGET) flush();
+        cur += (cur ? '\n' : '') + remaining;
+      }
+      flush();
     }
 
-    if (notification.resultPreview) {
-      lines.push('');
-      // Telegram message limit is 4096 chars; leave room for header/footer
-      lines.push(markdownToTelegramHtml(notification.resultPreview.slice(0, 3000)));
-    }
+    const total = Math.max(1, rawChunks.length);
 
-    lines.push('');
-    lines.push(`Reply to follow up, or /select ${notification.sessionId.slice(0, 8)}`);
+    // Build each message's text
+    const buildMessage = (idx: number): string => {
+      const parts: string[] = [];
+      const tag = total > 1 ? ` (${idx + 1}/${total})` : '';
+      if (idx === 0) {
+        parts.push(`${header}${tag}`);
+        if (pwdLine) parts.push(pwdLine);
+        if (rawChunks[0]) {
+          parts.push('');
+          parts.push(markdownToTelegramHtml(rawChunks[0]));
+        }
+      } else {
+        parts.push(`📄 <b>${escHtml(name)}</b> continued${tag}`);
+        parts.push('');
+        parts.push(markdownToTelegramHtml(rawChunks[idx]));
+      }
+      if (idx === total - 1) {
+        parts.push('');
+        parts.push(footer);
+      }
+      let text = parts.join('\n');
+      if (text.length > HARD_LIMIT) {
+        // Last-resort truncate (shouldn't trigger given the raw budget).
+        text = text.slice(0, HARD_LIMIT - 24) + '\n… [truncated]';
+      }
+      return text;
+    };
 
-    const text = lines.join('\n');
+    const sendOne = async (text: string): Promise<TelegramBot.Message | undefined> => {
+      const opts: TelegramBot.SendMessageOptions = { parse_mode: 'HTML' };
+      try {
+        return await this.bot!.sendMessage(chatId, text, opts);
+      } catch {
+        // HTML parse failed (or some other Telegram rejection) — strip tags and retry.
+        let plain = text.replace(/<[^>]+>/g, '');
+        if (plain.length > HARD_LIMIT) plain = plain.slice(0, HARD_LIMIT - 24) + '\n… [truncated]';
+        try {
+          return await this.bot!.sendMessage(chatId, plain);
+        } catch {
+          return undefined;
+        }
+      }
+    };
 
     try {
-      // Build send options with HTML parsing
-      const opts: TelegramBot.SendMessageOptions = { parse_mode: 'HTML' };
-      let sent: TelegramBot.Message;
-      try {
-        sent = await this.bot.sendMessage(chatId, text, opts);
-      } catch {
-        // If HTML parse fails (malformed markup), fall back to plain text
-        sent = await this.bot.sendMessage(chatId, lines.join('\n').replace(/<[^>]+>/g, ''));
-      }
+      // Send first message — this one anchors the session mapping + Listen button.
+      const firstSent = await sendOne(buildMessage(0));
+      if (!firstSent) return undefined;
 
-      // Map this message to the session for reply routing
-      await this.configManager.mapMessage(String(sent.message_id), notification.sessionId);
+      await this.configManager.mapMessage(String(firstSent.message_id), notification.sessionId);
 
-      // Add Listen button if voice pipeline is available and there's a result
       if (this.voicePipeline && notification.resultPreview) {
-        this.configManager.storeResult(String(sent.message_id), notification.resultPreview);
-        // Edit message to add the button (sendMessage doesn't support reply_markup with plain text easily)
+        this.configManager.storeResult(String(firstSent.message_id), notification.resultPreview);
         try {
           await this.bot.editMessageReplyMarkup({
             inline_keyboard: [[
-              { text: '🔊 Listen', callback_data: `listen:${sent.message_id}` }
+              { text: '🔊 Listen', callback_data: `listen:${firstSent.message_id}` }
             ]]
-          }, { chat_id: chatId, message_id: sent.message_id });
+          }, { chat_id: chatId, message_id: firstSent.message_id });
         } catch {
           // Not critical if button fails
         }
       }
 
-      return sent.message_id;
+      // Send continuation chunks. Map each to the same session so replies on any
+      // chunk still route correctly. Don't fail the whole notification if a
+      // continuation drops — first message already landed.
+      for (let i = 1; i < total; i++) {
+        const cont = await sendOne(buildMessage(i));
+        if (cont) {
+          await this.configManager.mapMessage(String(cont.message_id), notification.sessionId);
+        }
+      }
+
+      return firstSent.message_id;
     } catch (err) {
       this.emit('error', err);
       return undefined;
