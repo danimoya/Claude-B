@@ -154,6 +154,12 @@ hooks system but with key differences:
   hooks run *outside* the sandbox, so the notify curl works even under
   `-s read-only`. `codex exec` does NOT fire lifecycle hooks — interactive TUI
   only. Log: `~/.claude-b/codex-notify.log`.
+- **Pane restart required**: Codex reads `hooks.json` only at startup. Codex
+  panes that were already running when the hook was added (or last changed)
+  will NOT fire it until restarted — `/quit` + relaunch `codex` in each pane,
+  or wait for natural turnover. New panes pick it up automatically (and, on the
+  first launch after a hook change, show the one-time trust prompt above). A
+  pane silently sending nothing to Telegram is almost always this.
 
 #### TTS Configuration
 
@@ -175,10 +181,11 @@ Available voices: `alloy`, `ash`, `ballad`, `coral`, `echo`, `fable`,
 
 #### Caveats
 
-- **Hook pickup**: the Stop hook in `settings.json` is read at Claude Code
-  startup. Running panes that were started before the hook was added will
-  not fire it. Restart those panes (`/exit` + relaunch `claude`) or wait
-  for natural session turnover.
+- **Hook pickup**: the Stop hook is read at startup — from `settings.json` for
+  Claude Code, from `hooks.json` for Codex. Panes started before the hook was
+  added won't fire it. Restart those panes (`/exit` or `/quit` + relaunch
+  `claude`/`codex`) or wait for natural session turnover. (See the Codex
+  Sessions "Pane restart required" note above for the Codex specifics.)
 
 - **Cold transcript cache**: voice prompt optimisation uses session context
   from a cached transcript path. The cache populates when `/api/notify`
