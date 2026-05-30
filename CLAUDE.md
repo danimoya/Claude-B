@@ -126,6 +126,35 @@ reply — all from your phone.
 }
 ```
 
+#### Codex Sessions
+
+Codex CLI (v0.134+) interactive sessions in tmux are bridged the same way via
+a parallel Stop hook, `bin/codex-notify.sh`. Codex ships a Claude-Code-style
+hooks system but with key differences:
+
+- **Config lives in `~/.codex/hooks.json`** (NOT `settings.json`, which is a
+  separate Codex file). Same `hooks.Stop[].hooks[]` schema; `command` is a
+  single string run through a shell (`$HOME` expands):
+
+  ```json
+  // ~/.codex/hooks.json
+  { "hooks": { "Stop": [{ "hooks": [{
+    "type": "command", "command": "$HOME/Claude-B/bin/codex-notify.sh"
+  }] }] } }
+  ```
+
+- **Payload on stdin** (like Claude) but Codex provides `last_assistant_message`
+  directly — `codex-notify.sh` uses it without parsing the transcript. The
+  `transcript_path` points at a Codex *rollout* JSONL (different format from
+  Claude's; `readLastTurnsFromTranscript` in the daemon understands both).
+- **`agent: "codex"`** is set on the `/api/notify` payload so the daemon can
+  register Codex panes (see `/sessions` caveat below).
+- **Hook trust + sandbox**: Codex prompts "Hooks need review → Trust all and
+  continue" on the next launch after any hook change (one-time gate). Trusted
+  hooks run *outside* the sandbox, so the notify curl works even under
+  `-s read-only`. `codex exec` does NOT fire lifecycle hooks — interactive TUI
+  only. Log: `~/.claude-b/codex-notify.log`.
+
 #### TTS Configuration
 
 Model and voice are read from `~/.claude-b/telegram.json` under
@@ -160,6 +189,16 @@ Available voices: `alloy`, `ash`, `ballad`, `coral`, `echo`, `fable`,
 - **`/sessions` enumeration is synchronous**: the daemon spawns
   `tmux list-panes -a` on each `/sessions` call. At ~22 panes this is
   <10ms. At hundreds of panes, consider caching the result with a short TTL.
+
+- **Codex panes in `/sessions`**: Claude panes are auto-discovered from tmux
+  by `pane_current_command == "claude"`. Codex panes report `node` (the npm
+  wrapper) with no status glyph, so they can't be discovered that way. Instead
+  the daemon keeps a `codexTmuxSessions` registry populated from `/api/notify`
+  (`agent:"codex"`): a Codex pane appears in `/sessions` only **after its first
+  notification**, stays listed while its tmux target is alive (liveness checked
+  per call, dead/expired entries pruned, 24h TTL), and always shows `idle`
+  (Codex has no between-turns busy signal). Replies still route fine regardless,
+  since the notification carries the `tmux:<target>` id.
 
 - **Inline keyboard button labels**: Telegram buttons with long labels
   (60+ chars) truncate visually on narrow phone screens. Pane titles like

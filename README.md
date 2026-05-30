@@ -508,6 +508,81 @@ cb --telegram-status
 cb --voice-status
 ```
 
+### Codex Session Notifications
+
+The same bridge works for [OpenAI Codex CLI](https://developers.openai.com/codex) sessions (v0.134+) running in tmux panes — output notifications, `/sessions` listing, reply-to-notification, and voice all work exactly as they do for Claude Code. Codex ships a Claude-Code-compatible hooks system, so the integration is a parallel Stop hook.
+
+**Prerequisites:**
+- Telegram bot configured + REST API running (same as above)
+- tmux panes running `codex` (interactive TUI — not `codex exec`, which does not fire lifecycle hooks)
+
+**Step 1: Install the Codex Stop hook**
+
+Codex reads hooks from `~/.codex/hooks.json` (note: **not** `settings.json` — that's a different file). Create it (or merge the `Stop` entry into your existing one):
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Claude-B/bin/codex-notify.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hook fires after every top-level Codex response. Codex's Stop payload hands the script the final assistant message directly (`last_assistant_message`), so unlike the Claude hook it doesn't need to parse the transcript on the happy path.
+
+> **Trust prompt:** The next time you launch `codex`, it shows **"Hooks need review → 1 hook is new or changed"**. Choose **"Trust all and continue"** (or *Review hooks* then trust). This is a one-time gate per hook change. Trusted hooks run *outside* the Codex sandbox, so the notification reaches Claude-B even when Codex itself runs read-only.
+>
+> Codex reads `hooks.json` at startup. Panes already running won't fire the hook until restarted (`/quit` + relaunch `codex`), same as the Claude Code caveat above.
+
+**Step 2 & 3** are identical to the Claude Code flow — the same REST API on `localhost:3847` and the same Telegram commands.
+
+**How it works under the hood:**
+
+```
+tmux pane (codex) ──Stop hook──> bin/codex-notify.sh
+                                   │
+                                   │ reads last_assistant_message from stdin payload
+                                   │ resolves tmux target via $TMUX_PANE
+                                   ▼
+                             POST /api/notify  { agent: "codex", … }
+                                   │
+                                   ▼
+                             Claude-B daemon
+                             ├── broadcastNotification → Telegram
+                             ├── register Codex tmux session (for /sessions)
+                             ├── cache transcriptPath (voice context; Codex rollout
+                             │     format is parsed alongside Claude's)
+                             └── persist to notification inbox
+```
+
+Reply-to-notification works the same way as Claude (`tmux send-keys` into the originating pane).
+
+**Codex-specific notes:**
+
+- **`/sessions` listing:** tmux reports Codex panes as `node` (not `codex`) with no status glyph, so Claude-B can't auto-discover them the way it discovers Claude panes. Instead, a Codex pane appears in `/sessions` **after it has sent at least one notification** (the daemon learns of it from the hook) and is listed as long as the pane stays alive. Status always shows `idle` — Codex emits no between-turns busy signal, so there's no live busy/idle glyph to mirror.
+- **Replies** to a Codex notification still route correctly to the pane regardless of the above, because the notification itself carries the `tmux:<target>` id.
+
+**Troubleshooting:**
+
+```bash
+# Check if the Codex hook is firing
+tail -f ~/.claude-b/codex-notify.log
+
+# Confirm Codex sees the hook as enabled
+codex features list | grep '^hooks'         # → hooks  stable  true
+
+# Same REST / Telegram / voice checks as the Claude Code section apply
+```
+
 ### Quick Start: Conversation Continuity
 
 Sessions maintain conversation context across prompts — Claude remembers previous interactions:

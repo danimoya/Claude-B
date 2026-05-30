@@ -15,9 +15,13 @@ interface NotifyBody {
   durationMs?: number;
   costUsd?: number;
   resultPreview?: string;    // last assistant text (full; bot truncates for display)
-  transcriptPath?: string;   // absolute path to the Claude Code session JSONL;
-                             // cached so the voice pipeline can ground
+  transcriptPath?: string;   // absolute path to the Claude Code / Codex session
+                             // JSONL; cached so the voice pipeline can ground
                              // optimizePrompt in real turn history
+  agent?: string;            // originating agent, e.g. "codex". Claude Code's
+                             // cb-notify.sh omits it. Lets the daemon register
+                             // Codex tmux panes (which tmux reports as `node`,
+                             // so they can't be enumerated like Claude panes).
 }
 
 /**
@@ -33,7 +37,8 @@ export async function registerNotifyRoutes(
   telegramBot: ClaudeBTelegramBot,
   authManager: AuthManager,
   inbox: NotificationInbox | null,
-  onTmuxTranscript: ((sessionId: string, transcriptPath: string) => void) | null
+  onTmuxTranscript: ((sessionId: string, transcriptPath: string) => void) | null,
+  onTmuxSession: ((sessionId: string, sessionName: string | undefined, agent: string, goal: string | undefined) => void) | null
 ): Promise<void> {
 
   app.post<{ Body: NotifyBody }>('/api/notify', {
@@ -51,6 +56,7 @@ export async function registerNotifyRoutes(
           costUsd:       { type: 'number' },
           resultPreview: { type: 'string' },
           transcriptPath:{ type: 'string' },
+          agent:         { type: 'string' },
         },
       },
     },
@@ -93,6 +99,16 @@ export async function registerNotifyRoutes(
     if (body.transcriptPath && onTmuxTranscript) {
       try {
         onTmuxTranscript(body.sessionId, body.transcriptPath);
+      } catch { /* non-fatal */ }
+    }
+
+    // Register Codex tmux panes so they appear in the Telegram /sessions list.
+    // Claude panes are enumerated directly from tmux (pane_current_command ==
+    // "claude"), but Codex panes report "node", so the daemon only learns about
+    // them from these notify POSTs. Fire-and-forget; skip silently if unwired.
+    if (body.agent && onTmuxSession && body.sessionId.startsWith('tmux:')) {
+      try {
+        onTmuxSession(body.sessionId, body.sessionName, body.agent, body.goal);
       } catch { /* non-fatal */ }
     }
 

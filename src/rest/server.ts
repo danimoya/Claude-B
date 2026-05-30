@@ -30,6 +30,10 @@ export interface RestServerOptions {
   // transcriptPath. Daemon uses this to cache tmux session → transcript
   // mappings for the voice pipeline's context lookup.
   onTmuxTranscript?: (sessionId: string, transcriptPath: string) => void;
+  // Optional hook invoked by /api/notify when the payload carries an `agent`
+  // field (e.g. "codex"). Daemon uses this to register non-Claude tmux panes
+  // so they surface in the Telegram /sessions list.
+  onTmuxSession?: (sessionId: string, sessionName: string | undefined, agent: string, goal: string | undefined) => void;
 }
 
 export class RestServer {
@@ -41,6 +45,7 @@ export class RestServer {
   private orchestrationManager: OrchestrationManager | null;
   private authManager: AuthManager;
   private onTmuxTranscript: ((sessionId: string, transcriptPath: string) => void) | null;
+  private onTmuxSession: ((sessionId: string, sessionName: string | undefined, agent: string, goal: string | undefined) => void) | null;
   private host: string;
   private port: number;
 
@@ -53,6 +58,7 @@ export class RestServer {
     this.telegramBot = options.telegramBot || null;
     this.orchestrationManager = options.orchestrationManager || null;
     this.onTmuxTranscript = options.onTmuxTranscript || null;
+    this.onTmuxSession = options.onTmuxSession || null;
     this.authManager = new AuthManager(options.configDir);
 
     this.app = Fastify({
@@ -136,7 +142,8 @@ export class RestServer {
         this.telegramBot,
         this.authManager,
         this.notificationInbox,
-        this.onTmuxTranscript
+        this.onTmuxTranscript,
+        this.onTmuxSession
       );
     }
 
