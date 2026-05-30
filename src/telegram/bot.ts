@@ -4,6 +4,7 @@ import { TelegramConfigManager } from './config.js';
 import { VoicePipeline } from './voice.js';
 import { SessionContext } from './ai-provider.js';
 import { isChatAllowed } from './allow-list.js';
+import { sanitizeForSpeech } from './tts-text.js';
 
 /**
  * Convert common Markdown patterns to Telegram-safe HTML.
@@ -769,9 +770,18 @@ export class ClaudeBTelegramBot extends EventEmitter {
       return;
     }
 
+    // Strip code blocks, tables, links, emoji and metadata so the TTS reads the
+    // prose, not the markup. If nothing speakable remains (e.g. a code-only
+    // reply), say so instead of synthesizing an empty/odd clip.
+    const speechText = sanitizeForSpeech(resultText);
+    if (!speechText) {
+      await this.safeSend(chatId, '🔊 Nothing to read aloud (the result was code or non-text content).');
+      return;
+    }
+
     try {
       await this.safeSend(chatId, '🔊 Generating audio...');
-      const audioBuffer = await this.voicePipeline.synthesize(resultText);
+      const audioBuffer = await this.voicePipeline.synthesize(speechText);
       await this.bot!.sendVoice(chatId, audioBuffer, {}, { filename: 'result.ogg', contentType: 'audio/ogg' });
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
