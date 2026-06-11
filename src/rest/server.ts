@@ -62,8 +62,9 @@ export class RestServer {
     this.authManager = new AuthManager(options.configDir);
 
     this.app = Fastify({
+      disableRequestLogging: process.env.CB_REST_REQUEST_LOGS !== '1',
       logger: {
-        level: 'info'
+        level: process.env.CB_REST_LOG_LEVEL || 'warn'
       }
     });
   }

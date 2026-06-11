@@ -22,6 +22,7 @@ import { createSTTTTSProvider } from '../telegram/stt-tts-provider.js';
 interface DaemonConfig {
   socketPath: string;
   pidFile: string;
+  lockFile: string;
   logFile: string;
   configDir: string;
 }
@@ -67,6 +68,7 @@ class Daemon {
     this.config = {
       socketPath: `${configDir}/daemon.sock`,
       pidFile: `${configDir}/daemon.pid`,
+      lockFile: `${configDir}/daemon.lock`,
       logFile: `${configDir}/daemon.log`,
       configDir
     };
@@ -160,6 +162,7 @@ class Daemon {
   async start(): Promise<void> {
     // Ensure config directory exists
     await mkdir(this.config.configDir, { recursive: true });
+    await this.acquireLock();
 
     // Check if daemon is already running
     if (existsSync(this.config.pidFile)) {
@@ -167,6 +170,7 @@ class Daemon {
       try {
         process.kill(pid, 0); // Check if process exists
         console.error(`Daemon already running (PID: ${pid})`);
+        await this.releaseLock();
         process.exit(1);
       } catch {
         // Process doesn't exist, clean up stale files
@@ -1586,13 +1590,65 @@ class Daemon {
     // In production, also write to log file
   }
 
-  private async cleanup(): Promise<void> {
+  private isProcessAlive(pid: number): boolean {
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async acquireLock(): Promise<void> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await writeFile(this.config.lockFile, `${process.pid}\n`, { flag: 'wx' });
+        return;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'EEXIST') throw error;
+
+        let existingPid = NaN;
+        try {
+          existingPid = parseInt(await readFile(this.config.lockFile, 'utf-8'), 10);
+        } catch {
+          // If the lock cannot be read, remove it once and retry.
+        }
+
+        if (this.isProcessAlive(existingPid)) {
+          console.error(`Daemon already running (lock held by PID: ${existingPid})`);
+          process.exit(1);
+        }
+
+        await unlink(this.config.lockFile).catch(() => {});
+      }
+    }
+
+    throw new Error('Failed to acquire daemon lock');
+  }
+
+  private async releaseLock(): Promise<void> {
+    try {
+      const lockPid = parseInt(await readFile(this.config.lockFile, 'utf-8'), 10);
+      if (lockPid === process.pid) {
+        await unlink(this.config.lockFile);
+      }
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
+
+  private async cleanup(releaseLock = false): Promise<void> {
     try {
       if (existsSync(this.config.pidFile)) {
         await unlink(this.config.pidFile);
       }
       if (existsSync(this.config.socketPath)) {
         await unlink(this.config.socketPath);
+      }
+      if (releaseLock) {
+        await this.releaseLock();
       }
     } catch {
       // Ignore cleanup errors
@@ -1637,7 +1693,7 @@ class Daemon {
     this.server?.close();
 
     // Clean up files
-    await this.cleanup();
+    await this.cleanup(true);
 
     this.log('Daemon stopped');
     process.exit(0);

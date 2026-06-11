@@ -111,7 +111,13 @@ export class ClaudeBTelegramBot extends EventEmitter {
   private voicePipeline: VoicePipeline | null;
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private reconnecting = false;
+  private pollingSuspendedReason: string | null = null;
   private healthCheckInterval: NodeJS.Timeout | null = null;
+  private lastPollingErrorMessage: string | null = null;
+  private lastPollingErrorLogAt = 0;
+  private suppressedPollingErrorCount = 0;
 
   constructor(options: TelegramBotOptions) {
     super();
@@ -127,14 +133,26 @@ export class ClaudeBTelegramBot extends EventEmitter {
   async start(token?: string): Promise<{ username?: string }> {
     const config = await this.configManager.load();
     const botToken = token || config.token;
+    const explicitStart = !!token;
 
     if (!botToken) {
       throw new Error('No Telegram bot token configured');
     }
 
+    if (!explicitStart && !config.enabled) {
+      throw new Error('Telegram bot disabled');
+    }
+
     if (token) {
       await this.configManager.setToken(token);
     }
+
+    if (this.bot) {
+      const me = await this.bot.getMe();
+      return { username: me.username };
+    }
+
+    this.pollingSuspendedReason = null;
 
     this.bot = new TelegramBot(botToken, {
       polling: {
@@ -148,9 +166,14 @@ export class ClaudeBTelegramBot extends EventEmitter {
 
     // Handle polling errors — log + auto-reconnect on transient failures
     this.bot.on('polling_error', (error) => {
-      console.error(`[Telegram Bot] Polling error: ${error.message}`);
+      if (this.isPollingConflict(error)) {
+        this.suspendPolling('Telegram 409 Conflict: another getUpdates poller is using this bot token').catch(() => {});
+        return;
+      }
+
+      this.logPollingError(error);
       if (this.shouldReconnect(error)) {
-        setTimeout(() => this.attemptReconnect(), 5000);
+        this.scheduleReconnect();
       }
     });
 
@@ -184,6 +207,7 @@ export class ClaudeBTelegramBot extends EventEmitter {
   }
 
   async stop(): Promise<void> {
+    this.clearReconnectTimer();
     if (this.healthCheckInterval) {
       clearInterval(this.healthCheckInterval);
       this.healthCheckInterval = null;
@@ -830,6 +854,10 @@ export class ClaudeBTelegramBot extends EventEmitter {
   // ─── Connection Stability ──────────────────────────────────────────
 
   private shouldReconnect(error: Error): boolean {
+    if (this.pollingSuspendedReason || this.isPollingConflict(error)) {
+      return false;
+    }
+
     const message = error.message.toLowerCase();
     if (message.includes('unauthorized') || message.includes('not found')) {
       return false;
@@ -842,25 +870,100 @@ export class ClaudeBTelegramBot extends EventEmitter {
     return false;
   }
 
-  private async attemptReconnect(): Promise<void> {
-    if (!this.bot || this.reconnectAttempts >= this.maxReconnectAttempts) return;
+  private isPollingConflict(error: Error): boolean {
+    const message = error.message.toLowerCase();
+    return message.includes('409 conflict') ||
+      message.includes('terminated by other getupdates request') ||
+      message.includes('only one bot instance is running');
+  }
+
+  private logPollingError(error: Error): void {
+    const now = Date.now();
+    const message = error.message;
+    const sameRecentError = this.lastPollingErrorMessage === message &&
+      now - this.lastPollingErrorLogAt < 60_000;
+
+    if (sameRecentError) {
+      this.suppressedPollingErrorCount++;
+      return;
+    }
+
+    if (this.suppressedPollingErrorCount > 0 && this.lastPollingErrorMessage) {
+      console.error(
+        `[Telegram Bot] Suppressed ${this.suppressedPollingErrorCount} repeated polling errors: ${this.lastPollingErrorMessage}`
+      );
+      this.suppressedPollingErrorCount = 0;
+    }
+
+    this.lastPollingErrorMessage = message;
+    this.lastPollingErrorLogAt = now;
+    console.error(`[Telegram Bot] Polling error: ${message}`);
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+
+  private scheduleReconnect(): void {
+    if (!this.bot || this.reconnectTimer || this.reconnecting) return;
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) return;
 
     this.reconnectAttempts++;
-    const delay = 5000 * this.reconnectAttempts;
+    const baseDelay = Math.min(5 * 60_000, 5000 * 2 ** (this.reconnectAttempts - 1));
+    const jitter = Math.floor(Math.random() * 1000);
+    const delay = baseDelay + jitter;
 
     console.log(`[Telegram Bot] Reconnect attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts} in ${delay}ms`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.attemptReconnect().catch(() => {});
+    }, delay);
+    this.reconnectTimer.unref?.();
+  }
 
+  private async attemptReconnect(): Promise<void> {
+    if (!this.bot || this.reconnecting || this.pollingSuspendedReason) return;
+
+    this.reconnecting = true;
     try {
       await this.bot.stopPolling();
-      await new Promise(resolve => setTimeout(resolve, delay));
       await this.bot.startPolling();
-      this.reconnectAttempts = 0;
       console.log('[Telegram Bot] Reconnected successfully');
     } catch (error) {
       console.error(`[Telegram Bot] Reconnect failed: ${error instanceof Error ? error.message : error}`);
-      if (this.reconnectAttempts < this.maxReconnectAttempts) {
-        setTimeout(() => this.attemptReconnect(), delay);
-      }
+      this.scheduleReconnect();
+    } finally {
+      this.reconnecting = false;
+    }
+  }
+
+  private async suspendPolling(reason: string): Promise<void> {
+    if (this.pollingSuspendedReason) return;
+
+    this.pollingSuspendedReason = reason;
+    this.clearReconnectTimer();
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+      this.healthCheckInterval = null;
+    }
+
+    const bot = this.bot;
+    this.bot = null;
+    console.error(`[Telegram Bot] Polling suspended: ${reason}. Telegram has been disabled in telegram.json.`);
+
+    try {
+      await bot?.stopPolling();
+    } catch {
+      // Best effort; the important part is to stop scheduling more polling.
+    }
+
+    try {
+      await this.configManager.setEnabled(false);
+    } catch (error) {
+      console.error(`[Telegram Bot] Failed to persist disabled state: ${error instanceof Error ? error.message : error}`);
     }
   }
 
@@ -871,9 +974,14 @@ export class ClaudeBTelegramBot extends EventEmitter {
       if (!this.bot) return;
       try {
         await this.bot.getMe();
+        this.reconnectAttempts = 0;
       } catch (error) {
         console.error(`[Telegram Bot] Health check failed: ${error instanceof Error ? error.message : error}`);
-        this.attemptReconnect();
+        if (error instanceof Error && this.isPollingConflict(error)) {
+          await this.suspendPolling('Telegram 409 Conflict during health check');
+          return;
+        }
+        this.scheduleReconnect();
       }
     }, 5 * 60 * 1000);  // Every 5 minutes
   }

@@ -101,6 +101,11 @@ export class TelegramConfigManager {
     await this.save();
   }
 
+  async setEnabled(enabled: boolean): Promise<void> {
+    this.config.enabled = enabled;
+    await this.save();
+  }
+
   async disable(): Promise<void> {
     this.config.enabled = false;
     this.config.token = '';

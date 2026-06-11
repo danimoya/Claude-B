@@ -1,11 +1,11 @@
 {
   "name": "claude-b",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Background-capable Claude Code with async workflows and REST API",
   "type": "module",
   "main": "dist/cli/index.js",
   "bin": {
-    "cb": "./bin/cb"
+    "cb": "bin/cb"
   },
   "scripts": {
     "dev": "tsup src/cli/index.ts src/daemon/index.ts --watch --format esm",
