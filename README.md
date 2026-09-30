@@ -514,7 +514,7 @@ The same bridge works for [OpenAI Codex CLI](https://developers.openai.com/codex
 
 **Prerequisites:**
 - Telegram bot configured + REST API running (same as above)
-- tmux panes running `codex` (interactive TUI — not `codex exec`, which does not fire lifecycle hooks)
+- tmux panes running `codex` (interactive TUI; `codex exec` also fires hooks on Codex 0.154+)
 
 **Step 1: Install the Codex Stop hook**
 

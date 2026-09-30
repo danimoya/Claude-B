@@ -152,14 +152,27 @@ hooks system but with key differences:
 - **Hook trust + sandbox**: Codex prompts "Hooks need review → Trust all and
   continue" on the next launch after any hook change (one-time gate). Trusted
   hooks run *outside* the sandbox, so the notify curl works even under
-  `-s read-only`. `codex exec` does NOT fire lifecycle hooks — interactive TUI
-  only. Log: `~/.claude-b/codex-notify.log`.
+  `-s read-only`. Older Codex releases fired lifecycle hooks only in the
+  interactive TUI; `codex exec` fires them too on 0.154+. Untrusted hooks are
+  skipped **silently** — on headless hosts check `trustStatus` via the app
+  server's `hooks/list` (see README). Log: `~/.claude-b/codex-notify.log`.
 - **Pane restart required**: Codex reads `hooks.json` only at startup. Codex
   panes that were already running when the hook was added (or last changed)
   will NOT fire it until restarted — `/quit` + relaunch `codex` in each pane,
   or wait for natural turnover. New panes pick it up automatically (and, on the
   first launch after a hook change, show the one-time trust prompt above). A
   pane silently sending nothing to Telegram is almost always this.
+
+#### OpenCode Sessions
+
+OpenCode has no shell hooks, so `bin/opencode-notify.js` is an OpenCode
+plugin, installed as `~/.config/opencode/plugins/claude-b-notify.js` (OpenCode
+loads `{plugin,plugins}/*.{js,ts}` at startup). On `session.idle` it skips child
+sessions (`parentID`), reads the last assistant text via the plugin `client`,
+and POSTs to `/api/notify` with `agent: "opencode"`. Same rules as the shell
+hooks: tmux-only, never throws into the host, 3000-char cap. Log:
+`~/.claude-b/opencode-notify.log`. The daemon does not register OpenCode panes
+for `/sessions` yet (`rememberCodexTmuxSession` only accepts `codex`).
 
 #### TTS Configuration
 
