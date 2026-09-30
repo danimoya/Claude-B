@@ -583,6 +583,33 @@ codex features list | grep '^hooks'         # → hooks  stable  true
 # Same REST / Telegram / voice checks as the Claude Code section apply
 ```
 
+> **Silent skip:** Codex does not warn when a hook is untrusted — it just never runs it. On a headless host where nobody sees the trust prompt, check the status via the app server (`initialize` → `hooks/list`, look at `trustStatus`). Trust is persisted in `~/.codex/config.toml` as `[hooks.state."<key>"] trusted_hash = "<currentHash>"`, using the `key` and `currentHash` that `hooks/list` reports. Any edit to `hooks.json` changes the hash and requires trusting it again.
+
+### OpenCode Session Notifications
+
+[OpenCode](https://opencode.ai) sessions running in tmux panes can notify through the same bridge. OpenCode has no shell-hook system, so the integration is a small plugin instead of a Stop hook: it listens for the `session.idle` event, fetches the final assistant message, and POSTs it to `/api/notify` with `agent: "opencode"`.
+
+**Install the plugin** (OpenCode loads every `*.js` / `*.ts` file in `~/.config/opencode/plugins/` at startup):
+
+```bash
+mkdir -p ~/.config/opencode/plugins
+ln -sf ~/Claude-B/bin/opencode-notify.js ~/.config/opencode/plugins/claude-b-notify.js
+# npm-global install: copy from $(npm root -g)/claude-b/bin/opencode-notify.js instead
+```
+
+**Notes:**
+
+- Only top-level sessions notify — subagent/task child sessions (those with a `parentID`) are skipped.
+- Works for both the interactive TUI and `opencode run`, as long as the process runs inside tmux.
+- Like Claude Code and Codex, plugins are read at startup: OpenCode processes already running won't notify until restarted.
+- OpenCode panes are not yet listed in `/sessions`, and replying to an OpenCode notification from Telegram is untested.
+
+**Troubleshooting:**
+
+```bash
+tail -f ~/.claude-b/opencode-notify.log      # one line per notification (HTTP status + response), or the error
+```
+
 ### Quick Start: Conversation Continuity
 
 Sessions maintain conversation context across prompts — Claude remembers previous interactions:
