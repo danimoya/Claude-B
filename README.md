@@ -867,14 +867,14 @@ Credentials belong in runtime environment variables or the mounted state directo
 ```bash
 # Build the current checkout without touching a host daemon
 # Run from this repository; the build cleans only its container output.
-docker build -t claude-b:0.7.0 .
+docker build -t claude-b:0.8.0 .
 
 # Enter the repository you want Claude to work on
 cd /path/to/your/project
 
 # Use the persistent launcher from the Claude-B checkout
-CB_DOCKER_IMAGE=claude-b:0.7.0 /path/to/Claude-B/scripts/docker-launcher.sh --new work
-CB_DOCKER_IMAGE=claude-b:0.7.0 /path/to/Claude-B/scripts/docker-launcher.sh 'Analyze this repository'
+CB_DOCKER_IMAGE=claude-b:0.8.0 /path/to/Claude-B/scripts/docker-launcher.sh --new work
+CB_DOCKER_IMAGE=claude-b:0.8.0 /path/to/Claude-B/scripts/docker-launcher.sh 'Analyze this repository'
 ```
 
 The launcher uses your UID/GID for bind-mount access and preserves the caller's
@@ -923,7 +923,7 @@ docker run -d --name claudeb-test \
   --mount type=bind,source=/path/to/private-state,target=/home/node/.claude-b \
   --mount type=bind,source=/path/to/your/project,target=/workspace \
   --env ANTHROPIC_API_KEY \
-  -p 127.0.0.1:3850:3847 claude-b:0.7.0
+  -p 127.0.0.1:3850:3847 claude-b:0.8.0
 
 # Check health without exposing a credential
 curl --fail http://127.0.0.1:3850/api/health

@@ -70,7 +70,7 @@ install_npm() {
 }
 
 install_docker() {
-  local version="${CLAUDE_B_VERSION:-0.7.0}"
+  local version="${CLAUDE_B_VERSION:-0.8.0}"
   [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || fail "invalid CLAUDE_B_VERSION"
   [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "invalid CLAUDE_B_REPO"
   local image="${CB_DOCKER_IMAGE:-}"

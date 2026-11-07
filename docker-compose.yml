@@ -3,7 +3,7 @@
 x-claude-b: &claude-b
   build:
     context: .
-  image: claude-b:0.7.0
+  image: claude-b:0.8.0
   environment:
     CB_REST_HOST: 0.0.0.0
     CB_REST_PORT: '3847'
@@ -22,7 +22,7 @@ services:
   state-init:
     build:
       context: .
-    image: claude-b:0.7.0
+    image: claude-b:0.8.0
     user: '0:0'
     entrypoint: ['/bin/sh', '-ec']
     command:
