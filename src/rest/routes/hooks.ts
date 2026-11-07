@@ -16,6 +16,7 @@ interface AddWebhookBody {
   headers?: Record<string, string>;
   timeout?: number;
   retries?: number;
+  secret?: string;
   transform?: string;
   sessionFilter?: string;
 }
@@ -149,7 +150,8 @@ export async function registerHookRoutes(
           method: { type: 'string', enum: ['POST', 'PUT'] },
           headers: { type: 'object' },
           timeout: { type: 'number' },
-          retries: { type: 'number' },
+          retries: { type: 'integer', minimum: 0, maximum: 5 },
+          secret: { type: 'string', minLength: 1 },
           transform: { type: 'string' },
           sessionFilter: { type: 'string' }
         }

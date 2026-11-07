@@ -9,6 +9,7 @@ describe('HookEngine', () => {
   let engine: HookEngine;
 
   beforeEach(async () => {
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async () => new Response('ok', { status: 200 })));
     testDir = join(tmpdir(), `claude-b-hooks-test-${Date.now()}`);
     await mkdir(testDir, { recursive: true });
     engine = new HookEngine(testDir);
@@ -16,6 +17,7 @@ describe('HookEngine', () => {
   });
 
   afterEach(async () => {
+    vi.unstubAllGlobals();
     await rm(testDir, { recursive: true, force: true });
   });
 
@@ -91,6 +93,7 @@ describe('HookEngine', () => {
         headers: { 'X-Custom': 'value' },
         timeout: 10000,
         retries: 3,
+        secret: 'test-only-signing-secret',
         sessionFilter: 'my-session'
       });
 
@@ -98,6 +101,7 @@ describe('HookEngine', () => {
       expect(webhook.headers).toEqual({ 'X-Custom': 'value' });
       expect(webhook.timeout).toBe(10000);
       expect(webhook.retries).toBe(3);
+      expect(webhook.secret).toBe('test-only-signing-secret');
       expect(webhook.sessionFilter).toBe('my-session');
     });
 
@@ -183,6 +187,26 @@ describe('HookEngine', () => {
       expect(result2.shellResults.length).toBe(2);
     });
 
+    it('delivers only enabled matching webhooks and shares the event ID across subscribers', async () => {
+      await engine.addWebhook('prompt.completed', 'https://receiver.invalid/exact');
+      await engine.addWebhook('*', 'https://receiver.invalid/all');
+      await engine.addWebhook('prompt.error', 'https://receiver.invalid/errors');
+      await engine.addWebhook('prompt.completed', 'https://receiver.invalid/other', { sessionFilter: 'other' });
+      const disabled = await engine.addWebhook('prompt.completed', 'https://receiver.invalid/disabled');
+      await engine.toggleWebhook(disabled.id, false);
+      const result = await engine.dispatch('prompt.completed', {
+        sessionId: 'target', promptId: 'p1', status: 'completed'
+      });
+      expect(result.webhookResults).toHaveLength(2);
+      expect(fetch).toHaveBeenCalledTimes(2);
+      const requests = vi.mocked(fetch).mock.calls;
+      expect(requests.map(([url]) => url)).toEqual([
+        'https://receiver.invalid/exact', 'https://receiver.invalid/all'
+      ]);
+      expect(requests.map(([, options]) => JSON.parse(options!.body as string).eventId))
+        .toEqual([result.event.id, result.event.id]);
+    });
+
     it('should match wildcard hooks', async () => {
       await engine.addShellHook('*', 'echo "catch all"');
 
@@ -216,7 +240,7 @@ describe('HookEngine', () => {
   describe('Persistence', () => {
     it('should persist and restore hooks', async () => {
       await engine.addShellHook('session.created', 'echo test');
-      await engine.addWebhook('prompt.completed', 'https://example.com');
+      await engine.addWebhook('prompt.completed', 'https://example.com', { secret: 'test-only-secret' });
 
       // Create new engine instance
       const newEngine = new HookEngine(testDir);
@@ -224,6 +248,7 @@ describe('HookEngine', () => {
 
       expect(newEngine.listShellHooks().length).toBe(1);
       expect(newEngine.listWebhooks().length).toBe(1);
+      expect(newEngine.listWebhooks()[0].secret).toBe('test-only-secret');
     });
   });
 });

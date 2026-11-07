@@ -820,6 +820,7 @@ class Daemon {
         headers: options.headers as Record<string, string> | undefined,
         timeout: options.timeout as number | undefined,
         retries: options.retries as number | undefined,
+        secret: options.secret as string | undefined,
         transform: options.transform as string | undefined,
         sessionFilter: options.sessionFilter as string | undefined
       });

@@ -661,6 +661,56 @@ cb --hooks
 cb --webhooks
 ```
 
+### Webhook signing and delivery
+
+`POST /api/hooks/webhook` accepts a per-webhook `secret` along with `event`,
+`url`, and optional `retries` (for example,
+`{"event":"prompt.completed","url":"https://receiver.example/hooks","secret":"<random shared secret>","retries":2}`).
+Configure the same secret at the receiver. Secrets are stored in the daemon's
+`hooks.json`; protect that file as a credential. Hooks without a secret remain
+unsigned for compatibility.
+
+Every delivery includes an `eventId` and ISO-8601 `timestamp` in the JSON body,
+even with a payload transform. `X-Claude-B-Event-Id` and `X-Claude-B-Timestamp`
+repeat those values. When a secret is configured, `X-Claude-B-Signature` contains
+`sha256=<hex HMAC-SHA256 of the exact UTF-8 request body>`. Custom headers cannot
+override these reserved headers. A receiver should retain the raw request bytes,
+verify the signature with a constant-time comparison, require matching body/header
+metadata, reject timestamps outside its replay window, and atomically deduplicate
+`eventId` before applying effects. For example, in a Node receiver:
+
+```js
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
+function verifyWebhook(rawBody, headers, secret) {
+  const expected = createHmac('sha256', secret).update(rawBody).digest();
+  const supplied = headers['x-claude-b-signature'] ?? '';
+  if (!/^sha256=[a-f0-9]{64}$/.test(supplied)) throw new Error('Invalid signature');
+  if (!timingSafeEqual(expected, Buffer.from(supplied.slice(7), 'hex'))) {
+    throw new Error('Invalid signature');
+  }
+  const event = JSON.parse(rawBody.toString('utf8'));
+  const timestamp = Date.parse(event.timestamp);
+  if (!event.eventId || event.eventId !== headers['x-claude-b-event-id'] ||
+      event.timestamp !== headers['x-claude-b-timestamp'] ||
+      !Number.isFinite(timestamp) || Math.abs(Date.now() - timestamp) > 300000) {
+    throw new Error('Invalid or stale event');
+  }
+  return event; // Atomically record eventId before processing; acknowledge duplicates.
+}
+```
+
+Delivery retries network errors, HTTP 429, and HTTP 5xx twice by default;
+`retries: 0` disables retries, and the maximum is five. Backoff starts at one
+second and doubles. `Retry-After` seconds or HTTP dates can extend the delay,
+with each delay capped at ten seconds. Each request has a ten-second default
+timeout (configurable up to sixty seconds), including response-body reading.
+All attempts reuse the same event ID, timestamp, body and signature. Ordinary
+4xx and redirects are not retried; only 2xx counts as success, and redirects
+are not followed. Delivery is bounded and in memory: retries do not survive a
+daemon restart. Receivers should reply promptly and process accepted events
+asynchronously.
+
 ### Quick Start: REST API
 
 ```bash

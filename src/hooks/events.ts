@@ -1,5 +1,7 @@
 // Hook event types and definitions
 
+import { randomUUID } from 'node:crypto';
+
 export type HookEventType =
   | 'session.created'
   | 'session.destroyed'
@@ -28,6 +30,7 @@ export interface HookEventPayload {
 }
 
 export interface HookEvent<T extends HookEventType = HookEventType> {
+  id?: string;
   type: T;
   timestamp: string;
   payload: HookEventPayload[T];
@@ -38,6 +41,7 @@ export function createEvent<T extends HookEventType>(
   payload: HookEventPayload[T]
 ): HookEvent<T> {
   return {
+    id: randomUUID(),
     type,
     timestamp: new Date().toISOString(),
     payload

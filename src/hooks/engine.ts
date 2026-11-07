@@ -1,7 +1,7 @@
 // Hook engine - manages hooks and dispatches events
 
 import { EventEmitter } from 'events';
-import { readFile, writeFile, mkdir } from 'fs/promises';
+import { readFile, writeFile, mkdir, chmod } from 'fs/promises';
 import { existsSync } from 'fs';
 import { nanoid } from 'nanoid';
 import { HookEvent, HookEventType, createEvent, HookEventPayload } from './events.js';
@@ -66,7 +66,8 @@ export class HookEngine extends EventEmitter {
       webhooks: Array.from(this.webhooks.values())
     };
 
-    await writeFile(this.configPath, JSON.stringify(config, null, 2));
+    await writeFile(this.configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
+    await chmod(this.configPath, 0o600);
   }
 
   // Shell hook management
@@ -124,6 +125,7 @@ export class HookEngine extends EventEmitter {
       headers?: Record<string, string>;
       timeout?: number;
       retries?: number;
+      secret?: string;
       transform?: string;
       sessionFilter?: string;
     }
@@ -136,6 +138,7 @@ export class HookEngine extends EventEmitter {
       headers: options?.headers,
       timeout: options?.timeout,
       retries: options?.retries,
+      secret: options?.secret,
       transform: options?.transform,
       sessionFilter: options?.sessionFilter,
       enabled: true,

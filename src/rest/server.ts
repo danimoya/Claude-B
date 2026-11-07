@@ -136,17 +136,18 @@ export class RestServer {
     if (this.telegramBot) {
       await registerTelegramRoutes(this.app, this.telegramBot);
 
-      // Register /api/notify ingest — external hook sink for tmux-hosted
-      // Claude Code sessions. Only available when the bot is running.
-      await registerNotifyRoutes(
+    }
+
+    // External completions also feed hooks and the inbox with Telegram disabled.
+    await registerNotifyRoutes(
         this.app,
         this.telegramBot,
         this.authManager,
         this.notificationInbox,
         this.onTmuxTranscript,
-        this.onTmuxSession
+        this.onTmuxSession,
+        this.hookEngine
       );
-    }
 
     // Register orchestration routes if manager is available
     if (this.orchestrationManager) {
