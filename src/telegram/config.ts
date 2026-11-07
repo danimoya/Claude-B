@@ -1,5 +1,6 @@
 import { readFile, writeFile, mkdir, chmod } from 'fs/promises';
 import { existsSync } from 'fs';
+import { createPairingChallenge, consumePairingChallenge, isPairingChallenge, type PairingChallenge, type PairingMessage } from './pairing.js';
 
 export interface AIProviderConfig {
   provider: 'anthropic' | 'openrouter';
@@ -26,6 +27,7 @@ export interface PendingPrompt {
 }
 
 export interface TelegramConfig {
+  pairingChallenge?: PairingChallenge;
   token: string;
   enabled: boolean;
   chatIds: string[];
@@ -91,6 +93,9 @@ export class TelegramConfigManager {
       this.config.sessionMap = scopedEntries(this.config.sessionMap);
       this.config.resultMap = scopedEntries(this.config.resultMap);
       this.config.pendingPrompts = scopedEntries(this.config.pendingPrompts);
+      if (!isPairingChallenge(this.config.pairingChallenge) || this.config.pairingChallenge.expiresAt <= Date.now()) {
+        delete this.config.pairingChallenge;
+      }
       // Auto-migrate legacy speechmaticsApiKey → sttProvider
       if (this.config.speechmaticsApiKey && !this.config.sttProvider) {
         this.config.sttProvider = { provider: 'speechmatics', apiKey: this.config.speechmaticsApiKey };
@@ -135,11 +140,35 @@ export class TelegramConfigManager {
   async disable(): Promise<void> {
     this.config.enabled = false;
     this.config.token = '';
+    delete this.config.pairingChallenge;
     this.config.chatIds = [];
     this.config.sessionMap = {};
     this.config.pendingPrompts = {};
     this.config.resultMap = {};
     await this.save();
+  }
+
+  async beginPairing(expectedSenderId?: string): Promise<{ code: string; expiresAt: number }> {
+    const { code, challenge } = createPairingChallenge({ expectedSenderId });
+    this.config.pairingChallenge = challenge;
+    await this.save();
+    return { code, expiresAt: challenge.expiresAt };
+  }
+
+  async consumePairing(message: PairingMessage): Promise<boolean> {
+    const challenge = this.config.pairingChallenge;
+    if (!challenge) return false;
+    const chatId = consumePairingChallenge(challenge, message);
+    if (!chatId) return false;
+    const alreadyAllowed = this.config.chatIds.includes(chatId);
+    if (!alreadyAllowed) this.config.chatIds.push(chatId);
+    try {
+      await this.save();
+      return true;
+    } catch (error) {
+      if (!alreadyAllowed) this.config.chatIds = this.config.chatIds.filter(id => id !== chatId);
+      throw error;
+    }
   }
 
   async addChatId(chatId: string): Promise<void> {

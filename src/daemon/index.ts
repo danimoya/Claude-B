@@ -444,6 +444,9 @@ class Daemon {
       case 'telegram.stop':
         return this.stopTelegram();
 
+      case 'telegram.pair':
+        return { data: await this.telegramBot.beginPairing(typeof params?.expectedSenderId === 'string' ? params.expectedSenderId : undefined) };
+
       case 'telegram.status':
         return this.getTelegramStatus();
 

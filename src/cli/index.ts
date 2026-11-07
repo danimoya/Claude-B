@@ -205,6 +205,7 @@ program
   .option('--telegram <token>', 'Set up Telegram bot with token')
   .option('--telegram-stop', 'Disable Telegram notifications')
   .option('--telegram-status', 'Show Telegram bot status')
+  .option('--telegram-pair [sender-id]', 'Create a private, single-use Telegram pairing challenge')
   .option('--telegram-forward <on|off>', 'Toggle forwarding all session completions to Telegram')
   // Voice pipeline
   .option('--voice-setup <provider>', 'Configure STT provider: speechmatics, deepgram, or openai')
@@ -443,6 +444,14 @@ USE CASES — when to reach for which group of commands:
       if (options.telegramStop) {
         await stopTelegram(client);
         return;
+      }
+
+      if (options.telegramPair) {
+        const result = await client.send({ method: 'telegram.pair', params: { expectedSenderId: typeof options.telegramPair === 'string' ? options.telegramPair : undefined } });
+        client.close();
+        if (result.error) throw new Error(result.error);
+        console.log(`Send /start ${result.data?.code} in the private bot chat before ${result.data?.expiresAt}`);
+        process.exit(0);
       }
 
       if (options.telegramStatus) {

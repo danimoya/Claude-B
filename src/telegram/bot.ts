@@ -127,6 +127,10 @@ export class ClaudeBTelegramBot extends EventEmitter {
     this.voicePipeline = options.voicePipeline || null;
   }
 
+  async beginPairing(expectedSenderId?: string): Promise<{ code: string; expiresAt: number }> {
+    return this.configManager.beginPairing(expectedSenderId);
+  }
+
   setVoicePipeline(pipeline: VoicePipeline): void {
     this.voicePipeline = pipeline;
   }
@@ -425,13 +429,16 @@ export class ClaudeBTelegramBot extends EventEmitter {
     if (!this.isPrivateActor(msg.chat, msg.from)) return;
     const chatId = String(msg.chat.id);
 
-    // Existing owner-paired chats remain usable. New registration requires an
-    // explicit owner-managed allow-list, including on fresh installations.
-    if (!this.isAuthorizedChat(chatId) && !isChatAllowed(chatId, process.env.TELEGRAM_ALLOWED_CHAT_IDS)) {
-      await this.safeSend(chatId, '⛔ This bot is private. Your chat is not authorised.');
-      return;
+    // A challenge is an owner-created capability, bound to a private sender.
+    // An explicit allow-list remains an additional restriction on all actions.
+    const allowedRaw = process.env.TELEGRAM_ALLOWED_CHAT_IDS;
+    if (allowedRaw?.trim() && !isChatAllowed(chatId, allowedRaw)) return;
+    if (!this.isAuthorizedChat(chatId) && !isChatAllowed(chatId, allowedRaw)) {
+      if (!await this.configManager.consumePairing(msg)) {
+        await this.safeSend(chatId, '⛔ This bot is private. Pair with the owner-provided /start challenge.');
+        return;
+      }
     }
-
     await this.configManager.addChatId(chatId);
 
     const voiceStatus = this.voicePipeline ? '🎤 Voice input: Active' : '🎤 Voice input: Not configured';

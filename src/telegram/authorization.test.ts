@@ -118,4 +118,28 @@ describe('Telegram private chat authorization', () => {
     expect(onPrompt).not.toHaveBeenCalled();
     expect(bot.configManager.getPendingPrompt('123', 'pending')).toBeDefined();
   });
+  it('pairs only a fresh matching private challenge and persists single-use consumption', async () => {
+    const { code } = await bot.beginPairing('789');
+    const date = Math.floor(Date.now() / 1000);
+    await bot.handleStart({ ...message(789, 'group'), date, text: `/start ${code}` });
+    await bot.handleStart({ ...message(789, 'private', 999), date, text: `/start ${code}` });
+    expect(bot.configManager.get().chatIds).not.toContain('789');
+    await bot.handleStart({ ...message(789), date, text: `/start ${code}` });
+    expect(bot.configManager.get().chatIds).toContain('789');
+    expect(bot.configManager.get().pairingChallenge.used).toBe(true);
+    await bot.configManager.load();
+    await bot.handleStart({ ...message(999), date, text: `/start ${code}` });
+    expect(bot.configManager.get().chatIds).not.toContain('999');
+  });
+
+  it('expires challenge enrollment and preserves explicit manual allow-list enrollment', async () => {
+    const { code } = await bot.beginPairing();
+    bot.configManager.get().pairingChallenge.expiresAt = Date.now() - 1;
+    await bot.handleStart({ ...message(789), date: Math.floor(Date.now() / 1000), text: `/start ${code}` });
+    expect(bot.configManager.get().chatIds).not.toContain('789');
+    vi.stubEnv('TELEGRAM_ALLOWED_CHAT_IDS', '789');
+    await bot.handleStart(message(789));
+    expect(bot.configManager.get().chatIds).toContain('789');
+  });
+
 });
