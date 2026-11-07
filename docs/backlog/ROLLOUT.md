@@ -1,31 +1,51 @@
-# Queued blueprint rollout disposition
+# Queued blueprint source and isolated rollout acceptance
 
 Sprinter: `7282b1a4de74`. Associated GitHub issue: none.
 
-Status: skipped for live rollout; source remediation and acceptance planning
-are included in this branch. This order encompasses the CB-01 through CB-10
-blueprints, so source-level changes and remaining scopes are recorded in their
-individual documents and OPERATIONS.md instead of importing the old candidate
-wholesale.
+The CB-01 through CB-10 source changes are implemented in the canonical
+repository and recorded in their individual backlog documents. The branch also
+provides executable isolated acceptance and rollback rehearsal; actual live
+cutover remains outside this request because production configuration, services,
+credentials and the running daemon must remain untouched.
 
-The source checkout also supplies artifacts used by a running daemon. Local
-validation for this work uses snapshots of the Git index with separate `dist`
-output and disposable test state. The live installation, service/poller,
-production configuration and credentials are outside this work's change scope.
-An installed candidate, old blueprint status or historical test report is not
-proof of source parity or permission to switch service ownership.
+The built artifact acceptance command starts only candidate processes under new
+temporary state and repositories, with a fake Claude executable and no inherited
+provider or bot credentials. It exercises real IPC, REST, CLI, task receipts,
+cancellation, delivery retry and crash recovery. The recovery check verifies that
+a traced private executor no longer runs after the restarted daemon becomes
+ready, and that interrupted work was not automatically executed again.
 
-Before a follow-up rollout, an operator must record every host's service/UID,
-immutable executable, state/workspace path, active task ownership, REST/proxy
-contract and sole Telegram poller. Reconcile candidate hashes and corrected
-review findings against the actual commit selected for release; complete the
-per-item remaining work before claiming blueprint acceptance. Rehearse state
-migration and rollback in isolation, verify dashboard interoperability, and
-obtain dedicated bot/provider/native fixtures with agreed entitlement,
-retention and charge limits. Preserve uncertain remote task receipts without
-resubmitting them.
+Rollback is a concrete filesystem and boot rehearsal. After stopping the isolated
+candidate, the harness copies its private state, deliberately changes one
+fixture receipt, restores the stopped-state backup and starts the candidate
+against that restored state. It then verifies the original exact result,
+preserved delivery identity and unchanged execution count before shutting down.
+Only fixture-generated credentials and data are copied; every temporary state
+copy and candidate process is cleaned up afterward.
 
-Cutover is a separate, explicit operation after that evidence is reviewable.
-Never start a second poller, rotate/copy live credentials for tests, replace an
-executing tree's build output, or restart the daemon merely to validate this PR.
-No such live operation was performed here.
+Successful acceptance emits versioned proof JSON containing Node/platform,
+SHA-256 hashes for all built artifacts, task/outbox/recovery/rollback outcomes
+and explicit statements that no live service, external provider or publication
+was changed. `CB_ACCEPTANCE_PROOF` optionally writes that receipt to a selected
+file. Retain the proof with the exact source commit and actual CI result links.
+The committed [isolated acceptance proof](evidence/isolated-acceptance-2026-11-07.json)
+records the actual validated runtime artifact hashes and outcomes. Those hashes
+match the independent complete-source build and staged release validation.
+The [container acceptance proof](evidence/container-acceptance-2026-11-07.json)
+records the final local image ID, verified non-root process inspection/native PTY,
+exact task persistence and three-host Compose checks. No image was published.
+The proof demonstrates that candidate's source and isolated runtime behavior;
+it does not imply activation of an installed candidate or an existing registry
+tag.
+
+An actual cutover still requires operator identification of each host's service,
+UID, immutable executable, state/workspace, active task, REST/proxy contract and
+sole Telegram poller. Verify the selected published digest, registry permissions,
+real dashboard compatibility and dedicated account entitlements, retention and
+charge limits before scheduling handover. Preserve uncertain remote task
+receipts without resubmitting work. OPERATIONS.md records the deployment and
+rollback procedure.
+
+No production restart, poller handover, credential rotation/copy, live message,
+provider charge or publication is performed by these source or isolated tests.
+The executing checkout's `dist` output is not used as a build destination.

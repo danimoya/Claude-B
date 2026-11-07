@@ -1,0 +1,26 @@
+{
+  "kind": "claude-b-isolated-container-acceptance",
+  "version": 1,
+  "sourceCommit": "8d1b51ec7e9a4f90b3e9ac5c15b26e7a4fac9778",
+  "localImage": "claude-b:codex-backlog-20261107",
+  "imageId": "sha256:586e5c129cd7da4b96b0dd8be84cc27d4f2e8c6b443becd592dc6ad4e073bf1b",
+  "platform": "linux/amd64",
+  "published": false,
+  "runtimeUid": "1001",
+  "claudeVersion": "2.1.319 (Claude Code)",
+  "checks": [
+    "Non-root ps ownership fields verified during image build",
+    "Native node-pty subprocess loaded and returned exact output",
+    "IPC and REST readiness",
+    "Literal prompt ran in mounted workspace with fake Claude",
+    "Result survives container recreation with same state",
+    "Startup fails with read-only state",
+    "three independent IPC/REST servers",
+    "all daemons match caller UID",
+    "all can write only disposable mounted workspace",
+    "initializer owns only project-created volumes"
+  ],
+  "liveServicesChanged": false,
+  "liveConfigurationChanged": false,
+  "externalProvidersUsed": false
+}
