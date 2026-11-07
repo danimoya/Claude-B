@@ -2,23 +2,23 @@ import { describe, it, expect } from 'vitest';
 import { isChatAllowed } from './allow-list.js';
 
 describe('isChatAllowed', () => {
-  describe('open mode (no env var set)', () => {
-    it('admits any chat when env is undefined', () => {
-      expect(isChatAllowed('13807256', undefined)).toBe(true);
-      expect(isChatAllowed('99999999', undefined)).toBe(true);
+  describe('closed registration (no configured chats)', () => {
+    it('rejects new chats when env is undefined', () => {
+      expect(isChatAllowed('13807256', undefined)).toBe(false);
+      expect(isChatAllowed('99999999', undefined)).toBe(false);
     });
 
-    it('admits any chat when env is empty string', () => {
-      expect(isChatAllowed('13807256', '')).toBe(true);
+    it('rejects new chats when env is empty string', () => {
+      expect(isChatAllowed('13807256', '')).toBe(false);
     });
 
-    it('admits any chat when env is whitespace only', () => {
-      expect(isChatAllowed('13807256', '   ')).toBe(true);
+    it('rejects new chats when env is whitespace only', () => {
+      expect(isChatAllowed('13807256', '   ')).toBe(false);
     });
 
-    it('admits any chat when env parses to an empty list', () => {
+    it('rejects new chats when env parses to an empty list', () => {
       // Commas with only whitespace between them
-      expect(isChatAllowed('13807256', ', , ,')).toBe(true);
+      expect(isChatAllowed('13807256', ', , ,')).toBe(false);
     });
   });
 

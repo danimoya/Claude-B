@@ -114,7 +114,7 @@ Claude-B reads from environment variables with this precedence:
 |----------|----------|---------|
 | `ANTHROPIC_API_KEY` | yes | Claude Code authentication |
 | `TELEGRAM_BOT_TOKEN` | no | Enables Telegram remote control |
-| `TELEGRAM_ALLOWED_CHAT_IDS` | no | Comma-separated chat ids allowed to use the bot |
+| `TELEGRAM_ALLOWED_CHAT_IDS` | for new Telegram registrations | Comma-separated private chat IDs; empty denies new registration |
 | `OPENAI_API_KEY` | no | Whisper STT + TTS for voice notes |
 | `SPEECHMATICS_API_KEY` / `DEEPGRAM_API_KEY` | no | Alternative STT providers |
 | `CB_DATA_DIR` | no | Override `~/.claude-b` (useful in containers) |
@@ -284,7 +284,7 @@ Get notifications on your phone and reply to sessions from Telegram.
 **Step 2: Connect to Claude-B**
 
 ```bash
-cb --telegram 123456789:ABCdefGHIjklMNO
+TELEGRAM_ALLOWED_CHAT_IDS=123456789 cb --telegram 123456789:ABCdefGHIjklMNO
 
 # Output:
 #   Telegram bot started!
@@ -294,7 +294,12 @@ cb --telegram 123456789:ABCdefGHIjklMNO
 
 **Step 3: Register in Telegram**
 
-Open your bot in Telegram and send `/start`. You're now registered for notifications.
+Configure your private chat ID in `TELEGRAM_ALLOWED_CHAT_IDS` in the daemon's
+environment before starting it, then send `/start` in a private conversation
+with your bot. New registrations require that explicit allow-list; groups are
+denied. Existing owner-paired private chats remain usable when the variable is
+unset. `cb init` can capture your chat ID locally; its interactive pairing step
+should be performed only with the owner present (challenge pairing is pending).
 
 **Step 4: Use it**
 

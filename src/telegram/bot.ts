@@ -108,6 +108,7 @@ export class ClaudeBTelegramBot extends EventEmitter {
   private options: TelegramBotOptions;
   private selectedSession: Map<string, string> = new Map(); // chatId -> sessionId
   private editState: Map<string, string> = new Map(); // chatId -> messageId (awaiting edit)
+  private confirmingPrompts = new Set<string>();
   private voicePipeline: VoicePipeline | null;
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
@@ -402,12 +403,30 @@ export class ClaudeBTelegramBot extends EventEmitter {
     }
   }
 
+  private isPrivateActor(chat: TelegramBot.Chat, sender: TelegramBot.User | undefined): boolean {
+    return chat.type === 'private' && !!sender && String(sender.id) === String(chat.id);
+  }
+
+  private isAuthorizedChat(chatId: string): boolean {
+    const allowedRaw = process.env.TELEGRAM_ALLOWED_CHAT_IDS;
+    return this.configManager.get().chatIds.includes(chatId) &&
+      (!allowedRaw?.trim() || isChatAllowed(chatId, allowedRaw));
+  }
+
+  private async authorizeMessage(msg: TelegramBot.Message): Promise<boolean> {
+    if (!this.isPrivateActor(msg.chat, msg.from)) return false;
+    if (this.isAuthorizedChat(String(msg.chat.id))) return true;
+    await this.safeSend(String(msg.chat.id), 'Not authorized. Ask the owner to pair this private chat.');
+    return false;
+  }
+
   private async handleStart(msg: TelegramBot.Message): Promise<void> {
+    if (!this.isPrivateActor(msg.chat, msg.from)) return;
     const chatId = String(msg.chat.id);
 
-    // Allow-list gate. Set TELEGRAM_ALLOWED_CHAT_IDS (comma-separated) to
-    // restrict /start. Empty/unset preserves legacy open behaviour.
-    if (!isChatAllowed(chatId, process.env.TELEGRAM_ALLOWED_CHAT_IDS)) {
+    // Existing owner-paired chats remain usable. New registration requires an
+    // explicit owner-managed allow-list, including on fresh installations.
+    if (!this.isAuthorizedChat(chatId) && !isChatAllowed(chatId, process.env.TELEGRAM_ALLOWED_CHAT_IDS)) {
       await this.safeSend(chatId, '⛔ This bot is private. Your chat is not authorised.');
       return;
     }
@@ -438,6 +457,7 @@ export class ClaudeBTelegramBot extends EventEmitter {
   }
 
   private async handleSessions(msg: TelegramBot.Message): Promise<void> {
+    if (!await this.authorizeMessage(msg)) return;
     const chatId = String(msg.chat.id);
 
     if (!this.options.getSessions) {
@@ -477,6 +497,7 @@ export class ClaudeBTelegramBot extends EventEmitter {
   }
 
   private async handleSelect(msg: TelegramBot.Message, match: RegExpMatchArray | null): Promise<void> {
+    if (!await this.authorizeMessage(msg)) return;
     const chatId = String(msg.chat.id);
     const sessionId = match?.[1]?.trim();
 
@@ -503,6 +524,7 @@ export class ClaudeBTelegramBot extends EventEmitter {
   }
 
   private async handleInbox(msg: TelegramBot.Message): Promise<void> {
+    if (!await this.authorizeMessage(msg)) return;
     const chatId = String(msg.chat.id);
 
     if (!this.options.getInboxCount) {
@@ -519,6 +541,7 @@ export class ClaudeBTelegramBot extends EventEmitter {
   }
 
   private async handleVoiceStatus(msg: TelegramBot.Message): Promise<void> {
+    if (!await this.authorizeMessage(msg)) return;
     const chatId = String(msg.chat.id);
 
     if (!this.voicePipeline) {
@@ -549,6 +572,7 @@ export class ClaudeBTelegramBot extends EventEmitter {
   }
 
   private async handleHelp(msg: TelegramBot.Message): Promise<void> {
+    if (!await this.authorizeMessage(msg)) return;
     const chatId = String(msg.chat.id);
     const text = [
       '🤖 Claude-B Commands',
@@ -570,14 +594,8 @@ export class ClaudeBTelegramBot extends EventEmitter {
   // ─── Voice Message Handler ─────────────────────────────────────────
 
   private async handleVoice(msg: TelegramBot.Message): Promise<void> {
+    if (!await this.authorizeMessage(msg)) return;
     const chatId = String(msg.chat.id);
-
-    // Check authorization
-    const config = this.configManager.get();
-    if (!config.chatIds.includes(chatId)) {
-      await this.safeSend(chatId, 'Not authorized. Send /start first.');
-      return;
-    }
 
     if (!this.voicePipeline) {
       await this.safeSend(chatId, '🎤 Voice pipeline not configured.\nUse cb --voice-setup <speechmatics|deepgram|openai> <api-key> on the server.');
@@ -699,6 +717,7 @@ export class ClaudeBTelegramBot extends EventEmitter {
 
   private async handleCallback(query: TelegramBot.CallbackQuery): Promise<void> {
     if (!this.bot || !query.data || !query.message) return;
+    if (!this.isPrivateActor(query.message.chat, query.from) || !this.isAuthorizedChat(String(query.message.chat.id))) return;
 
     const chatId = String(query.message.chat.id);
     const data = query.data;
@@ -721,7 +740,7 @@ export class ClaudeBTelegramBot extends EventEmitter {
 
   private async handleConfirmPrompt(chatId: string, pendingId: string, messageId: number): Promise<void> {
     const pending = this.configManager.getPendingPrompt(pendingId);
-    if (!pending) {
+    if (!pending || pending.chatId !== chatId) {
       await this.safeSend(chatId, '⏰ Prompt expired. Send another voice message.');
       return;
     }
@@ -730,6 +749,12 @@ export class ClaudeBTelegramBot extends EventEmitter {
       await this.safeSend(chatId, 'Prompt routing not available');
       return;
     }
+    if (this.confirmingPrompts.has(pendingId)) return;
+    if (this.editState.get(chatId) === pendingId) {
+      await this.safeSend(chatId, 'Finish editing the prompt before confirming.');
+      return;
+    }
+    this.confirmingPrompts.add(pendingId);
 
     try {
       await this.options.onPrompt(pending.sessionId, pending.optimizedPrompt);
@@ -757,12 +782,14 @@ export class ClaudeBTelegramBot extends EventEmitter {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       await this.safeSend(chatId, `❌ Error: ${errMsg}`);
+    } finally {
+      this.confirmingPrompts.delete(pendingId);
     }
   }
 
   private async handleEditPrompt(chatId: string, pendingId: string, _messageId: number): Promise<void> {
     const pending = this.configManager.getPendingPrompt(pendingId);
-    if (!pending) {
+    if (!pending || pending.chatId !== chatId || this.confirmingPrompts.has(pendingId)) {
       await this.safeSend(chatId, '⏰ Prompt expired. Send another voice message.');
       return;
     }
@@ -773,6 +800,8 @@ export class ClaudeBTelegramBot extends EventEmitter {
   }
 
   private async handleCancelPrompt(chatId: string, pendingId: string, messageId: number): Promise<void> {
+    const pending = this.configManager.getPendingPrompt(pendingId);
+    if (!pending || pending.chatId !== chatId || this.confirmingPrompts.has(pendingId)) return;
     this.configManager.removePendingPrompt(pendingId);
     this.editState.delete(chatId);
 
@@ -989,16 +1018,10 @@ export class ClaudeBTelegramBot extends EventEmitter {
   // ─── Text Message Handler ─────────────────────────────────────────
 
   private async handleMessage(msg: TelegramBot.Message): Promise<void> {
+    if (!await this.authorizeMessage(msg)) return;
     const chatId = String(msg.chat.id);
     const text = msg.text?.trim();
     if (!text) return;
-
-    // Check if authorized
-    const config = this.configManager.get();
-    if (!config.chatIds.includes(chatId)) {
-      await this.safeSend(chatId, 'Not authorized. Send /start first.');
-      return;
-    }
 
     // Check if user is in edit mode (editing a voice prompt)
     const editPendingId = this.editState.get(chatId);
