@@ -12,7 +12,7 @@ RUN npm run build && npm prune --omit=dev
 
 FROM ${NODE_IMAGE} AS runtime
 ARG CLAUDE_CODE_VERSION=2.1.319
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tini git openssh-client bash ripgrep tmux && rm -rf /var/lib/apt/lists/* \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tini git openssh-client bash ripgrep tmux procps && rm -rf /var/lib/apt/lists/* \
     && npm install --global --omit=dev --no-audit --no-fund "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && test "$(claude --version)" = "${CLAUDE_CODE_VERSION} (Claude Code)" \
     && npm cache clean --force
@@ -33,6 +33,8 @@ ENV CB_REST_HOST=0.0.0.0 \
     CLAUDE_CONFIG_DIR=/home/node/.claude-b/claude \
     DISABLE_AUTOUPDATER=1
 USER node
+# Executor ownership capture/recovery requires these exact fields at runtime.
+RUN ps -p $$ -o pid= -o uid= -o pgid= -o stat= -o lstart= >/dev/null
 WORKDIR /workspace
 VOLUME ["/home/node/.claude-b"]
 EXPOSE 3847
