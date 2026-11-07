@@ -5,6 +5,7 @@ import { loadEnv } from '../config/env.js';
 loadEnv();
 
 import { Command, Option } from 'commander';
+import { randomUUID } from 'node:crypto';
 import chalk from 'chalk';
 import { DaemonClient } from '../daemon/client.js';
 import { version } from '../utils/version.js';
@@ -13,6 +14,7 @@ import { runInit } from './init.js';
 import { readLogTail } from './logs.js';
 import { createPromptReader } from './stdin.js';
 import { startDaemon } from './daemon-launch.js';
+import type { TaskRecord } from '../jobs/types.js';
 import * as tunnel from '../tunnel/manager.js';
 
 // Type definitions for API responses
@@ -41,9 +43,7 @@ interface StatusData {
   memoryUsage: string;
 }
 
-interface PromptData {
-  promptId: string;
-}
+
 
 interface RestData {
   success?: boolean;
@@ -123,6 +123,10 @@ interface RemotePromptResult {
   error?: string;
   host: string;
   latency: number;
+  taskId?: string;
+  receiptId?: string;
+  taskStatus?: string;
+  failureKind?: string;
 }
 
 const program = new Command();
@@ -165,6 +169,15 @@ program
   .option('--rest-stop', 'Stop REST API server')
   .option('--status', 'Daemon status and health')
   .option('--logs', 'View daemon logs')
+  .option('--task-key <key>', 'Find the receipt for an explicit idempotency key')
+  .option('--task <id>', 'Read the exact durable task result')
+  .option('--tasks', 'List durable tasks, including restored and cleaned sessions')
+  .option('--cancel <id>', 'Cancel a queued or running task')
+  .option('--remote-task <id>', 'Resume a remote receipt using status reads only')
+  .option('--remote-tasks', 'List durable remote submission receipts')
+  .option('--json', 'Render task/receipt records as JSON')
+  .option('--timeout <ms>', 'Bound waiting without cancelling an accepted task')
+  .option('--idempotency-key <key>', 'Deduplicate an explicitly repeated submission')
   .option('--hook <event> <cmd>', 'Register shell hook for event')
   .option('--hook-session <id>', 'Only trigger hook for this session (use with --hook)')
   .option('--unhook <id>', 'Remove a shell hook')
@@ -266,6 +279,48 @@ USE CASES — when to reach for which group of commands:
     const client = new DaemonClient();
 
     try {
+      // Task/receipt reads do not consume redirected stdin or start new work.
+      if (options.task || options.taskKey) {
+        const result = await client.send(options.task ? { method: 'task.get', params: { taskId: options.task } } : { method: 'task.find', params: { idempotencyKey: options.taskKey } });
+        client.close();
+        if (result.error) throw new Error(result.error);
+        const task = result.data?.task as TaskRecord | null;
+        if (!task) throw new Error('Task not found');
+        printTask(task, Boolean(options.json));
+        process.exit(taskExitCode(task));
+      }
+      if (options.tasks) {
+        const result = await client.send({ method: 'task.list' });
+        client.close();
+        if (result.error) throw new Error(result.error);
+        const tasks = (result.data?.tasks || []) as TaskRecord[];
+        if (options.json) console.log(JSON.stringify(tasks));
+        else for (const task of tasks) console.log(`${task.id}  ${task.status}  ${task.sessionId}  ${task.workingDir}`);
+        process.exit(0);
+      }
+      if (options.cancel) {
+        const result = await client.send({ method: 'task.cancel', params: { taskId: options.cancel } });
+        client.close();
+        if (result.error) throw new Error(result.error);
+        const task = result.data?.task as TaskRecord | null;
+        if (!task) throw new Error('Task not found');
+        if (options.json) console.log(JSON.stringify(task));
+        else console.log(`Task ${task.id}: ${task.status}`);
+        process.exit(0);
+      }
+      if (options.remoteTasks) {
+        const result = await client.send({ method: 'orchestration.task.list' });
+        client.close();
+        if (result.error) throw new Error(result.error);
+        console.log(JSON.stringify(result.data?.tasks || [], null, options.json ? undefined : 2));
+        process.exit(0);
+      }
+      if (options.remoteTask) {
+        const result = await waitForRemoteReceipt(client, options.remoteTask, waitBudget(options.timeout) ?? 15000);
+        client.close();
+        printRemoteResult(result, Boolean(options.json));
+      }
+
       // Handle flags first
       if (options.last) {
         await showLastOutput(client);
@@ -523,7 +578,7 @@ USE CASES — when to reach for which group of commands:
       // Prompt data is read literally and never sent back through Commander.
       const prompt = await readPrompt(promptParts);
       if (options.select) {
-        await selectSession(client, options.select);
+        await selectSession(client, options.select, Boolean(options.json) && prompt !== undefined);
         if (prompt === undefined) {
           client.close();
           process.exit(0);
@@ -535,7 +590,7 @@ USE CASES — when to reach for which group of commands:
           console.error(chalk.red('Prompt required for remote execution'));
           return;
         }
-        await sendRemotePrompt(client, options.remote, prompt);
+        await sendRemotePrompt(client, options.remote, prompt, options.idempotencyKey, waitBudget(options.timeout), Boolean(options.json));
         return;
       }
 
@@ -545,16 +600,16 @@ USE CASES — when to reach for which group of commands:
           console.error(chalk.red('Prompt required for remote fire-and-forget'));
           return;
         }
-        await fireRemotePrompt(client, options.remoteFire, prompt, options.goal);
+        await fireRemotePrompt(client, options.remoteFire, prompt, options.idempotencyKey, waitBudget(options.timeout), Boolean(options.json), options.goal);
         return;
       }
 
       // If we have a prompt, send it (or fire-and-forget).
       if (prompt !== undefined) {
         if (options.fire) {
-          await fireAndForgetPrompt(client, prompt, options.goal, options.model, options.executionPolicy);
+        await fireAndForgetPrompt(client, prompt, options.goal, options.model, options.executionPolicy, options.idempotencyKey, waitBudget(options.timeout), Boolean(options.json));
         } else {
-          await sendPrompt(client, prompt, options.model, options.executionPolicy, options.select);
+        await sendPrompt(client, prompt, options.model, options.executionPolicy, options.select, options.idempotencyKey, waitBudget(options.timeout), Boolean(options.json));
         }
         return;
       }
@@ -563,11 +618,11 @@ USE CASES — when to reach for which group of commands:
       program.help();
     } catch (error) {
       if (error instanceof Error) {
-        if (error.message.includes('ECONNREFUSED') || error.message.includes('ENOENT')) {
+        if (!(error instanceof TaskResumeError) && (error.message.includes('ECONNREFUSED') || error.message.includes('ENOENT'))) {
           console.error(chalk.yellow('Daemon not running. Starting daemon...'));
           await startDaemon();
           await waitForDaemon();
-          console.log(chalk.green('Daemon started. Retrying...'));
+          console.error(chalk.green('Daemon started. Retrying...'));
           // Re-run the command by re-parsing argv
           await program.parseAsync(process.argv);
           return;
@@ -669,13 +724,13 @@ async function watchSession(client: DaemonClient): Promise<void> {
   process.exit(0);
 }
 
-async function selectSession(client: DaemonClient, sessionId: string): Promise<void> {
+async function selectSession(client: DaemonClient, sessionId: string, quiet = false): Promise<void> {
   const result = await client.send({ method: 'session.select', params: { sessionId } });
   if (result.error) {
     console.error(chalk.red(result.error));
     process.exit(1);
   }
-  console.log(chalk.green(`Selected session: ${sessionId}`));
+  if (!quiet) console.log(chalk.green(`Selected session: ${sessionId}`));
 }
 
 async function showCurrentSession(client: DaemonClient): Promise<void> {
@@ -804,68 +859,94 @@ async function showLogs(): Promise<void> {
   else if (log.text) console.log(log.text);
 }
 
-async function sendPrompt(client: DaemonClient, prompt: string, model?: string, executionPolicy?: string, sessionId?: string): Promise<void> {
-  console.log(chalk.gray('Sending prompt...'));
-  const result = await client.send({ method: 'prompt.send', params: { prompt, model, executionPolicy, workingDir: process.cwd(), sessionId } });
-  if (result.error) {
-    console.error(chalk.red(result.error));
-    client.close();
-    process.exit(1);
+class TaskResumeError extends Error {
+  constructor(message: string, resume: string) {
+    super(`${message}. Check ${resume} before resubmitting.`);
+    this.name = 'TaskResumeError';
   }
-  const data = result.data as PromptData & { sessionId?: string } | undefined;
-  const sessionInfo = data?.sessionId ? ` on ${chalk.cyan(data.sessionId)}` : '';
-  console.log(chalk.green(`Prompt queued (ID: ${data?.promptId})${sessionInfo}`));
-  console.log(chalk.gray('Watching output (Ctrl+C to detach)...\n'));
+}
+let attemptId: string | undefined;
+function submissionIdentity(key?: string) {
+  if (key !== undefined && (!key || key.length > 256)) throw new Error('Idempotency key must contain 1 to 256 characters');
+  const taskId = key ? undefined : (attemptId ||= randomUUID());
+  return { taskId, idempotencyKey: key || `cli:${taskId}`, resume: taskId ? `cb --task ${taskId}` : 'cb --task-key with the original key' };
+}
+function safeStartupFailure(error: unknown): boolean {
+  return ['ENOENT', 'ECONNREFUSED'].includes((error as NodeJS.ErrnoException)?.code || '');
+}
 
-  // Start watching for output immediately
-  await client.send({ method: 'session.watch', params: { sessionId: data?.sessionId } });
+function waitBudget(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  const budget = Number(value);
+  if (!Number.isSafeInteger(budget) || budget <= 0 || budget > 86_400_000) throw new Error('Timeout must be between 1 and 86400000 milliseconds');
+  return budget;
+}
 
-  // Listen for status updates
-  client.on('status', (statusData: { status: string; promptId?: string; error?: string }) => {
-    if (statusData.status === 'processing') {
-      console.log(chalk.yellow(`[Processing prompt ${statusData.promptId || ''}...]`));
-    } else if (statusData.status === 'completed') {
-      console.log(chalk.green(`\n[Completed]`));
-    } else if (statusData.status === 'error') {
-      if (statusData.promptId && data?.promptId && statusData.promptId !== data.promptId) return;
-      console.error(chalk.red(`\n[Error] ${statusData.error || 'Prompt failed'}`));
-      client.close();
-      process.exitCode = 1;
-    }
+function taskExitCode(task: TaskRecord): number {
+  if (task.status === 'completed') return 0;
+  return task.status === 'pending' || task.status === 'running' ? 2 : 1;
+}
+
+function printTask(task: TaskRecord, json = false): void {
+  if (json) console.log(JSON.stringify(task));
+  else {
+    process.stdout.write(task.output);
+    if (task.error && task.error !== task.output) console.error(task.error);
+    if (task.status === 'pending' || task.status === 'running') console.error(`Task ${task.id}: ${task.status}`);
+  }
+}
+
+async function sendPrompt(client: DaemonClient, prompt: string, model?: string, executionPolicy?: string, sessionId?: string, idempotencyKey?: string, timeout?: number, json = false): Promise<void> {
+  const identity = submissionIdentity(idempotencyKey);
+  const deadline = timeout === undefined ? undefined : Date.now() + timeout;
+  const result = await client.send({ method: 'prompt.send', params: { prompt, model, executionPolicy, workingDir: process.cwd(), sessionId, taskId: identity.taskId, idempotencyKey: identity.idempotencyKey } }, timeout).catch(error => {
+    client.close();
+    if (safeStartupFailure(error)) throw error;
+    throw new TaskResumeError(error instanceof Error ? error.message : 'Submission connection lost', identity.resume);
   });
-
-  // Listen for output and display it
-  // When using --output-format json, stdout is a JSON blob - extract the result field
-  let jsonAccumulator = '';
-  client.on('output', (outputData: { content: string }) => {
-    jsonAccumulator += outputData.content;
-    // Try to parse as complete JSON (from --output-format json)
-    try {
-      const parsed = JSON.parse(jsonAccumulator.trim());
-      if (parsed.result !== undefined) {
-        process.stdout.write(parsed.result);
-        jsonAccumulator = '';
-        return;
+  if (result.error) { client.close(); throw new TaskResumeError(result.error, identity.resume); }
+  const id = result.data?.taskId || result.data?.promptId;
+  if (typeof id !== 'string') { client.close(); throw new Error('Daemon did not return a durable task ID'); }
+  let latest: TaskRecord | undefined;
+  const printPending = () => {
+    if (json) {
+      console.log(JSON.stringify(latest ?? { taskId: id, promptId: id,
+        sessionId: result.data?.sessionId, status: 'accepted', taskStatus: result.data?.taskStatus }));
+    }
+  };
+  console.error(chalk.gray(`Task accepted: ${id}. Ctrl+C detaches; cb --task ${id} reads its result.`));
+  const detach = () => { client.close(); process.exit(130); };
+  process.once('SIGINT', detach);
+  try {
+    while (true) {
+      if (deadline !== undefined && Date.now() >= deadline) {
+        printPending();
+        console.error(`Task ${id} remains accepted; execution was not cancelled.`); client.close(); process.exit(2);
       }
-    } catch {
-      // Not complete JSON yet or not JSON at all - display raw for streaming
+      const receipt = await client.send({ method: 'task.get', params: { taskId: id } }, deadline === undefined ? undefined : Math.max(1, deadline - Date.now()));
+      if (receipt.error) throw new Error(receipt.error);
+      const task = receipt.data?.task as TaskRecord | null;
+      if (!task || task.id !== id) throw new Error('Exact task receipt is unavailable');
+      latest = task;
+      if (!['pending', 'running'].includes(task.status)) {
+        printTask(task, json); client.close(); process.exit(taskExitCode(task));
+      }
+      if (deadline !== undefined && Date.now() >= deadline) {
+        printPending();
+        console.error(`Task ${id} remains ${task.status}; execution was not cancelled.`);
+        client.close(); process.exit(2);
+      }
+      await new Promise(resolve => setTimeout(resolve, deadline === undefined ? 100 : Math.max(1, Math.min(100, deadline - Date.now()))));
     }
-    process.stdout.write(outputData.content);
-  });
-
-  // Handle Ctrl+C to detach
-  process.on('SIGINT', () => {
-    console.log(chalk.gray('\n\nDetaching... (use "cb -l" to check result or "cb -w" to resume watching)'));
-    client.send({ method: 'session.unwatch' }).finally(() => {
-      process.exit(0);
-    });
-  });
-
-  // Wait for completion or connection close.
-  await new Promise<void>((resolve) => {
-    client.on('close', resolve);
-  });
-  process.exit(process.exitCode ?? 0);
+  } catch (error) {
+    client.close();
+    if (deadline !== undefined && Date.now() >= deadline) {
+      printPending();
+      console.error(`Wait deadline reached; cb --task ${id} reads the saved result. Execution was not cancelled.`);
+      process.exit(2);
+    }
+    throw new TaskResumeError(error instanceof Error ? error.message : 'Task connection lost', `cb --task ${id}`);
+  } finally { process.off('SIGINT', detach); }
 }
 
 async function waitForDaemon(maxWaitMs = 5000): Promise<void> {
@@ -1191,42 +1272,65 @@ async function showOrchestrationStats(client: DaemonClient): Promise<void> {
   process.exit(0);
 }
 
-async function sendRemotePrompt(client: DaemonClient, hostId: string, prompt: string): Promise<void> {
-  console.log(chalk.gray(`Sending prompt to remote host ${hostId}...`));
-  const result = await client.send({
-    method: 'orchestration.prompt',
-    params: { hostId, prompt }
-  });
-  client.close();
-  if (result.error) {
-    console.error(chalk.red(result.error));
-    process.exit(1);
+function printRemoteResult(data: RemotePromptResult, json = false, background = false): never {
+  if (json) console.log(JSON.stringify(data));
+  else {
+    console.error(`Remote task ${data.taskId || data.promptId || 'unassigned'}: ${data.taskStatus || data.status}`);
+    if (data.receiptId) console.error(`Receipt ${data.receiptId}; resume with cb --remote-task ${data.receiptId}`);
+    if (data.output !== undefined) process.stdout.write(data.output);
+    if (data.error) console.error(data.error);
   }
-  const data = result.data as unknown as RemotePromptResult;
+  process.exit(data.status === 'completed' || (background && data.status === 'accepted') ? 0 : ['accepted', 'uncertain'].includes(data.status) ? 2 : 1);
+}
 
-  console.log(chalk.green(`Prompt completed on ${data.host}`));
-  console.log(chalk.gray(`  Session: ${data.sessionId}`));
-  console.log(chalk.gray(`  Status: ${data.status}`));
-  console.log(chalk.gray(`  Latency: ${data.latency}ms`));
+async function waitForRemoteReceipt(client: DaemonClient, receiptId: string, timeout: number): Promise<RemotePromptResult> {
+  const deadline = Date.now() + timeout;
+  let latest: RemotePromptResult | undefined;
+  do {
+    const budget = Math.max(1, Math.min(5000, deadline - Date.now()));
+    const response = await client.send({ method: 'orchestration.task.resume', params: { receiptId, timeout: budget } }, budget + 500)
+      .catch(error => { throw new TaskResumeError(error instanceof Error ? error.message : 'Remote status connection lost', `cb --remote-task ${receiptId}`); });
+    if (response.error) throw new TaskResumeError(response.error, `cb --remote-task ${receiptId}`);
+    latest = response.data as unknown as RemotePromptResult;
+    if (!['accepted', 'uncertain'].includes(latest.status)) return latest;
+    if (Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, Math.min(100, deadline - Date.now())));
+  } while (Date.now() < deadline);
+  return latest!;
+}
 
-  if (data.output) {
-    console.log('');
-    console.log(chalk.bold('Output:'));
-    console.log(data.output);
+async function sendRemotePrompt(client: DaemonClient, hostId: string, prompt: string, key?: string, timeout = 300000, json = false, fire = false, goal?: string): Promise<void> {
+  const identity = submissionIdentity(key);
+  const deadline = Date.now() + timeout;
+  const resume = 'cb --remote-tasks to find the saved receipt for the original key';
+  try {
+    const budget = Math.min(10000, timeout);
+    const response = await client.send({ method: fire ? 'orchestration.fire' : 'orchestration.prompt', params: { hostId, prompt, taskId: identity.taskId, idempotencyKey: identity.idempotencyKey, timeout: budget, waitForCompletion: false, ...(fire && goal !== undefined ? { goal } : {}) } }, budget + 500);
+    if (response.error) throw new TaskResumeError(response.error, resume);
+    let result = response.data as unknown as RemotePromptResult;
+    if (!fire && result.receiptId && ['accepted', 'uncertain'].includes(result.status) && Date.now() < deadline) {
+      console.error(`Remote receipt saved: ${result.receiptId}`);
+      result = await waitForRemoteReceipt(client, result.receiptId, Math.max(1, deadline - Date.now()));
+    }
+    client.close();
+    printRemoteResult(result, json, fire);
+  } catch (error) {
+    client.close();
+    if (safeStartupFailure(error)) throw error;
+    if (error instanceof TaskResumeError) throw error;
+    throw new TaskResumeError(error instanceof Error ? error.message : 'Remote connection lost', resume);
   }
-
-  if (data.error) {
-    console.log('');
-    console.error(chalk.red(`Error: ${data.error}`));
-  }
-  process.exit(0);
 }
 
 // Fire-and-forget functions
-async function fireAndForgetPrompt(client: DaemonClient, prompt: string, goal?: string, model?: string, executionPolicy?: string): Promise<void> {
+async function fireAndForgetPrompt(client: DaemonClient, prompt: string, goal?: string, model?: string, executionPolicy?: string, idempotencyKey?: string, timeout?: number, json = false): Promise<void> {
+  const identity = submissionIdentity(idempotencyKey);
   const result = await client.send({
     method: 'prompt.fire',
-    params: { prompt, goal, model, executionPolicy, workingDir: process.cwd() }
+    params: { prompt, goal, model, executionPolicy, workingDir: process.cwd(), taskId: identity.taskId, idempotencyKey: identity.idempotencyKey }
+  }, timeout).catch(error => {
+    client.close();
+    if (safeStartupFailure(error)) throw error;
+    throw new TaskResumeError(error instanceof Error ? error.message : 'Submission connection lost', identity.resume);
   });
   client.close();
 
@@ -1236,36 +1340,20 @@ async function fireAndForgetPrompt(client: DaemonClient, prompt: string, goal?: 
   }
 
   const data = result.data as { sessionId: string; promptId: string; goal: string };
+  if (json) { console.log(JSON.stringify(result.data)); process.exit(0); }
   console.log(chalk.green('Task launched in background'));
   console.log(`  Session: ${chalk.cyan(data.sessionId)}`);
   console.log(`  Goal: ${chalk.gray(data.goal)}`);
   console.log('');
   console.log(chalk.gray('Check status:'));
   console.log(`  ${chalk.yellow('cb -i')}          ${chalk.gray('# notification inbox')}`);
-  console.log(`  ${chalk.yellow('cb -l')}          ${chalk.gray('# view output')}`);
+  console.log(`  ${chalk.yellow(`cb --task ${data.promptId}`)} ${chalk.gray('# exact task result')}`);
   console.log(`  ${chalk.yellow('cb -w')}          ${chalk.gray('# watch live')}`);
   process.exit(0);
 }
 
-async function fireRemotePrompt(client: DaemonClient, hostId: string, prompt: string, goal?: string): Promise<void> {
-  const result = await client.send({
-    method: 'orchestration.fire',
-    params: { hostId, prompt, goal }
-  });
-  client.close();
-
-  if (result.error) {
-    console.error(chalk.red(result.error));
-    process.exit(1);
-  }
-
-  const data = result.data as { trackingId: string; goal: string };
-  console.log(chalk.green('Remote task dispatched'));
-  console.log(`  Host: ${chalk.cyan(hostId)}`);
-  console.log(`  Goal: ${chalk.gray(data.goal)}`);
-  console.log('');
-  console.log(`  ${chalk.yellow('cb -i')}  ${chalk.gray('# check when done')}`);
-  process.exit(0);
+async function fireRemotePrompt(client: DaemonClient, hostId: string, prompt: string, key?: string, timeout?: number, json = false, goal?: string): Promise<void> {
+  return sendRemotePrompt(client, hostId, prompt, key, timeout ?? 10000, json, true, goal);
 }
 
 // ---------------------------------------------------------------------------

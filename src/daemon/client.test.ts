@@ -77,7 +77,7 @@ describe('DaemonClient state targeting', () => {
     const responses = await Promise.all([client.send({ method: 'first' }), client.send({ method: 'second' })]);
     expect(responses.map(response => response.data?.method)).toEqual(['first', 'second']);
     expect(sockets.size).toBe(1);
-    expect(cleared).toHaveBeenCalledTimes(2);
+    expect(cleared).toHaveBeenCalledTimes(4);
   });
 
   it('rejects all requests immediately when the peer closes', async () => {
@@ -115,6 +115,13 @@ describe('DaemonClient state targeting', () => {
     expect(requestTimer.hasRef()).toBe(false);
   });
 
+  it('honors a shorter per-call deadline and can read again without resubmitting', async () => {
+    await listen(join(dir, 'daemon.sock'));
+    client = new DaemonClient(undefined, 30000);
+    await expect(client.send({ method: 'hold' }, 20)).rejects.toThrow('Request timeout');
+    expect((await client.send({ method: 'read' })).data?.method).toBe('read');
+  });
+
   it('drops an incomplete frame before reconnecting after peer failure', async () => {
     await listen(join(dir, 'daemon.sock'));
     let connections = 0;
@@ -127,5 +134,18 @@ describe('DaemonClient state targeting', () => {
     client = new DaemonClient(undefined, 200);
     await expect(client.send({ method: 'hold' })).rejects.toThrow('Daemon connection closed');
     expect((await client.send({ method: 'fresh' })).data?.method).toBe('fresh');
+  });
+
+  it('preserves UTF-8 task output split inside a multibyte socket chunk', async () => {
+    await listen(join(dir, 'daemon.sock'));
+    const output = 'exact été ✓ output\n';
+    const bytes = Buffer.from(JSON.stringify({ id: 1, data: { output } }) + '\n');
+    const boundary = bytes.indexOf(Buffer.from('é')) + 1;
+    server!.once('connection', socket => {
+      socket.write(bytes.subarray(0, boundary));
+      setTimeout(() => socket.write(bytes.subarray(boundary)), 10);
+    });
+    client = new DaemonClient(undefined, 500);
+    expect((await client.send({ method: 'hold' })).data?.output).toBe(output);
   });
 });

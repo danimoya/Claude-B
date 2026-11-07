@@ -58,7 +58,7 @@ function publicResult(result: RemotePromptResult): RemotePromptResult {
 function publicReceipt(task: RemoteReceipt): RemoteReceipt {
   return {
     id: task.id, receiptId: task.receiptId, taskId: task.taskId, remoteTaskId: task.remoteTaskId,
-    hostId: task.hostId, sessionId: task.sessionId, prompt: task.prompt, idempotencyKey: task.idempotencyKey,
+    hostId: task.hostId, sessionId: task.sessionId, prompt: task.prompt, goal: task.goal, idempotencyKey: task.idempotencyKey,
     status: task.status, taskStatus: task.taskStatus, createdAt: task.createdAt, updatedAt: task.updatedAt,
     submittedAt: task.submittedAt, output: task.output, error: task.error,
     failureKind: task.failureKind, retrySafe: task.retrySafe

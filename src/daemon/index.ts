@@ -232,6 +232,7 @@ class Daemon {
   }
 
   private handleConnection(socket: Socket): void {
+    socket.setEncoding('utf8');
     this.clients.add(socket);
     this.log(`Client connected (total: ${this.clients.size})`);
 
@@ -466,7 +467,7 @@ class Daemon {
       case 'orchestration.fire':
         return this.fireRemotePrompt(
           params?.prompt as string,
-          { hostId: params?.hostId as string | undefined, taskId: params?.taskId as string | undefined, idempotencyKey: params?.idempotencyKey as string | undefined, timeout: params?.timeout as number | undefined }
+          { hostId: params?.hostId as string | undefined, taskId: params?.taskId as string | undefined, idempotencyKey: params?.idempotencyKey as string | undefined, timeout: params?.timeout as number | undefined, goal: params?.goal as string | undefined }
         );
 
       // Telegram bot

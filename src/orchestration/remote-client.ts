@@ -77,6 +77,7 @@ export interface RemotePromptResult {
 
 export interface RemoteRequestOptions { timeout?: number; deadline?: number }
 export interface RemoteSendOptions extends RemoteRequestOptions {
+  goal?: string;
   taskId?: string;
   idempotencyKey?: string;
   waitForCompletion?: boolean;
@@ -389,7 +390,7 @@ export class RemoteClient extends EventEmitter {
       const previous = options.idempotencyKey ? (await this.receipts.list()).find((receipt) => receipt.hostId === this.host.id && receipt.idempotencyKey === options.idempotencyKey) : undefined;
       if (!options.taskId && previous) taskId = previous.taskId;
       if (!this.host.enabled) throw new RemoteRequestError('Remote host is disabled', 'rejected');
-      const prepared = await this.receipts.prepare({ taskId, hostId: this.host.id, sessionId, prompt, idempotencyKey: options.idempotencyKey || taskId, strictTaskId: options.strictTaskId ?? !!options.taskId });
+      const prepared = await this.receipts.prepare({ taskId, hostId: this.host.id, sessionId, prompt, goal: options.goal, idempotencyKey: options.idempotencyKey || taskId, strictTaskId: options.strictTaskId ?? !!options.taskId });
       receipt = prepared.receipt;
       taskId = receipt.taskId;
       if (!prepared.created && receipt.submittedAt && receipt.status !== 'rejected') {

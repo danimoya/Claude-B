@@ -267,6 +267,7 @@ export class OrchestrationManager extends EventEmitter {
       if (existing.prompt !== prompt || (options.taskId && options.taskId !== existing.taskId) ||
           (options.idempotencyKey && options.idempotencyKey !== existing.idempotencyKey) ||
           (options.sessionId && options.sessionId !== existing.sessionId) ||
+          (options.goal !== undefined && options.goal !== existing.goal) ||
           (options.hostId && requestedHost?.id !== existing.hostId)) throw new TaskConflictError();
       if (matches.some(receipt => receipt.taskId !== existing.taskId || receipt.idempotencyKey !== existing.idempotencyKey || receipt.prompt !== existing.prompt)) throw new TaskConflictError();
     }

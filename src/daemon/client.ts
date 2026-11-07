@@ -39,6 +39,7 @@ export class DaemonClient extends EventEmitter {
     if (this.socket?.writable && !this.socket.destroyed) return Promise.resolve(this.socket);
 
     const socket = createConnection(this.socketPath);
+    socket.setEncoding('utf8');
     this.socket = socket;
     this.buffer = '';
     this.connecting = new Promise((resolve, reject) => {
@@ -121,8 +122,18 @@ export class DaemonClient extends EventEmitter {
     }
   }
 
-  async send(message: DaemonMessage): Promise<DaemonResponse> {
-    const socket = await this.connect();
+  async send(message: DaemonMessage, timeoutMs = this.requestTimeoutMs): Promise<DaemonResponse> {
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 1) throw new Error('Invalid request timeout');
+    const deadline = Date.now() + timeoutMs;
+    let connectTimer: ReturnType<typeof setTimeout> | undefined;
+    let socket: Socket;
+    try {
+      socket = await Promise.race([this.connect(), new Promise<never>((_, reject) => {
+        connectTimer = setTimeout(() => reject(new Error('Request timeout')), timeoutMs);
+        connectTimer.unref();
+      })]);
+    } finally { clearTimeout(connectTimer); }
+    if (Date.now() >= deadline) throw new Error('Request timeout');
     if (this.socket !== socket || !socket.writable || socket.destroyed) throw new Error('Daemon connection closed');
     const id = ++this.messageId;
     const payload = JSON.stringify({ ...message, id }) + '\n';
@@ -135,7 +146,7 @@ export class DaemonClient extends EventEmitter {
         clearTimeout(pending.timer);
         reject(error);
       };
-      const timer = setTimeout(() => fail(new Error('Request timeout')), this.requestTimeoutMs);
+      const timer = setTimeout(() => fail(new Error('Request timeout')), Math.max(1, deadline - Date.now()));
       timer.unref();
       this.pendingRequests.set(id, { resolve, reject, timer });
       try {

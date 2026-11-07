@@ -43,14 +43,14 @@ describe('durable remote completion delivery', () => {
   });
 
   it('preserves empty success and includes the error beside partial failure output', async () => {
-    const tasks = [{ ...receipt('completed'), output: '' },
+    const tasks = [{ ...receipt('completed'), output: '', goal: 'owner-selected goal' },
       { ...receipt('error', 'receipt-failed'), output: 'partial result', error: 'provider failed' }];
     const manager = { listRemoteTasks: async () => tasks, getRemoteTask: async () => null,
       resumeRemoteTask: vi.fn(async () => ({} as never)) };
     const outbox = { enqueue: vi.fn(async () => ({} as never)), drain: vi.fn(async () => {}) };
     await new RemoteDeliveryMonitor(manager, outbox).reconcile();
-    expect(outbox.enqueue).toHaveBeenNthCalledWith(1, expect.objectContaining({ resultFull: '' }));
-    expect(outbox.enqueue).toHaveBeenNthCalledWith(2, expect.objectContaining({ resultFull: 'partial result\nprovider failed' }));
+    expect(outbox.enqueue).toHaveBeenNthCalledWith(1, expect.objectContaining({ resultFull: '', goal: 'owner-selected goal' }));
+    expect(outbox.enqueue).toHaveBeenNthCalledWith(2, expect.objectContaining({ resultFull: 'partial result\nprovider failed', goal: 'literal prompt' }));
     expect(manager.resumeRemoteTask).not.toHaveBeenCalled();
   });
 });

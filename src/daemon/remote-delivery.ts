@@ -61,7 +61,7 @@ export class RemoteDeliveryMonitor {
       deliveryId: `remote:${receipt.id}`, promptId: receipt.taskId,
       sessionId: receipt.sessionId, sessionName: `remote:${receipt.hostId}`,
       type: completed ? 'prompt.completed' : 'prompt.error',
-      goal: receipt.prompt.slice(0, 100), exitCode: completed ? 0 : 1,
+      goal: (receipt.goal ?? receipt.prompt).slice(0, 100), exitCode: completed ? 0 : 1,
       resultPreview: result.slice(0, 200), resultFull: result.slice(0, 50000),
       viewCommand: `cb --remote-task ${receipt.id}`,
     });

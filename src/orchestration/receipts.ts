@@ -16,6 +16,7 @@ export interface RemoteReceipt {
   hostId: string;
   sessionId: string;
   prompt: string;
+  goal?: string;
   idempotencyKey: string;
   status: RemoteReceiptStatus;
   taskStatus?: TaskStatus;
@@ -68,6 +69,7 @@ export class RemoteReceiptStore {
           (!['prepared', 'rejected'].includes(receipt.status) && !receipt.submittedAt) ||
           (receipt.taskStatus !== undefined && !['pending', 'running', 'completed', 'error', 'cancelled', 'interrupted'].includes(receipt.taskStatus)) ||
           (receipt.output !== undefined && typeof receipt.output !== 'string') || (receipt.error !== undefined && typeof receipt.error !== 'string') ||
+          (receipt.goal !== undefined && (typeof receipt.goal !== 'string' || !receipt.goal.trim() || receipt.goal.length > 10000)) ||
           (receipt.retrySafe !== undefined && typeof receipt.retrySafe !== 'boolean') ||
           (receipt.failureKind !== undefined && !['auth', 'rejected', 'unavailable', 'uncertain'].includes(receipt.failureKind))) throw new Error('Invalid remote receipt fields; file preserved');
       return receipt;
@@ -100,17 +102,18 @@ export class RemoteReceiptStore {
     else this.memory.set(receipt.id, structuredClone(receipt));
   }
 
-  async prepare(input: Pick<RemoteReceipt, 'taskId' | 'hostId' | 'sessionId' | 'prompt' | 'idempotencyKey'> & { strictTaskId?: boolean }): Promise<{ receipt: RemoteReceipt; created: boolean }> {
+  async prepare(input: Pick<RemoteReceipt, 'taskId' | 'hostId' | 'sessionId' | 'prompt' | 'idempotencyKey' | 'goal'> & { strictTaskId?: boolean }): Promise<{ receipt: RemoteReceipt; created: boolean }> {
     if (!/^[a-zA-Z0-9_-]{8,128}$/.test(input.taskId) || !input.prompt.trim() || !input.idempotencyKey || input.idempotencyKey.length > 256) throw new Error('Invalid remote submission');
+    if (input.goal !== undefined && (typeof input.goal !== 'string' || !input.goal.trim() || input.goal.length > 10000)) throw new Error('Invalid remote submission goal');
     return this.locked(async () => {
       const existing = (await this.list()).find((receipt) => receipt.hostId === input.hostId && (receipt.taskId === input.taskId || receipt.idempotencyKey === input.idempotencyKey));
       if (existing) {
-        if (existing.prompt !== input.prompt || existing.sessionId !== input.sessionId || (input.strictTaskId && existing.taskId !== input.taskId) || existing.idempotencyKey !== input.idempotencyKey) throw new TaskConflictError();
+        if (existing.prompt !== input.prompt || existing.sessionId !== input.sessionId || (input.strictTaskId && existing.taskId !== input.taskId) || existing.idempotencyKey !== input.idempotencyKey || (input.goal !== undefined && existing.goal !== input.goal)) throw new TaskConflictError();
         return { receipt: existing, created: false };
       }
       const now = new Date().toISOString();
       const id = randomUUID();
-      const fields = { taskId: input.taskId, hostId: input.hostId, sessionId: input.sessionId, prompt: input.prompt, idempotencyKey: input.idempotencyKey };
+      const fields = { taskId: input.taskId, hostId: input.hostId, sessionId: input.sessionId, prompt: input.prompt, goal: input.goal, idempotencyKey: input.idempotencyKey };
       const receipt: RemoteReceipt = { ...fields, id, receiptId: id, status: 'prepared', createdAt: now, updatedAt: now };
       await this.write(receipt);
       return { receipt, created: true };

@@ -399,6 +399,10 @@ export class Session extends EventEmitter {
       else args.push('--session-id', randomUUID());
       const proc = spawn(getClaudePath(), args, { cwd: task.workingDir, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env }, detached: process.platform !== 'win32' });
       this.process = proc;
+      // Pipe chunk boundaries can split a Unicode code point. Let each stream
+      // retain partial UTF-8 bytes instead of decoding individual Buffers.
+      proc.stdout?.setEncoding('utf8');
+      proc.stderr?.setEncoding('utf8');
       let promptDispatched = false;
       const onStdout = (chunk: Buffer) => {
         if (this.process !== proc) return;

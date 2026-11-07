@@ -60,7 +60,9 @@ describe('durable remote submission/completion contract', () => {
         const data = await body(request); id = data.taskId; submissions++;
         const receipts = await new RemoteReceiptStore(dir).list();
         expect(receipts).toHaveLength(1);
-        expect(receipts[0]).toMatchObject({ taskId: id, idempotencyKey: 'request-key', status: 'submitting' });
+        expect(receipts[0]).toMatchObject({ taskId: id, idempotencyKey: 'request-key', goal: 'visible notification goal', status: 'submitting' });
+        expect(data.prompt).toBe('work');
+        expect(data).not.toHaveProperty('goal');
         return json(response, { taskId: id, promptId: id, sessionId: 'session-test', status: 'queued' }, 202);
       }
       polls++;
@@ -68,11 +70,12 @@ describe('durable remote submission/completion contract', () => {
     });
     const manager = new RemoteClientManager(dir);
     const client = manager.addHost(remote);
-    const result = await client.sendPrompt('session-test', 'work', { timeout: 1000, idempotencyKey: 'request-key', pollInterval: 5 });
+    const result = await client.sendPrompt('session-test', 'work', { timeout: 1000, idempotencyKey: 'request-key', pollInterval: 5, goal: 'visible notification goal' });
     expect(result).toMatchObject({ status: 'completed', output: 'exact result\n', taskId: id, promptId: id, retrySafe: false });
     expect(submissions).toBe(1);
     expect(polls).toBe(2);
-    expect(await manager.getRemoteTask(result.receiptId!)).toMatchObject({ status: 'completed', output: 'exact result\n' });
+    expect(await manager.getRemoteTask(result.receiptId!)).toMatchObject({ status: 'completed', output: 'exact result\n', goal: 'visible notification goal' });
+    expect(await new RemoteReceiptStore(dir).get(result.receiptId!)).toMatchObject({ goal: 'visible notification goal' });
     expect((await client.sendPrompt('session-test', 'work', { idempotencyKey: 'request-key' })).taskId).toBe(id);
     expect(submissions).toBe(1);
   });
@@ -179,6 +182,23 @@ describe('durable remote submission/completion contract', () => {
     await writeFile(path, bytes);
     await expect(new RemoteReceiptStore(dir).get(receipt.id)).rejects.toThrow('preserved');
     expect(await readFile(path, 'utf8')).toBe(bytes);
+  });
+
+  it('validates optional notification goals and preserves their immutable submission identity', async () => {
+    const store = new RemoteReceiptStore(dir);
+    const input = { taskId: 'fixture-goal-task', hostId: 'host-test', sessionId: 'session-test', prompt: 'unchanged prompt', idempotencyKey: 'goal-key' };
+    for (const goal of [null, 123, '   ', 'x'.repeat(10001)]) {
+      await expect(store.prepare({ ...input, goal } as never)).rejects.toThrow('Invalid remote submission goal');
+    }
+    expect(await store.list()).toEqual([]);
+    const { receipt } = await store.prepare({ ...input, goal: 'owner-selected title' });
+    expect(await new RemoteReceiptStore(dir).get(receipt.id)).toMatchObject({ goal: 'owner-selected title', prompt: input.prompt });
+    await expect(store.prepare({ ...input, goal: 'different title' })).rejects.toThrow('different submission');
+    const path = join(dir, 'remote-tasks', `${receipt.id}.json`);
+    const invalid = JSON.stringify({ ...receipt, goal: 123 });
+    await writeFile(path, invalid);
+    await expect(new RemoteReceiptStore(dir).get(receipt.id)).rejects.toThrow('preserved');
+    expect(await readFile(path, 'utf8')).toBe(invalid);
   });
 
   it('claims concurrent identical submissions once, retaining the same durable task and receipt IDs', async () => {

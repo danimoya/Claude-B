@@ -166,4 +166,30 @@ describe('print-mode prompt terminal results', () => {
     const next = await start();
     expect((await finish(next.child, 'next')).resultFull).toBe('next');
   });
+
+  it('preserves structured and raw UTF-8 results when pipe chunks split multibyte characters', async () => {
+    const { child, id } = await start();
+    const result = '€ κόσμος 😺 café';
+    const json = JSON.stringify({ result, is_error: false });
+    const bytes = Buffer.from(json);
+    const euro = bytes.indexOf(Buffer.from('€')) + 1;
+    const cat = bytes.indexOf(Buffer.from('😺')) + 2;
+    child.stdout.write(bytes.subarray(0, euro));
+    child.stdout.write(bytes.subarray(euro, cat));
+    child.stdout.write(bytes.subarray(cat));
+    const warning = '\nstderr: é 🚀';
+    const stderr = Buffer.from(warning);
+    const rocket = stderr.indexOf(Buffer.from('🚀')) + 1;
+    child.stderr.write(stderr.subarray(0, rocket));
+    child.stderr.write(stderr.subarray(rocket));
+    const notification = await finish(child);
+    expect(notification.resultFull).toBe(result);
+    expect(session.getLastOutput()).toBe(result);
+    expect(session.getLastRawOutput()).toBe(json + warning);
+    expect(await session.getTask(id)).toMatchObject({ status: 'completed', output: result, rawOutput: json + warning, structuredResult: { result } });
+    const restored = new Session(session.getState(), dir);
+    await restored.loadPersistedOutput();
+    expect(restored.getLastOutput()).toBe(result);
+    expect(restored.getLastRawOutput()).toBe(json + warning);
+  });
 });
