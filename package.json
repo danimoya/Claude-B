@@ -29,19 +29,19 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.74.0",
     "@fastify/cors": "^10.0.0",
-    "@fastify/jwt": "^9.0.0",
+    "@fastify/jwt": "^10.2.7",
     "@fastify/rate-limit": "^10.0.0",
     "@fastify/websocket": "^11.0.0",
     "@speechmatics/batch-client": "^5.1.0",
     "chalk": "^5.3.0",
     "commander": "^12.1.0",
-    "fastify": "^5.0.0",
-    "nanoid": "^5.0.7",
+    "fastify": "^5.12.8",
+    "nanoid": "^5.1.16",
     "node-pty": "^1.0.0",
     "node-telegram-bot-api": "^0.67.0",
     "ora": "^8.1.0",
     "strip-ansi": "^7.1.0",
-    "ws": "^8.18.0"
+    "ws": "^8.22.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
