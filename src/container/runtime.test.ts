@@ -3,7 +3,7 @@ import { createServer as createIpcServer, type Server as IpcServer, type Socket 
 import { createServer, type Server } from 'node:http';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,7 +19,8 @@ describe('container readiness and persistent launcher', () => {
   let http: Server | undefined;
   const sockets = new Set<Socket>();
   beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), 'cb-container-'));
+    // The launcher records canonical paths; macOS /var is a /private/var link.
+    dir = await realpath(await mkdtemp(join(tmpdir(), 'cb-container-')));
     ipc = undefined;
     http = undefined;
   });
@@ -142,12 +143,16 @@ if (args[0] === 'exec' && args.includes('cb')) console.log(JSON.stringify(args))
   });
 
   it('installs a usable pinned Docker launcher into the selected user bin directory', async () => {
-    const { env } = await fakeDocker();
+    const { workspace, env } = await fakeDocker();
     const binDir = join(dir, 'installed');
     await execute('bash', [installer, '--method=docker', '--skip-init'], { env: { ...env, CLAUDE_B_BIN_DIR: binDir } });
     const script = await readFile(join(binDir, 'cb'), 'utf8');
     expect(script).toContain('export CB_DOCKER_IMAGE=claude-b:local-fixture');
     expect(script).toContain('exec docker exec');
     await execute('bash', ['-n', join(binDir, 'cb')]);
+    const { stdout } = await execute('bash', [join(binDir, 'cb'), 'literal $HOME $(no shell)'], {
+      env: { ...env, CB_DOCKER_IMAGE: 'unselected-image' }, cwd: workspace,
+    });
+    expect(JSON.parse(stdout)).toEqual(['exec', '-i', '--workdir', '/workspace', 'disposable-fixture', 'cb', 'literal $HOME $(no shell)']);
   });
 });

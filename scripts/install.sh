@@ -11,7 +11,7 @@
 set -euo pipefail
 
 REPO="${CLAUDE_B_REPO:-danimoya/Claude-B}"
-GHCR_IMAGE="ghcr.io/${REPO,,}"
+GHCR_IMAGE="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
 METHOD="auto"
 SKIP_INIT=0
 
