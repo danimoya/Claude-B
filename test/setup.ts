@@ -1,11 +1,11 @@
 import { afterAll, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, realpathSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
 // Each test file has its own worker environment and disposable state. Never
 // discover the developer's real Claude executable, credentials or daemon state.
-const testHome = mkdtempSync(join(tmpdir(), 'claude-b-vitest-'));
+const testHome = realpathSync(mkdtempSync(join(tmpdir(), 'claude-b-vitest-')));
 const testBin = join(testHome, 'bin');
 mkdirSync(testBin);
 process.env.CB_TEST_HOME = testHome;

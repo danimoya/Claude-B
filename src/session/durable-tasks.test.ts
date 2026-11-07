@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'events';
 import { PassThrough } from 'stream';
 import { spawn } from 'child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'fs/promises';
 import { readFileSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -28,7 +28,7 @@ describe('durable task execution and cancellation', () => {
   let children: ReturnType<typeof fakeChild>[];
 
   beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), 'cb-durable-'));
+    dir = await realpath(await mkdtemp(join(tmpdir(), 'cb-durable-')));
     children = [];
     vi.mocked(spawn).mockImplementation((() => {
       const child = fakeChild();
@@ -53,15 +53,19 @@ describe('durable task execution and cancellation', () => {
   }
 
   it('writes a pending receipt before acceptance returns and a running receipt before spawning', async () => {
+    const observed: { tasks?: ReturnType<typeof requireTasks>; error?: unknown } = {};
     vi.mocked(spawn).mockImplementation((() => {
-      const tasks = requireTasks();
-      expect(tasks).toHaveLength(1);
-      expect(tasks[0]).toMatchObject({ status: 'running', prompt: 'exact prompt', workingDir: dir, model: 'sonnet', executionPolicy: 'default' });
+      // Capture the pre-execution state without throwing assertions inside the
+      // runtime callback, which would turn a fixture mismatch into a task error.
+      try { observed.tasks = requireTasks(); } catch (error) { observed.error = error; }
       const child = fakeChild(); children.push(child); return child;
     }) as unknown as typeof spawn);
     const id = await session.sendPrompt('exact prompt');
     expect(await new TaskStore(dir).get(id)).toMatchObject({ id, taskId: id, promptId: id, sessionId: session.id });
     await waitForChildren(1);
+    expect(observed.error).toBeUndefined();
+    expect(observed.tasks).toHaveLength(1);
+    expect(observed.tasks![0]).toMatchObject({ status: 'running', prompt: 'exact prompt', workingDir: dir, model: 'sonnet', executionPolicy: 'default' });
     await complete(children[0]);
   });
 

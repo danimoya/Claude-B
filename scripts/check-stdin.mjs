@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:net';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 /** Exercise the built CLI against disposable IPC fixtures, never a daemon. */
 export async function checkStdinArtifact() {
-  const stateDir = await mkdtemp(join(tmpdir(), 'cb-stdin-artifact-'));
+  const stateDir = await realpath(await mkdtemp(join(tmpdir(), 'cb-stdin-artifact-')));
+  const workingDir = await realpath(process.cwd());
   const requests = [];
   const sockets = new Set();
   const failing = new WeakSet();
@@ -66,7 +67,7 @@ export async function checkStdinArtifact() {
       'DEEPGRAM_API_KEY', 'OPENROUTER_API_KEY', 'TELEGRAM_BOT_TOKEN',
       'TELEGRAM_ALLOWED_CHAT_IDS', 'CB_REST_API_KEY']) delete env[key];
     const child = spawn(process.execPath, ['bin/cb', ...args], {
-      env, stdio: ['pipe', 'pipe', 'pipe'],
+      env, cwd: workingDir, stdio: ['pipe', 'pipe', 'pipe'],
     });
     let output = '';
     let stdout = '';
@@ -95,12 +96,12 @@ export async function checkStdinArtifact() {
     const prompt = '  --help is literal input\n"quoted" $(literal) été ✓\n\n';
     let result = await run(['--model', 'fixture-model'], prompt);
     assert.deepEqual(executionParams(result.requests.find(r => r.method === 'prompt.send')),
-      { prompt, model: 'fixture-model', workingDir: process.cwd() });
+      { prompt, model: 'fixture-model', workingDir });
 
     result = await run(['-x', 'target-session', '-m', 'fixture-model'], prompt);
     assert.equal(result.requests[0]?.method, 'session.select');
     assert.deepEqual(result.requests[0]?.params, { sessionId: 'target-session' });
-    assert.deepEqual(executionParams(result.requests[1]), { prompt, model: 'fixture-model', workingDir: process.cwd(), sessionId: 'target-session' });
+    assert.deepEqual(executionParams(result.requests[1]), { prompt, model: 'fixture-model', workingDir, sessionId: 'target-session' });
 
     result = await run(['--json', '-x', 'target-session'], prompt);
     assert.equal(JSON.parse(result.stdout).output, 'fixture-output', 'JSON stdout must contain only the task receipt');
@@ -110,7 +111,7 @@ export async function checkStdinArtifact() {
 
     result = await run(['-f', '-m', 'fixture-model', '--goal', 'fixture-goal'], prompt);
     assert.deepEqual(executionParams(result.requests.find(r => r.method === 'prompt.fire')),
-      { prompt, model: 'fixture-model', goal: 'fixture-goal', workingDir: process.cwd() });
+      { prompt, model: 'fixture-model', goal: 'fixture-goal', workingDir });
 
     result = await run(['--remote', 'fixture-host'], prompt);
     assert.deepEqual(executionParams(result.requests.find(r => r.method === 'orchestration.prompt')),

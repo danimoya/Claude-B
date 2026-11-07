@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { createServer as createNetServer, createConnection } from 'node:net';
 import { createServer } from 'node:http';
-import { cp, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -26,7 +26,7 @@ async function artifactHashes(directory = artifactRoot) {
 
 /** Real built daemon/CLI acceptance, using only owned temporary state and fake Claude. */
 export async function checkDaemonArtifact() {
-  const root = await mkdtemp(join(tmpdir(), 'cb-daemon-artifact-'));
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'cb-daemon-artifact-')));
   const state = join(root, 'state');
   const home = join(root, 'home');
   const workspace = join(root, 'repository');

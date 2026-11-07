@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, rm } from 'fs/promises';
+import { mkdtemp, realpath, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { spawn } from 'child_process';
@@ -18,7 +18,7 @@ describe('explicit execution policy and workspace', () => {
   });
 
   it.each(['default', 'bypass'] as const)('persists %s policy and uses it for execution', async (policy) => {
-    const dir = await mkdtemp(join(tmpdir(), 'cb-policy-'));
+    const dir = await realpath(await mkdtemp(join(tmpdir(), 'cb-policy-')));
     dirs.push(dir);
     const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), stdin: new PassThrough(), kill: vi.fn(), unref: vi.fn() });
     vi.mocked(spawn).mockReturnValue(child as unknown as ReturnType<typeof spawn>);
@@ -35,7 +35,7 @@ describe('explicit execution policy and workspace', () => {
   });
 
   it('uses safe defaults for new and legacy sessions and rejects nonexistent workspaces', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'cb-policy-'));
+    const dir = await realpath(await mkdtemp(join(tmpdir(), 'cb-policy-')));
     dirs.push(dir);
     const session = Session.create('safe', dir);
     expect(session.executionPolicy).toBe('default');
