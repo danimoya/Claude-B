@@ -66,7 +66,8 @@ export class RemoteClient extends EventEmitter {
     return { ...this.status };
   }
 
-  private async getToken(): Promise<string> {
+  private async getToken(signal: AbortSignal): Promise<string> {
+    signal.throwIfAborted();
     // Check if we have a valid cached token
     if (this.tokenCache && this.tokenCache.expiresAt > Date.now() + 60000) {
       return this.tokenCache.accessToken;
@@ -75,12 +76,14 @@ export class RemoteClient extends EventEmitter {
     // Try to refresh if we have a refresh token
     if (this.tokenCache?.refreshToken) {
       try {
-        const refreshed = await this.refreshToken(this.tokenCache.refreshToken);
+        const refreshed = await this.refreshToken(this.tokenCache.refreshToken, signal);
         if (refreshed) {
           return this.tokenCache.accessToken;
         }
       } catch {
-        // Fall through to get new token
+        // A failed refresh may fall back to authentication only within the
+        // same request budget. An expired deadline must not start more I/O.
+        signal.throwIfAborted();
       }
     }
 
@@ -88,10 +91,12 @@ export class RemoteClient extends EventEmitter {
     const response = await fetch(`${this.host.url}/api/auth/token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ api_key: this.host.apiKey })
+      body: JSON.stringify({ api_key: this.host.apiKey }),
+      signal
     });
 
     if (!response.ok) {
+      await response.body?.cancel();
       throw new Error(`Authentication failed: ${response.status}`);
     }
 
@@ -101,6 +106,7 @@ export class RemoteClient extends EventEmitter {
       expires_in: number;
     };
 
+    signal.throwIfAborted();
     this.tokenCache = {
       accessToken: data.access_token,
       refreshToken: data.refresh_token,
@@ -110,14 +116,17 @@ export class RemoteClient extends EventEmitter {
     return this.tokenCache.accessToken;
   }
 
-  private async refreshToken(refreshToken: string): Promise<boolean> {
+  private async refreshToken(refreshToken: string, signal: AbortSignal): Promise<boolean> {
+    signal.throwIfAborted();
     const response = await fetch(`${this.host.url}/api/auth/refresh`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refresh_token: refreshToken })
+      body: JSON.stringify({ refresh_token: refreshToken }),
+      signal
     });
 
     if (!response.ok) {
+      await response.body?.cancel();
       return false;
     }
 
@@ -127,6 +136,7 @@ export class RemoteClient extends EventEmitter {
       expires_in: number;
     };
 
+    signal.throwIfAborted();
     this.tokenCache = {
       accessToken: data.access_token,
       refreshToken: data.refresh_token,
@@ -142,14 +152,16 @@ export class RemoteClient extends EventEmitter {
     body?: unknown,
     options?: { timeout?: number }
   ): Promise<T> {
-    const token = await this.getToken();
-    const timeout = options?.timeout || 30000;
-
+    // One deadline includes token acquisition/refresh, the operation, and its
+    // response body. No stage gets a fresh timeout or retries a submitted POST.
+    const timeout = options?.timeout ?? 30000;
+    const start = Date.now();
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    const timeoutId = setTimeout(() => controller.abort(new Error(`Remote request timed out after ${timeout}ms`)), timeout);
 
     try {
-      const start = Date.now();
+      const token = await this.getToken(controller.signal);
+      controller.signal.throwIfAborted();
       const headers: Record<string, string> = {
         'Authorization': `Bearer ${token}`
       };
@@ -163,21 +175,23 @@ export class RemoteClient extends EventEmitter {
         signal: controller.signal
       });
 
-      const latency = Date.now() - start;
-      this.status.latency = latency;
-      this.status.healthy = true;
-      this.status.consecutiveFailures = 0;
-      this.status.lastCheck = new Date().toISOString();
-
       if (!response.ok) {
         const error = await response.text();
         throw new Error(`HTTP ${response.status}: ${error}`);
       }
 
-      return await response.json() as T;
+      const result = await response.json() as T;
+      controller.signal.throwIfAborted();
+      this.status.latency = Date.now() - start;
+      this.status.healthy = true;
+      this.status.consecutiveFailures = 0;
+      this.status.lastError = undefined;
+      this.status.lastCheck = new Date().toISOString();
+      return result;
     } catch (error) {
       this.status.consecutiveFailures++;
-      this.status.lastError = error instanceof Error ? error.message : String(error);
+      const failure = controller.signal.aborted ? controller.signal.reason : error;
+      this.status.lastError = failure instanceof Error ? failure.message : String(failure);
       this.status.lastCheck = new Date().toISOString();
 
       const threshold = this.host.healthCheck?.unhealthyThreshold || 3;
@@ -186,7 +200,7 @@ export class RemoteClient extends EventEmitter {
         this.emit('unhealthy', this.status);
       }
 
-      throw error;
+      throw failure;
     } finally {
       clearTimeout(timeoutId);
     }
@@ -195,7 +209,9 @@ export class RemoteClient extends EventEmitter {
   // Health check
   async healthCheck(): Promise<{ status: string; sessions: number; latency: number }> {
     const start = Date.now();
-    const result = await this.request<{ status: string; sessions: number }>('GET', '/api/health');
+    const result = await this.request<{ status: string; sessions: number }>(
+      'GET', '/api/health', undefined, { timeout: this.host.healthCheck?.timeout }
+    );
     return {
       ...result,
       latency: Date.now() - start
@@ -254,7 +270,7 @@ export class RemoteClient extends EventEmitter {
         'POST',
         `/api/sessions/${sessionId}/prompt`,
         { prompt },
-        { timeout: options?.timeout || 300000 }
+        { timeout: options?.timeout ?? 300000 }
       );
 
       return {
