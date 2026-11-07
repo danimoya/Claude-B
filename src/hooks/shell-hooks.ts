@@ -26,49 +26,35 @@ export interface ShellHookResult {
 function buildHookEnv(event: HookEvent): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
 
-  // Common variables
-  env.CLAUDE_B_EVENT = event.type;
-  env.CLAUDE_B_TIMESTAMP = event.timestamp;
-
   // Flatten payload into environment variables
   const payload = event.payload as Record<string, unknown>;
   for (const [key, value] of Object.entries(payload)) {
+    // Payload names are data too. Only valid identifiers can become variables.
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(key)) continue;
     const envKey = `CLAUDE_B_${key.toUpperCase()}`;
-    if (typeof value === 'string') {
-      env[envKey] = value;
-    } else if (typeof value === 'number' || typeof value === 'boolean') {
-      env[envKey] = String(value);
-    } else if (value !== null && value !== undefined) {
-      env[envKey] = JSON.stringify(value);
-    }
+    let serialized: string | undefined;
+    if (typeof value === 'string') serialized = value;
+    else if (typeof value === 'number' || typeof value === 'boolean') serialized = String(value);
+    else if (value !== null && value !== undefined) serialized = JSON.stringify(value);
+    if (serialized === undefined) continue;
+    env[envKey] = serialized;
+
+    // Preserve historical $sessionId/$output aliases through shell expansion,
+    // never by inserting values into the command's source. Upper-case names
+    // cannot become aliases: PATH, ENV and BASH_ENV affect shell execution.
+    if (/^[a-z][a-zA-Z0-9_]*$/.test(key)) env[key] = serialized;
   }
+
+  // Assign metadata last so payload keys cannot override it.
+  env.CLAUDE_B_EVENT = event.type;
+  env.CLAUDE_B_TIMESTAMP = event.timestamp;
+  env.EVENT = event.type;
+  env.TIMESTAMP = event.timestamp;
 
   // Also provide full payload as JSON
   env.CLAUDE_B_PAYLOAD = JSON.stringify(event.payload);
 
   return env;
-}
-
-// Substitute variables in command string
-function substituteVariables(command: string, event: HookEvent): string {
-  let result = command;
-  const payload = event.payload as Record<string, unknown>;
-
-  // Replace $EVENT, $TIMESTAMP, etc.
-  result = result.replace(/\$EVENT/g, event.type);
-  result = result.replace(/\$TIMESTAMP/g, event.timestamp);
-
-  // Replace payload variables like $sessionId, $promptId, etc.
-  for (const [key, value] of Object.entries(payload)) {
-    const pattern = new RegExp(`\\$${key}`, 'g');
-    if (typeof value === 'string') {
-      result = result.replace(pattern, value);
-    } else if (typeof value === 'number' || typeof value === 'boolean') {
-      result = result.replace(pattern, String(value));
-    }
-  }
-
-  return result;
 }
 
 export async function executeShellHook(
@@ -78,8 +64,9 @@ export async function executeShellHook(
   const startTime = Date.now();
   const timeout = hook.timeout || 30000;
 
-  // Substitute variables in command
-  const command = substituteVariables(hook.command, event);
+  // The operator-authored command is trusted shell source; payload values are
+  // passed only through the environment and are never parsed as shell source.
+  const command = hook.command;
   const env = buildHookEnv(event);
 
   return new Promise((resolve) => {
