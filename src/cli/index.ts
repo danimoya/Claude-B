@@ -11,6 +11,7 @@ import { version } from '../utils/version.js';
 import { detectClaude } from '../utils/claude-detector.js';
 import { runInit } from './init.js';
 import * as tunnel from '../tunnel/manager.js';
+import { startDaemon } from './daemon-launch.js';
 
 // Type definitions for API responses
 interface SessionInfo {
@@ -849,22 +850,6 @@ async function sendPrompt(client: DaemonClient, prompt: string, model?: string):
   await new Promise<void>((resolve) => {
     client.on('close', resolve);
   });
-}
-
-async function startDaemon(): Promise<void> {
-  const { spawn } = await import('child_process');
-  const { homedir } = await import('os');
-  const { mkdir } = await import('fs/promises');
-
-  const configDir = `${homedir()}/.claude-b`;
-  await mkdir(configDir, { recursive: true });
-
-  const daemon = spawn('node', ['dist/daemon/index.js'], {
-    cwd: process.cwd(),
-    detached: true,
-    stdio: 'ignore'
-  });
-  daemon.unref();
 }
 
 async function waitForDaemon(maxWaitMs = 5000): Promise<void> {

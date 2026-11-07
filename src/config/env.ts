@@ -1,6 +1,6 @@
 import { homedir } from 'os';
 import { readFileSync, existsSync } from 'fs';
-import { join } from 'path';
+import { join, resolve } from 'path';
 
 const KNOWN_KEYS = [
   // Claude Code
@@ -55,7 +55,7 @@ function parseEnvFile(path: string): Record<string, string> {
  * Safe to call multiple times. Missing files are silently ignored.
  */
 export function loadEnv(): void {
-  const dataDir = process.env.CB_DATA_DIR || join(homedir(), '.claude-b');
+  const dataDir = getDataDir();
   const sources = [
     join(dataDir, '.env'),
     join(process.cwd(), '.env'),
@@ -82,10 +82,19 @@ export function loadEnv(): void {
   if (process.env.CB_REST_PORT === undefined && process.env.REST_PORT) {
     process.env.CB_REST_PORT = process.env.REST_PORT;
   }
+
+  // Resolve once in the caller's directory before a detached daemon inherits
+  // the environment, so all processes use the same absolute state location.
+  if (process.env.CB_DATA_DIR) process.env.CB_DATA_DIR = getDataDir();
 }
 
 export function getDataDir(): string {
-  return process.env.CB_DATA_DIR || join(homedir(), '.claude-b');
+  const configured = process.env.CB_DATA_DIR;
+  if (!configured) return join(homedir(), '.claude-b');
+  const expanded = configured === '~'
+    ? homedir()
+    : configured.startsWith('~/') ? join(homedir(), configured.slice(2)) : configured;
+  return resolve(expanded);
 }
 
 export function envTemplate(): string {

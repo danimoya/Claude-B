@@ -1,9 +1,8 @@
-import { loadEnv } from '../config/env.js';
+import { loadEnv, getDataDir } from '../config/env.js';
 
 loadEnv();
 
 import { createServer, Server, Socket } from 'net';
-import { homedir } from 'os';
 import { mkdir, writeFile, unlink, readFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { nanoid } from 'nanoid';
@@ -64,7 +63,7 @@ class Daemon {
   private codexTmuxSessions = new Map<string, { name?: string; goal?: string; lastSeen: number }>();
 
   constructor() {
-    const configDir = process.env.CB_DATA_DIR || `${homedir()}/.claude-b`;
+    const configDir = getDataDir();
     this.config = {
       socketPath: `${configDir}/daemon.sock`,
       pidFile: `${configDir}/daemon.pid`,

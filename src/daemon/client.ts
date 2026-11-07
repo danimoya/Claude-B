@@ -1,6 +1,7 @@
 import { createConnection, Socket } from 'net';
-import { homedir } from 'os';
 import { EventEmitter } from 'events';
+import { join } from 'path';
+import { getDataDir } from '../config/env.js';
 
 export interface DaemonMessage {
   method: string;
@@ -26,7 +27,7 @@ export class DaemonClient extends EventEmitter {
 
   constructor(socketPath?: string) {
     super();
-    this.socketPath = socketPath || `${homedir()}/.claude-b/daemon.sock`;
+    this.socketPath = socketPath || join(getDataDir(), 'daemon.sock');
   }
 
   private async connect(): Promise<Socket> {
