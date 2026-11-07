@@ -29,14 +29,14 @@ export interface TelegramConfig {
   token: string;
   enabled: boolean;
   chatIds: string[];
-  sessionMap: Record<string, string>; // telegramMessageId -> claudeSessionId
+  sessionMap: Record<string, string>; // [chatId, messageId] -> claudeSessionId
   forwardAllSessions?: boolean; // Forward all session completions to Telegram (default: true)
   // Voice pipeline
   speechmaticsApiKey?: string;  // Legacy — use sttProvider instead
   sttProvider?: STTProviderConfig;
   aiProvider?: AIProviderConfig;
-  pendingPrompts: Record<string, PendingPrompt>; // messageId -> pending
-  resultMap: Record<string, string>; // messageId -> result text (for TTS)
+  pendingPrompts: Record<string, PendingPrompt>; // [chatId, messageId] -> pending
+  resultMap: Record<string, string>; // [chatId, messageId] -> result text (for TTS)
 }
 
 const DEFAULT_CONFIG: TelegramConfig = {
@@ -48,10 +48,29 @@ const DEFAULT_CONFIG: TelegramConfig = {
   resultMap: {},
 };
 
+function defaultConfig(): TelegramConfig {
+  return { ...DEFAULT_CONFIG, chatIds: [], sessionMap: {}, pendingPrompts: {}, resultMap: {} };
+}
+
+export function telegramMessageKey(chatId: string, messageId: string): string {
+  return JSON.stringify([chatId, messageId]);
+}
+
+function scopedEntries<T>(map: Record<string, T>): Record<string, T> {
+  return Object.fromEntries(Object.entries(map || {}).filter(([key]) => {
+    try {
+      const parts: unknown = JSON.parse(key);
+      return Array.isArray(parts) && parts.length === 2 && parts.every(part => typeof part === 'string');
+    } catch {
+      return false;
+    }
+  }));
+}
+
 export class TelegramConfigManager {
   private configPath: string;
   private configDir: string;
-  private config: TelegramConfig = { ...DEFAULT_CONFIG };
+  private config: TelegramConfig = defaultConfig();
 
   constructor(configDir: string) {
     this.configDir = configDir;
@@ -60,19 +79,24 @@ export class TelegramConfigManager {
 
   async load(): Promise<TelegramConfig> {
     if (!existsSync(this.configPath)) {
-      this.config = { ...DEFAULT_CONFIG };
+      this.config = defaultConfig();
       return this.config;
     }
     try {
       const content = await readFile(this.configPath, 'utf-8');
-      this.config = { ...DEFAULT_CONFIG, ...JSON.parse(content) };
+      this.config = { ...defaultConfig(), ...JSON.parse(content) };
+      // Telegram message IDs are only unique inside a chat. Legacy bare IDs
+      // cannot be assigned to an owner reliably; never reuse them for routing.
+      this.config.sessionMap = scopedEntries(this.config.sessionMap);
+      this.config.resultMap = scopedEntries(this.config.resultMap);
+      this.config.pendingPrompts = scopedEntries(this.config.pendingPrompts);
       // Auto-migrate legacy speechmaticsApiKey → sttProvider
       if (this.config.speechmaticsApiKey && !this.config.sttProvider) {
         this.config.sttProvider = { provider: 'speechmatics', apiKey: this.config.speechmaticsApiKey };
         await this.save();
       }
     } catch {
-      this.config = { ...DEFAULT_CONFIG };
+      this.config = defaultConfig();
     }
     return this.config;
   }
@@ -111,6 +135,8 @@ export class TelegramConfigManager {
     this.config.token = '';
     this.config.chatIds = [];
     this.config.sessionMap = {};
+    this.config.pendingPrompts = {};
+    this.config.resultMap = {};
     await this.save();
   }
 
@@ -121,8 +147,8 @@ export class TelegramConfigManager {
     }
   }
 
-  async mapMessage(telegramMessageId: string, claudeSessionId: string): Promise<void> {
-    this.config.sessionMap[telegramMessageId] = claudeSessionId;
+  async mapMessage(chatId: string, telegramMessageId: string, claudeSessionId: string): Promise<void> {
+    this.config.sessionMap[telegramMessageKey(chatId, telegramMessageId)] = claudeSessionId;
     // Keep map size bounded — remove oldest entries beyond 500
     const keys = Object.keys(this.config.sessionMap);
     if (keys.length > 500) {
@@ -133,8 +159,8 @@ export class TelegramConfigManager {
     await this.save();
   }
 
-  getSessionForMessage(telegramMessageId: string): string | undefined {
-    return this.config.sessionMap[telegramMessageId];
+  getSessionForMessage(chatId: string, telegramMessageId: string): string | undefined {
+    return this.config.sessionMap[telegramMessageKey(chatId, telegramMessageId)];
   }
 
   // Voice config
@@ -158,8 +184,9 @@ export class TelegramConfigManager {
   }
 
   // Pending prompts (awaiting user confirmation)
-  addPendingPrompt(messageId: string, pending: PendingPrompt): void {
-    this.config.pendingPrompts[messageId] = pending;
+  addPendingPrompt(chatId: string, messageId: string, pending: PendingPrompt): void {
+    if (pending.chatId !== chatId) throw new Error('Pending prompt owner must match chat');
+    this.config.pendingPrompts[telegramMessageKey(chatId, messageId)] = pending;
     // Expire old entries (>10 min) and cap at 50
     const now = Date.now();
     const entries = Object.entries(this.config.pendingPrompts);
@@ -176,29 +203,30 @@ export class TelegramConfigManager {
     }
   }
 
-  getPendingPrompt(messageId: string): PendingPrompt | undefined {
-    const pending = this.config.pendingPrompts[messageId];
-    if (pending && Date.now() - pending.timestamp > 10 * 60 * 1000) {
-      delete this.config.pendingPrompts[messageId];
+  getPendingPrompt(chatId: string, messageId: string): PendingPrompt | undefined {
+    const key = telegramMessageKey(chatId, messageId);
+    const pending = this.config.pendingPrompts[key];
+    if (pending && (pending.chatId !== chatId || Date.now() - pending.timestamp > 10 * 60 * 1000)) {
+      delete this.config.pendingPrompts[key];
       return undefined;
     }
     return pending;
   }
 
-  removePendingPrompt(messageId: string): void {
-    delete this.config.pendingPrompts[messageId];
+  removePendingPrompt(chatId: string, messageId: string): void {
+    delete this.config.pendingPrompts[telegramMessageKey(chatId, messageId)];
   }
 
-  updatePendingPrompt(messageId: string, optimizedPrompt: string): void {
-    const pending = this.config.pendingPrompts[messageId];
+  updatePendingPrompt(chatId: string, messageId: string, optimizedPrompt: string): void {
+    const pending = this.getPendingPrompt(chatId, messageId);
     if (pending) {
       pending.optimizedPrompt = optimizedPrompt;
     }
   }
 
   // Result map (for TTS playback of notification results)
-  storeResult(messageId: string, resultText: string): void {
-    this.config.resultMap[messageId] = resultText.slice(0, 5000);
+  storeResult(chatId: string, messageId: string, resultText: string): void {
+    this.config.resultMap[telegramMessageKey(chatId, messageId)] = resultText.slice(0, 5000);
     // Cap at 200 entries
     const keys = Object.keys(this.config.resultMap);
     if (keys.length > 200) {
@@ -208,7 +236,7 @@ export class TelegramConfigManager {
     }
   }
 
-  getResult(messageId: string): string | undefined {
-    return this.config.resultMap[messageId];
+  getResult(chatId: string, messageId: string): string | undefined {
+    return this.config.resultMap[telegramMessageKey(chatId, messageId)];
   }
 }

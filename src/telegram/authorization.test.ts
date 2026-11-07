@@ -38,7 +38,7 @@ describe('Telegram private chat authorization', () => {
   });
 
   function pending() {
-    bot.configManager.addPendingPrompt('pending', { chatId: '123', sessionId: 'session', transcript: 'raw', optimizedPrompt: 'optimized', timestamp: Date.now() });
+    bot.configManager.addPendingPrompt('123', 'pending', { chatId: '123', sessionId: 'session', transcript: 'raw', optimizedPrompt: 'optimized', timestamp: Date.now() });
   }
 
   it('denies new registrations until explicitly allowed and requires a private sender', async () => {
@@ -83,7 +83,7 @@ describe('Telegram private chat authorization', () => {
     pending();
     for (const action of ['confirm', 'edit', 'cancel']) await bot.handleCallback(callback(`${action}:pending`, 456));
     expect(onPrompt).not.toHaveBeenCalled();
-    expect(bot.configManager.getPendingPrompt('pending')).toBeDefined();
+    expect(bot.configManager.getPendingPrompt('123', 'pending')).toBeDefined();
     expect(bot.editState.size).toBe(0);
   });
 
@@ -98,17 +98,17 @@ describe('Telegram private chat authorization', () => {
     await first;
     await bot.handleCallback(callback('confirm:pending'));
     expect(onPrompt).toHaveBeenCalledOnce();
-    expect(bot.configManager.getPendingPrompt('pending')).toBeUndefined();
+    expect(bot.configManager.getPendingPrompt('123', 'pending')).toBeUndefined();
   });
 
   it('retains a pending prompt after a failed submission and permits an explicit retry', async () => {
     pending();
     onPrompt.mockRejectedValueOnce(new Error('provider unavailable'));
     await bot.handleCallback(callback('confirm:pending'));
-    expect(bot.configManager.getPendingPrompt('pending')).toBeDefined();
+    expect(bot.configManager.getPendingPrompt('123', 'pending')).toBeDefined();
     await bot.handleCallback(callback('confirm:pending'));
     expect(onPrompt).toHaveBeenCalledTimes(2);
-    expect(bot.configManager.getPendingPrompt('pending')).toBeUndefined();
+    expect(bot.configManager.getPendingPrompt('123', 'pending')).toBeUndefined();
   });
 
   it('does not submit an old prompt while an edit is pending', async () => {
@@ -116,6 +116,6 @@ describe('Telegram private chat authorization', () => {
     await bot.handleCallback(callback('edit:pending'));
     await bot.handleCallback(callback('confirm:pending'));
     expect(onPrompt).not.toHaveBeenCalled();
-    expect(bot.configManager.getPendingPrompt('pending')).toBeDefined();
+    expect(bot.configManager.getPendingPrompt('123', 'pending')).toBeDefined();
   });
 });

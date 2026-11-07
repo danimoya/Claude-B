@@ -1,6 +1,6 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { EventEmitter } from 'events';
-import { TelegramConfigManager } from './config.js';
+import { TelegramConfigManager, telegramMessageKey } from './config.js';
 import { VoicePipeline } from './voice.js';
 import { SessionContext } from './ai-provider.js';
 import { isChatAllowed } from './allow-list.js';
@@ -185,6 +185,7 @@ export class ClaudeBTelegramBot extends EventEmitter {
     this.bot.onText(/\/inbox/, (msg) => this.handleInbox(msg));
     this.bot.onText(/\/voice/, (msg) => this.handleVoiceStatus(msg));
     this.bot.onText(/\/help/, (msg) => this.handleHelp(msg));
+    this.bot.onText(/^\/cancel(?:@\w+)?$/, (msg) => this.handleMessage({ ...msg, text: '/cancel' }));
 
     // Handle voice messages
     this.bot.on('voice', (msg) => this.handleVoice(msg));
@@ -234,7 +235,7 @@ export class ClaudeBTelegramBot extends EventEmitter {
     costUsd?: number;
     resultPreview?: string;
   }): Promise<number | undefined> {
-    if (!this.bot) return;
+    if (!this.bot || !/^[1-9]\d*$/.test(chatId) || !this.isAuthorizedChat(chatId)) return;
 
     const isSuccess = notification.type === 'prompt.completed';
     const icon = isSuccess ? '✅' : '❌';
@@ -329,10 +330,10 @@ export class ClaudeBTelegramBot extends EventEmitter {
       const firstSent = await sendOne(buildMessage(0));
       if (!firstSent) return undefined;
 
-      await this.configManager.mapMessage(String(firstSent.message_id), notification.sessionId);
+      await this.configManager.mapMessage(chatId, String(firstSent.message_id), notification.sessionId);
 
       if (this.voicePipeline && notification.resultPreview) {
-        this.configManager.storeResult(String(firstSent.message_id), notification.resultPreview);
+        this.configManager.storeResult(chatId, String(firstSent.message_id), notification.resultPreview);
         try {
           await this.bot.editMessageReplyMarkup({
             inline_keyboard: [[
@@ -350,7 +351,7 @@ export class ClaudeBTelegramBot extends EventEmitter {
       for (let i = 1; i < total; i++) {
         const cont = await sendOne(buildMessage(i));
         if (cont) {
-          await this.configManager.mapMessage(String(cont.message_id), notification.sessionId);
+          await this.configManager.mapMessage(chatId, String(cont.message_id), notification.sessionId);
         }
       }
 
@@ -607,7 +608,11 @@ export class ClaudeBTelegramBot extends EventEmitter {
     // Determine target session
     let targetSession: string | undefined;
     if (msg.reply_to_message) {
-      targetSession = this.configManager.getSessionForMessage(String(msg.reply_to_message.message_id));
+      targetSession = this.configManager.getSessionForMessage(chatId, String(msg.reply_to_message.message_id));
+      if (!targetSession) {
+        await this.safeSend(chatId, 'Notification mapping expired. Use /select <id> and send a new message.');
+        return;
+      }
     }
     if (!targetSession) {
       targetSession = this.selectedSession.get(chatId);
@@ -692,7 +697,7 @@ export class ClaudeBTelegramBot extends EventEmitter {
       });
 
       // 5. Store pending prompt
-      this.configManager.addPendingPrompt(String(statusMsg.message_id), {
+      this.configManager.addPendingPrompt(chatId, String(statusMsg.message_id), {
         chatId,
         sessionId: targetSession,
         transcript,
@@ -739,7 +744,7 @@ export class ClaudeBTelegramBot extends EventEmitter {
   }
 
   private async handleConfirmPrompt(chatId: string, pendingId: string, messageId: number): Promise<void> {
-    const pending = this.configManager.getPendingPrompt(pendingId);
+    const pending = this.configManager.getPendingPrompt(chatId, pendingId);
     if (!pending || pending.chatId !== chatId) {
       await this.safeSend(chatId, '⏰ Prompt expired. Send another voice message.');
       return;
@@ -749,16 +754,16 @@ export class ClaudeBTelegramBot extends EventEmitter {
       await this.safeSend(chatId, 'Prompt routing not available');
       return;
     }
-    if (this.confirmingPrompts.has(pendingId)) return;
+    if (this.confirmingPrompts.has(telegramMessageKey(chatId, pendingId))) return;
     if (this.editState.get(chatId) === pendingId) {
       await this.safeSend(chatId, 'Finish editing the prompt before confirming.');
       return;
     }
-    this.confirmingPrompts.add(pendingId);
+    this.confirmingPrompts.add(telegramMessageKey(chatId, pendingId));
 
     try {
       await this.options.onPrompt(pending.sessionId, pending.optimizedPrompt);
-      this.configManager.removePendingPrompt(pendingId);
+      this.configManager.removePendingPrompt(chatId, pendingId);
 
       // Debug / audit view: keep both the raw transcript and the optimized
       // prompt visible after send so the user can see "what I said" vs
@@ -783,13 +788,13 @@ export class ClaudeBTelegramBot extends EventEmitter {
       const errMsg = err instanceof Error ? err.message : String(err);
       await this.safeSend(chatId, `❌ Error: ${errMsg}`);
     } finally {
-      this.confirmingPrompts.delete(pendingId);
+      this.confirmingPrompts.delete(telegramMessageKey(chatId, pendingId));
     }
   }
 
   private async handleEditPrompt(chatId: string, pendingId: string, _messageId: number): Promise<void> {
-    const pending = this.configManager.getPendingPrompt(pendingId);
-    if (!pending || pending.chatId !== chatId || this.confirmingPrompts.has(pendingId)) {
+    const pending = this.configManager.getPendingPrompt(chatId, pendingId);
+    if (!pending || pending.chatId !== chatId || this.confirmingPrompts.has(telegramMessageKey(chatId, pendingId))) {
       await this.safeSend(chatId, '⏰ Prompt expired. Send another voice message.');
       return;
     }
@@ -800,10 +805,10 @@ export class ClaudeBTelegramBot extends EventEmitter {
   }
 
   private async handleCancelPrompt(chatId: string, pendingId: string, messageId: number): Promise<void> {
-    const pending = this.configManager.getPendingPrompt(pendingId);
-    if (!pending || pending.chatId !== chatId || this.confirmingPrompts.has(pendingId)) return;
-    this.configManager.removePendingPrompt(pendingId);
-    this.editState.delete(chatId);
+    const pending = this.configManager.getPendingPrompt(chatId, pendingId);
+    if (!pending || pending.chatId !== chatId || this.confirmingPrompts.has(telegramMessageKey(chatId, pendingId))) return;
+    this.configManager.removePendingPrompt(chatId, pendingId);
+    if (this.editState.get(chatId) === pendingId) this.editState.delete(chatId);
 
     await this.bot!.editMessageText('❌ Cancelled', {
       chat_id: chatId,
@@ -817,7 +822,7 @@ export class ClaudeBTelegramBot extends EventEmitter {
       return;
     }
 
-    const resultText = this.configManager.getResult(resultMsgId);
+    const resultText = this.configManager.getResult(chatId, resultMsgId);
     if (!resultText) {
       await this.safeSend(chatId, '🔊 Result no longer available for playback');
       return;
@@ -1026,21 +1031,21 @@ export class ClaudeBTelegramBot extends EventEmitter {
     // Check if user is in edit mode (editing a voice prompt)
     const editPendingId = this.editState.get(chatId);
     if (editPendingId) {
-      this.editState.delete(chatId);
+      const editKey = telegramMessageKey(chatId, editPendingId);
+      if (this.confirmingPrompts.has(editKey)) return;
 
       if (text === '/cancel') {
+        this.editState.delete(chatId);
         await this.safeSend(chatId, '✏️ Edit cancelled');
         return;
       }
 
-      const pending = this.configManager.getPendingPrompt(editPendingId);
+      const pending = this.configManager.getPendingPrompt(chatId, editPendingId);
       if (!pending) {
+        this.editState.delete(chatId);
         await this.safeSend(chatId, '⏰ Prompt expired. Send another voice message.');
         return;
       }
-
-      // Update the pending prompt with user's edit
-      this.configManager.updatePendingPrompt(editPendingId, text);
 
       // Show updated prompt with buttons
       const displayText = [
@@ -1051,9 +1056,13 @@ export class ClaudeBTelegramBot extends EventEmitter {
         text,
       ].join('\n');
 
+      this.confirmingPrompts.add(editKey);
       try {
-        // Send a new message with updated prompt and buttons
-        const newMsg = await this.bot!.sendMessage(chatId, displayText, {
+        // Keep the same confirmation message and ID throughout editing. Both
+        // displayed content and callback payloads now refer to the same prompt.
+        await this.bot!.editMessageText(displayText, {
+          chat_id: chatId,
+          message_id: Number(editPendingId),
           reply_markup: {
             inline_keyboard: [[
               { text: '✅ Send', callback_data: `confirm:${editPendingId}` },
@@ -1063,13 +1072,18 @@ export class ClaudeBTelegramBot extends EventEmitter {
           },
         });
 
-        // Move pending prompt to new message ID
-        const updatedPending = { ...pending, optimizedPrompt: text };
-        this.configManager.removePendingPrompt(editPendingId);
-        this.configManager.addPendingPrompt(String(newMsg.message_id), updatedPending);
+        this.configManager.updatePendingPrompt(chatId, editPendingId, text);
+        this.editState.delete(chatId);
       } catch {
         await this.safeSend(chatId, '❌ Failed to update prompt');
+      } finally {
+        this.confirmingPrompts.delete(editKey);
       }
+      return;
+    }
+
+    if (text === '/cancel') {
+      await this.safeSend(chatId, 'No prompt edit is pending.');
       return;
     }
 
@@ -1084,7 +1098,11 @@ export class ClaudeBTelegramBot extends EventEmitter {
     // If replying to a notification message, route to that session
     if (msg.reply_to_message) {
       const replyMsgId = String(msg.reply_to_message.message_id);
-      targetSession = this.configManager.getSessionForMessage(replyMsgId);
+      targetSession = this.configManager.getSessionForMessage(chatId, replyMsgId);
+      if (!targetSession) {
+        await this.safeSend(chatId, 'Notification mapping expired. Use /select <id> and send a new message.');
+        return;
+      }
     }
 
     // Otherwise use the selected session
