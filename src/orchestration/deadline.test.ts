@@ -102,7 +102,9 @@ describe('remote request wall-clock deadline', () => {
     const result = await client.sendPrompt('session-test', 'once', { timeout: 100 });
     expect(result.error).toBe('Remote request timed out after 100ms');
     expect(submissions).toBe(1);
-    expect(result.promptId).toBe('');
+    expect(result).toMatchObject({ status: 'uncertain', failureKind: 'uncertain', retrySafe: false, taskId: result.promptId });
+    expect(result.promptId).toMatch(/^[a-f0-9-]{36}$/);
+    expect(result.receiptId).toBeTruthy();
   });
 
   it('honors the configured health-check budget during authentication', async () => {

@@ -2,6 +2,8 @@
 
 import { EventEmitter } from 'events';
 import { RemoteClient, RemoteClientManager } from './remote-client.js';
+import { randomUUID } from 'crypto';
+import type { RemotePromptResult } from './remote-client.js';
 
 export type StepResult = {
   stepId: string;
@@ -10,6 +12,9 @@ export type StepResult = {
   output?: string;
   error?: string;
   host?: string;
+  taskId?: string;
+  receiptId?: string;
+  remoteStatus?: RemotePromptResult['status'];
   startTime: string;
   endTime: string;
   latency: number;
@@ -124,7 +129,10 @@ export class PipelineExecutor extends EventEmitter {
 
     for (const step of pipeline.steps) {
       try {
-        const result = await this.executeStep(step, context);
+        const executable = pipeline.onError === 'retry' && step.type === 'prompt'
+          ? { ...step, retries: step.retries ?? pipeline.maxRetries ?? 0 }
+          : step;
+        const result = await this.executeStep(executable, context);
         results.push(result);
         context.stepResults.set(step.id, result);
 
@@ -136,7 +144,7 @@ export class PipelineExecutor extends EventEmitter {
         this.emit('step.complete', { pipelineId: pipeline.id, step: result });
 
         if (result.status === 'error') {
-          if (pipeline.onError === 'stop') {
+          if (pipeline.onError !== 'continue') {
             pipelineStatus = 'error';
             break;
           } else if (pipeline.onError === 'continue') {
@@ -158,7 +166,7 @@ export class PipelineExecutor extends EventEmitter {
 
         this.emit('step.error', { pipelineId: pipeline.id, step: errorResult });
 
-        if (pipeline.onError === 'stop') {
+        if (pipeline.onError !== 'continue') {
           pipelineStatus = 'error';
           break;
         }
@@ -218,7 +226,7 @@ export class PipelineExecutor extends EventEmitter {
       client = this.clientManager.getNextHealthyHost();
     }
 
-    if (!client) {
+    if (!client || !client.getStatus().enabled) {
       return {
         stepId: step.id,
         stepName: step.name,
@@ -237,21 +245,26 @@ export class PipelineExecutor extends EventEmitter {
 
     // Execute with retries
     let lastError: string | undefined;
+    let lastResult: RemotePromptResult | undefined;
     const retries = step.retries || 0;
+    const timeout = step.timeout ?? 300000;
+    const deadline = Date.now() + timeout;
+    const taskId = randomUUID();
+    let sessionId = step.sessionId;
 
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
         // Get or create session
-        let sessionId = step.sessionId;
         if (!sessionId) {
-          const session = await client.createSession();
+          const session = await client.createSession(undefined, { timeout, deadline });
           sessionId = session.id;
         }
 
         // Send prompt
         const result = await client.sendPrompt(sessionId, prompt, {
-          timeout: step.timeout
+          timeout, deadline, taskId, idempotencyKey: taskId
         });
+        lastResult = result;
 
         if (result.status === 'completed') {
           let output = result.output || '';
@@ -273,15 +286,26 @@ export class PipelineExecutor extends EventEmitter {
           };
         }
 
-        lastError = result.error || 'Unknown error';
+        lastError = result.status === 'accepted' || result.status === 'uncertain'
+          ? `Remote task remains ${result.status}; resume receipt ${result.receiptId || result.taskId}`
+          : result.error || 'Remote execution failed';
+        if (!result.retrySafe) break;
       } catch (error) {
         lastError = error instanceof Error ? error.message : String(error);
+        if (!error || typeof error !== 'object' || (error as { retrySafe?: boolean }).retrySafe !== true) break;
       }
 
       // Wait before retry
       if (attempt < retries && step.retryDelay) {
-        await new Promise(resolve => setTimeout(resolve, step.retryDelay));
+        await new Promise<void>((resolve) => {
+          const signal = client!.abortSignal;
+          const done = () => { clearTimeout(timer); signal.removeEventListener('abort', done); resolve(); };
+          const timer = setTimeout(done, Math.max(0, Math.min(step.retryDelay!, deadline - Date.now())));
+          signal.addEventListener('abort', done, { once: true });
+          if (signal.aborted) done();
+        });
       }
+      if (client.abortSignal.aborted || Date.now() >= deadline) break;
     }
 
     return {
@@ -290,6 +314,9 @@ export class PipelineExecutor extends EventEmitter {
       status: 'error',
       error: lastError,
       host: client.getStatus().id,
+      taskId: lastResult?.taskId,
+      receiptId: lastResult?.receiptId,
+      remoteStatus: lastResult?.status,
       startTime,
       endTime: new Date().toISOString(),
       latency: new Date().getTime() - new Date(startTime).getTime()

@@ -7,6 +7,8 @@ import { nanoid } from 'nanoid';
 import { SessionManager } from './session-manager.js';
 import { DaemonInstanceLock } from './instance-lock.js';
 import { selectExecutionSession } from './execution-context.js';
+import { RemoteDeliveryMonitor } from './remote-delivery.js';
+import type { RemoteSendOptions } from '../orchestration/remote-client.js';
 import { TmuxRegistry } from './tmux-registry.js';
 import { readLastTurnsFromTranscript, type TranscriptTurn } from '../utils/transcript.js';
 import { Session, type ExecutionPolicy } from '../session/session.js';
@@ -49,6 +51,7 @@ class Daemon {
   private orchestrationManager: OrchestrationManager;
   private notificationInbox: NotificationInbox;
   private notificationOutbox: NotificationOutbox;
+  private remoteDelivery: RemoteDeliveryMonitor;
   private telegramBot: ClaudeBTelegramBot;
   private clients: Set<Socket> = new Set();
   private startTime: number = Date.now();
@@ -139,6 +142,7 @@ class Daemon {
     this.notificationOutbox = createDeliveryOutbox(configDir, {
       inbox: this.notificationInbox, hooks: this.hookEngine, telegram: this.telegramBot,
     });
+    this.remoteDelivery = new RemoteDeliveryMonitor(this.orchestrationManager, this.notificationOutbox, () => this.log('Remote task status remains recoverable from its durable receipt'));
     this.sessionManager.on('task.terminal', (task: TaskRecord) => {
       void this.notificationOutbox.enqueue(Session.notificationForTask(task)).then(() => this.notificationOutbox.drain()).catch(() => {
         this.log('Task notification remains recoverable from its durable receipt');
@@ -203,6 +207,7 @@ class Daemon {
       if (TERMINAL_TASK_STATUSES.has(task.status)) await this.notificationOutbox.enqueue(Session.notificationForTask(task));
     }
     this.notificationOutbox.start();
+    this.remoteDelivery.start();
 
     // Create server
     this.server = createServer((socket) => this.handleConnection(socket));
@@ -410,11 +415,25 @@ class Daemon {
         return this.getOrchestrationStats();
 
       case 'orchestration.prompt':
-        return this.sendRemotePrompt(
-          params?.prompt as string,
-          params?.hostId as string | undefined,
-          params?.sessionId as string | undefined
-        );
+        return this.sendRemotePrompt(params?.prompt as string, {
+          hostId: params?.hostId as string | undefined,
+          sessionId: params?.sessionId as string | undefined,
+          timeout: params?.timeout as number | undefined,
+          taskId: params?.taskId as string | undefined,
+          idempotencyKey: params?.idempotencyKey as string | undefined,
+          waitForCompletion: params?.waitForCompletion as boolean | undefined,
+        });
+      case 'orchestration.task.list':
+        return { data: { tasks: await this.orchestrationManager.listRemoteTasks() } };
+      case 'orchestration.task.get':
+        return { data: { task: await this.orchestrationManager.getRemoteTask(params?.receiptId as string) } };
+      case 'orchestration.task.resume': {
+        const result = await this.orchestrationManager.resumeRemoteTask(params?.receiptId as string, {
+          timeout: params?.timeout as number | undefined,
+          waitForCompletion: params?.waitForCompletion as boolean | undefined,
+        });
+        return { data: { ...result } };
+      }
 
       // Notification inbox
       case 'notification.list':
@@ -447,8 +466,7 @@ class Daemon {
       case 'orchestration.fire':
         return this.fireRemotePrompt(
           params?.prompt as string,
-          params?.hostId as string | undefined,
-          params?.goal as string | undefined
+          { hostId: params?.hostId as string | undefined, taskId: params?.taskId as string | undefined, idempotencyKey: params?.idempotencyKey as string | undefined, timeout: params?.timeout as number | undefined }
         );
 
       // Telegram bot
@@ -903,32 +921,14 @@ class Daemon {
   }
 
   private async sendRemotePrompt(
-    prompt: string,
-    hostId?: string,
-    sessionId?: string
+    prompt: string, options: RemoteSendOptions & { hostId?: string; sessionId?: string } = {}
   ): Promise<{ data?: Record<string, unknown>; error?: string }> {
-    if (!prompt) {
-      return { error: 'Prompt is required' };
-    }
-
+    if (!prompt?.trim()) return { error: 'Prompt is required' };
+    if (options.timeout !== undefined && (!Number.isFinite(options.timeout) || options.timeout < 1 || options.timeout > 86400000)) return { error: 'Timeout must be between 1 and 86400000 milliseconds' };
     try {
-      const result = await this.orchestrationManager.sendPrompt(prompt, {
-        hostId,
-        sessionId,
-        timeout: 300000
-      });
-
-      return {
-        data: {
-          sessionId: result.sessionId,
-          promptId: result.promptId,
-          status: result.status,
-          output: result.output,
-          error: result.error,
-          host: result.host,
-          latency: result.latency
-        }
-      };
+      const result = await this.orchestrationManager.sendPrompt(prompt, options);
+      void this.remoteDelivery.reconcile().catch(() => {});
+      return { data: { ...result } };
     } catch (error) {
       return { error: error instanceof Error ? error.message : 'Failed to send remote prompt' };
     }
@@ -1171,48 +1171,9 @@ class Daemon {
   }
 
   private async fireRemotePrompt(
-    prompt: string,
-    hostId?: string,
-    goal?: string
+    prompt: string, options: RemoteSendOptions & { hostId?: string } = {}
   ): Promise<{ data?: Record<string, unknown>; error?: string }> {
-    if (!prompt) return { error: 'Prompt is required' };
-
-    const trackingId = nanoid(8);
-    const taskGoal = goal || prompt.slice(0, 100);
-
-    // Fire asynchronously - don't await
-    this.orchestrationManager.sendPrompt(prompt, {
-      hostId,
-      timeout: 600000
-    }).then(async (result) => {
-      const notif = {
-        sessionId: result.sessionId,
-        sessionName: `remote:${result.host}`,
-        type: (result.status === 'completed' ? 'prompt.completed' : 'prompt.error') as 'prompt.completed' | 'prompt.error',
-        goal: taskGoal,
-        exitCode: result.status === 'completed' ? 0 : 1,
-        durationMs: result.latency,
-        resultPreview: result.output?.slice(0, 200),
-        resultFull: result.output?.slice(0, 50000),
-        viewCommand: `cb -i`,
-      };
-      await this.notificationInbox.addNotification(notif);
-      this.forwardToTelegram(notif);
-    }).catch(async (error) => {
-      const notif = {
-        sessionId: trackingId,
-        sessionName: `remote:${hostId || 'auto'}`,
-        type: 'prompt.error' as const,
-        goal: taskGoal,
-        exitCode: 1,
-        resultPreview: error instanceof Error ? error.message : String(error),
-        viewCommand: `cb -i`,
-      };
-      await this.notificationInbox.addNotification(notif);
-      this.forwardToTelegram(notif);
-    });
-
-    return { data: { trackingId, goal: taskGoal, status: 'dispatched' } };
+    return this.sendRemotePrompt(prompt, { ...options, timeout: options.timeout ?? 10000, waitForCompletion: false });
   }
 
   private log(message: string): void {
@@ -1226,7 +1187,8 @@ class Daemon {
     if (this.cleanupInterval) clearInterval(this.cleanupInterval);
     await this.telegramBot.stop().catch(() => {});
     await this.sessionManager.stopAll().catch(() => {});
-    this.orchestrationManager.stopHealthChecks();
+    this.remoteDelivery.stop();
+    await this.orchestrationManager.shutdown().catch(() => {});
     await this.notificationOutbox.stop().catch(() => {});
     if (this.server?.listening) {
       for (const client of this.clients) client.destroy();
@@ -1246,6 +1208,7 @@ class Daemon {
     };
     // Close acceptance before waiting for cancellation or network shutdown.
     const sessionsStopped = settle('Task cancellation', this.sessionManager.stopAll());
+    this.remoteDelivery.stop();
     const remoteStopped = settle('Remote request shutdown', this.orchestrationManager.shutdown());
     const serverClosed = this.server?.listening
       ? new Promise<void>(resolve => this.server!.close(() => resolve())) : Promise.resolve();

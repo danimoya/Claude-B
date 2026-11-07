@@ -1,9 +1,14 @@
 // Orchestration manager - coordinates multi-host AI workflows
 
 import { EventEmitter } from 'events';
-import { readFile, writeFile, mkdir, chmod } from 'fs/promises';
+import { readFile, mkdir, chmod } from 'fs/promises';
 import { existsSync } from 'fs';
 import { nanoid } from 'nanoid';
+import { randomUUID } from 'crypto';
+import { atomicWriteJson } from '../storage/atomic-json.js';
+import { RemoteRequestError, type RemoteReceipt } from './receipts.js';
+import type { RemoteSendOptions } from './remote-client.js';
+import { TaskConflictError } from '../jobs/types.js';
 import { RemoteHost, PublicRemoteHost, redactRemoteHost, RemoteClient, RemoteClientManager, RemotePromptResult } from './remote-client.js';
 import { PipelineExecutor, PipelineDefinition, PipelineResult } from './pipeline.js';
 import { HealthMonitor, AggregateHealthMonitor, HealthMetrics } from './health.js';
@@ -74,6 +79,9 @@ export class OrchestrationManager extends EventEmitter {
   private failoverHandler: FailoverHandler;
   private loadBalancer: LoadBalancer;
   private pipelineExecutor: PipelineExecutor;
+  private loadFailure: Error | null = null;
+  private closing = false;
+  private shutdownOperation: Promise<void> | null = null;
   private circuitBreakers: Map<string, CircuitBreaker> = new Map();
   private stats = {
     requests: { total: 0, successful: 0, failed: 0, failovers: 0 },
@@ -85,7 +93,7 @@ export class OrchestrationManager extends EventEmitter {
     this.configDir = configDir;
     this.configPath = `${configDir}/orchestration.json`;
     this.config = structuredClone(DEFAULT_CONFIG);
-    this.clientManager = new RemoteClientManager();
+    this.clientManager = new RemoteClientManager(configDir);
     this.healthMonitor = new AggregateHealthMonitor();
     this.failoverHandler = new FailoverHandler(this.clientManager);
     this.loadBalancer = new LoadBalancer(this.clientManager);
@@ -103,7 +111,7 @@ export class OrchestrationManager extends EventEmitter {
     // Forward failover events
     this.failoverHandler.on('attempt', (data) => this.emit('failover.attempt', data));
     this.failoverHandler.on('host.failed', (data) => {
-      this.stats.requests.failovers++;
+      if (data.willTryNext) this.stats.requests.failovers++;
       this.emit('failover.host_failed', data);
     });
     this.failoverHandler.on('success', (data) => this.emit('failover.success', data));
@@ -120,6 +128,7 @@ export class OrchestrationManager extends EventEmitter {
   }
 
   async load(): Promise<void> {
+    if (this.closing) throw new Error('Orchestration manager is closed');
     await mkdir(this.configDir, { recursive: true, mode: 0o700 });
 
     if (!existsSync(this.configPath)) {
@@ -132,29 +141,33 @@ export class OrchestrationManager extends EventEmitter {
       const data = await readFile(this.configPath, 'utf-8');
       const loaded = JSON.parse(data) as Partial<OrchestrationConfig>;
       this.config = { ...structuredClone(DEFAULT_CONFIG), ...loaded };
+      if (!Array.isArray(this.config.hosts)) throw new Error('Invalid remote host configuration');
+      this.loadFailure = null;
 
       // Initialize hosts
       for (const host of this.config.hosts) {
         await this.addHost(host, false);
       }
     } catch {
-      await this.save();
+      this.loadFailure = new Error('Cannot load orchestration configuration; existing file was preserved');
+      throw this.loadFailure;
     }
   }
 
   async save(): Promise<void> {
+    if (this.loadFailure) throw this.loadFailure;
     await mkdir(this.configDir, { recursive: true, mode: 0o700 });
-    await writeFile(this.configPath, JSON.stringify(this.config, null, 2), { mode: 0o600 });
-    await chmod(this.configPath, 0o600);
+    await atomicWriteJson(this.configPath, this.config);
   }
 
   // Host management
   async addHost(host: RemoteHost, persist = true): Promise<RemoteClient> {
+    if (this.closing) throw new Error('Orchestration manager is closed');
     // Add to client manager
     const client = this.clientManager.addHost(host);
 
     // Set up health monitoring
-    if (this.config.healthCheck.enabled) {
+    if (host.enabled && this.config.healthCheck.enabled) {
       const monitor = new HealthMonitor(client, {
         interval: this.config.healthCheck.interval,
         timeout: this.config.healthCheck.timeout
@@ -211,6 +224,14 @@ export class OrchestrationManager extends EventEmitter {
     if (!host) return false;
 
     host.enabled = enabled;
+    this.clientManager.setEnabled(hostId, enabled);
+    this.healthMonitor.removeMonitor(hostId);
+    if (enabled && this.config.healthCheck.enabled) {
+      const client = this.clientManager.getClient(hostId)!;
+      const monitor = new HealthMonitor(client, { interval: this.config.healthCheck.interval, timeout: this.config.healthCheck.timeout });
+      this.healthMonitor.addMonitor(hostId, monitor);
+      monitor.start();
+    }
     await this.save();
     this.emit('host.toggled', { hostId, enabled });
     return true;
@@ -225,71 +246,59 @@ export class OrchestrationManager extends EventEmitter {
     return metrics.find(m => m.hostId === hostId);
   }
 
-  // Request execution with failover
-  async sendPrompt(
-    prompt: string,
-    options?: {
-      hostId?: string;
-      sessionId?: string;
-      timeout?: number;
-      createSession?: boolean;
-    }
-  ): Promise<RemotePromptResult> {
+  async listRemoteTasks(): Promise<RemoteReceipt[]> { return this.clientManager.listRemoteTasks(); }
+  async getRemoteTask(id: string): Promise<RemoteReceipt | null> { return this.clientManager.getRemoteTask(id); }
+  async resumeRemoteTask(id: string, options?: RemoteSendOptions): Promise<RemotePromptResult> {
+    if (this.closing) throw new Error('Orchestration manager is closed');
+    return this.clientManager.resumeRemoteTask(id, options);
+  }
+
+  // Retry/failover is authorized only by an explicit pre-submission-safe error.
+  async sendPrompt(prompt: string, options: RemoteSendOptions & { hostId?: string; sessionId?: string; createSession?: boolean } = {}): Promise<RemotePromptResult> {
+    if (this.closing) throw new Error('Orchestration manager is closed');
     this.stats.requests.total++;
-
-    try {
-      const result = await this.failoverHandler.executeWithFailover(
-        async (client) => {
-          // Check circuit breaker
-          const hostId = client.getStatus().id;
-          const cb = this.circuitBreakers.get(hostId);
-
-          if (cb) {
-            return await cb.execute(async () => {
-              let sessionId = options?.sessionId;
-
-              if (!sessionId && options?.createSession !== false) {
-                const session = await client.createSession();
-                sessionId = session.id;
-              }
-
-              if (!sessionId) {
-                throw new Error('No session available');
-              }
-
-              return await client.sendPrompt(sessionId, prompt, {
-                timeout: options?.timeout
-              });
-            });
-          }
-
-          let sessionId = options?.sessionId;
-          if (!sessionId && options?.createSession !== false) {
-            const session = await client.createSession();
-            sessionId = session.id;
-          }
-
-          if (!sessionId) {
-            throw new Error('No session available');
-          }
-
-          return await client.sendPrompt(sessionId, prompt, {
-            timeout: options?.timeout
-          });
-        },
-        { preferredHost: options?.hostId }
-      );
-
-      this.stats.requests.successful++;
-      return result.result;
-    } catch (error) {
-      this.stats.requests.failed++;
-      throw error;
+    const timeout = options.timeout ?? 300000;
+    const deadline = options.deadline ?? Date.now() + timeout;
+    const receipts = options.idempotencyKey || options.taskId ? await this.listRemoteTasks() : [];
+    const matches = receipts.filter(receipt => (options.idempotencyKey && receipt.idempotencyKey === options.idempotencyKey) || (options.taskId && receipt.taskId === options.taskId));
+    const existing = matches.find(receipt => receipt.submittedAt && receipt.status !== 'rejected') || matches[0];
+    if (existing) {
+      const requestedHost = options.hostId ? this.config.hosts.find(host => host.id === options.hostId || host.name === options.hostId) : undefined;
+      if (existing.prompt !== prompt || (options.taskId && options.taskId !== existing.taskId) ||
+          (options.idempotencyKey && options.idempotencyKey !== existing.idempotencyKey) ||
+          (options.sessionId && options.sessionId !== existing.sessionId) ||
+          (options.hostId && requestedHost?.id !== existing.hostId)) throw new TaskConflictError();
+      if (matches.some(receipt => receipt.taskId !== existing.taskId || receipt.idempotencyKey !== existing.idempotencyKey || receipt.prompt !== existing.prompt)) throw new TaskConflictError();
     }
+    if (existing?.submittedAt && existing.status !== 'rejected') return this.resumeRemoteTask(existing.id, { ...options, timeout, deadline });
+    const taskId = options.taskId || existing?.taskId || randomUUID();
+    const sessions = new Map<string, string>();
+    try {
+      const delivered = await this.failoverHandler.executeWithFailover(async (client) => {
+        const hostId = client.getStatus().id;
+        const operation = async () => {
+          let sessionId = options.sessionId || sessions.get(hostId) || (existing?.hostId === hostId ? existing.sessionId : undefined);
+          if (!sessionId && options.createSession !== false) {
+            sessionId = (await client.createSession(undefined, { timeout, deadline })).id;
+            sessions.set(hostId, sessionId);
+          }
+          if (!sessionId) throw new RemoteRequestError('No session available', 'rejected');
+          const result = await client.sendPrompt(sessionId, prompt, { ...options, timeout, deadline, taskId, strictTaskId: !!options.taskId, idempotencyKey: options.idempotencyKey || taskId });
+          if (result.status === 'error' && result.retrySafe) throw new RemoteRequestError(result.error || 'Remote host unavailable', result.failureKind || 'unavailable', true);
+          return result;
+        };
+        const breaker = this.circuitBreakers.get(hostId);
+        return breaker ? breaker.execute(operation) : operation();
+      }, { preferredHost: options.hostId || existing?.hostId, deadline });
+      if (delivered.result.status === 'completed') this.stats.requests.successful++;
+      else if (delivered.result.status === 'error') this.stats.requests.failed++;
+      return delivered.result;
+    } catch (error) { this.stats.requests.failed++; throw error; }
   }
 
   // Pipeline execution
   async executePipeline(pipeline: PipelineDefinition): Promise<PipelineResult> {
+    if (this.closing) throw new Error('Orchestration manager is closed');
     this.stats.pipelines.total++;
 
     const result = await this.pipelineExecutor.execute(pipeline);
@@ -312,14 +321,17 @@ export class OrchestrationManager extends EventEmitter {
   // Load-balanced execution
   async sendPromptBalanced(
     prompt: string,
-    options?: { timeout?: number }
+    options: RemoteSendOptions = {}
   ): Promise<RemotePromptResult> {
+    if (this.closing) throw new Error('Orchestration manager is closed');
     this.stats.requests.total++;
+    const timeout = options.timeout ?? 300000;
+    const deadline = options.deadline ?? Date.now() + timeout;
 
     try {
       const result = await this.loadBalancer.executeBalanced(async (client) => {
-        const session = await client.createSession();
-        return await client.sendPrompt(session.id, prompt, options);
+        const session = await client.createSession(undefined, { timeout, deadline });
+        return await client.sendPrompt(session.id, prompt, { ...options, timeout, deadline });
       });
 
       this.stats.requests.successful++;
@@ -378,9 +390,12 @@ export class OrchestrationManager extends EventEmitter {
   }
 
   async shutdown(): Promise<void> {
+    if (this.shutdownOperation) return this.shutdownOperation;
+    this.closing = true;
     this.stopHealthChecks();
-    this.clientManager.stopAllHealthChecks();
-    await this.save();
+    this.clientManager.close();
+    this.shutdownOperation = this.save();
+    return this.shutdownOperation;
   }
 }
 
