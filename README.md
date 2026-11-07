@@ -89,11 +89,11 @@ curl -fsSL https://cb.danimoya.com | bash
 # Or via npm
 npm i -g claude-b
 
-# Or via Docker
-docker run -d \
-  -v ~/.claude-b:/root/.claude-b \
-  --env-file ~/.claude-b/.env \
-  ghcr.io/danimoya/claude-b:latest
+# Or build the verified Docker source and install its persistent CLI
+git clone https://github.com/danimoya/Claude-B.git
+cd Claude-B
+docker build -t claude-b:local .
+CB_DOCKER_IMAGE=claude-b:local scripts/install.sh --method=docker --skip-init
 ```
 
 Then configure everything interactively:
@@ -174,6 +174,12 @@ cb -a main
 | `cb --watch` | `-w` | Watch live output |
 | `cb --select <id>` | `-x` | Select session for commands |
 | `cb --current` | `-c` | Show current session |
+| `cb --tasks` | | List durable task receipts |
+| `cb --task ID` | | Read one exact task result; `--json` returns its receipt |
+| `cb --task-key KEY` | | Find the original task by idempotency key |
+| `cb --cancel ID` | | Cancel one queued or running task |
+| `cb --timeout 5000 "prompt"` | | Bound the wait without cancelling accepted work |
+| `cb --execution-policy bypass "prompt"` | | Explicitly opt the target session into permission bypass |
 
 ### Fire-and-Forget & Inbox
 
@@ -221,6 +227,8 @@ cb -a main
 | `cb --remote <hostId> <prompt>` | Send prompt to remote host |
 | `cb --remote-fire <hostId> <prompt>` | Fire-and-forget to remote host |
 | `cb --remote-stats` | Orchestration statistics |
+| `cb --remote-task ID` | Resume a saved remote receipt through status reads |
+| `cb --remote-tasks` | List durable remote receipts |
 
 ## Guides
 
@@ -284,22 +292,24 @@ Get notifications on your phone and reply to sessions from Telegram.
 **Step 2: Connect to Claude-B**
 
 ```bash
-TELEGRAM_ALLOWED_CHAT_IDS=123456789 cb --telegram 123456789:ABCdefGHIjklMNO
+cb --telegram 123456789:ABCdefGHIjklMNO
+cb --telegram-pair 123456789
 
 # Output:
 #   Telegram bot started!
 #   Bot: @my_claudeb_bot
-#   Send /start to your bot in Telegram to register.
+#   Send /start CODE from the expected private sender before the challenge expires.
 ```
 
 **Step 3: Register in Telegram**
 
-Configure your private chat ID in `TELEGRAM_ALLOWED_CHAT_IDS` in the daemon's
-environment before starting it, then send `/start` in a private conversation
-with your bot. New registrations require that explicit allow-list; groups are
-denied. Existing owner-paired private chats remain usable when the variable is
-unset. `cb init` can capture your chat ID locally; its interactive pairing step
-should be performed only with the owner present (challenge pairing is pending).
+Send `/start CODE` in the private bot chat using the expiring, single-use code
+created by the local owner with `cb --telegram-pair [expected-sender-id]`.
+Alternatively, configure your private chat ID in `TELEGRAM_ALLOWED_CHAT_IDS` in
+the daemon's environment before starting it and send `/start` privately.
+Groups and unauthorized senders cannot enroll. Existing owner-paired private
+chats remain usable when the variable is unset. `cb init` also supports local
+owner-authorized enrollment.
 
 **Step 4: Use it**
 
@@ -607,7 +617,7 @@ ln -sf ~/Claude-B/bin/opencode-notify.js ~/.config/opencode/plugins/claude-b-not
 - Only top-level sessions notify — subagent/task child sessions (those with a `parentID`) are skipped.
 - Works for both the interactive TUI and `opencode run`, as long as the process runs inside tmux.
 - Like Claude Code and Codex, plugins are read at startup: OpenCode processes already running won't notify until restarted.
-- OpenCode panes are not yet listed in `/sessions`, and replying to an OpenCode notification from Telegram is untested.
+- Registered OpenCode panes appear in `/sessions` while the same foreground invocation is alive. Replies verify that invocation before pasting literal text. Native agent and real Telegram/provider acceptance is part of the release procedure in [OPERATIONS.md](OPERATIONS.md).
 
 **Troubleshooting:**
 
@@ -954,6 +964,9 @@ pnpm test
 ```
 
 ## Potential Features
+
+The examples below are proposals, not implemented CLI commands. Use `cb --help`
+for the current command interface.
 
 ### Workflow Pipelines
 Chain AI tasks together like GitHub Actions for AI. Define multi-step workflows where output flows between sessions.

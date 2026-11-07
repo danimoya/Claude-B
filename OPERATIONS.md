@@ -1,82 +1,126 @@
 # Claude-B operations and release acceptance
 
-## Validate an isolated checkout
+## Validate isolated source and artifacts
 
-Use Node.js 20 or 22. Do not build in a directory referenced by a running
-service: the build cleans `dist/` before writing its output. Use a separate
-checkout or staged snapshot, with its own output directory.
+Use supported Node.js 22 for new installations. CI also tests Node.js 20 for
+compatibility. Never build in a directory referenced by a running service: the
+build cleans `dist/`. Use a separate checkout or staged snapshot with its own
+output directory and dependency installation.
 
 ```bash
 npm ci
 npm run typecheck
 npm run lint
 npm test
+CB_NATIVE_TMUX=1 npm test -- src/tmux/native.test.ts
 npm run build
 npm run check:artifact
 ```
 
-`npm test` runs once. `npm run test:watch` starts watch mode. Tests substitute
-a deterministic local Claude executable, use disposable state and homedir
-values, suppress desktop notifications, and reject non-loopback `fetch`
-requests. REST integration tests bind to random loopback ports. Tests do not
-prove real provider access, Telegram delivery, or native tmux behavior.
+`npm test` runs once; `npm run test:watch` watches. Unit/integration tests isolate
+state and homedir, substitute a deterministic Claude executable, suppress desktop
+notifications, and reject external fetches. REST fixtures bind random loopback
+ports. Native tmux tests are optional locally and required by CI: every command
+uses its own random `tmux -L` namespace, creates only fixture processes and kills
+only that private server. They exercise terminal transport and pane recycling,
+not a live paid agent account.
 
-Artifact checks inspect `npm pack --dry-run` without publishing, validate the
-package allowlist, check daemon JavaScript syntax, and execute CLI help/version
-with a disposable `CB_DATA_DIR`. They never start a daemon or send a prompt.
-The validation workflow runs these checks on Node.js 20 and 22; it does not
-publish an npm package or container image.
+`check:artifact` inspects `npm pack --dry-run`, enforces the package allowlist,
+checks built CLI help/version/logs/stdin behavior, then starts the actual built
+candidate daemon with disposable state, HOME and a fake Claude executable. Its
+minimal environment inherits no provider, bot or registry credentials. Acceptance
+covers IPC and REST task submission/result/cancellation, caller cwd and execution
+policy, successful CLI termination, atomic result persistence, graceful shutdown,
+crash recovery with verified orphan termination and no replay, durable webhook
+delivery after restart, and a stopped-state backup/restore boot rehearsal. Local
+recording receivers stay on random loopback ports. Cleanup is restricted to the
+candidate's own processes and trace-verified fixture process groups.
 
-## Capture a release candidate
+The validation workflow runs Ubuntu with Node.js 20/22 and macOS with Node.js 22.
+Release jobs depend on exact-source validation before publishing. Manual release
+runs default to dry-run; tag publication remains an explicit operator action.
+No local validation command publishes a package/image or touches a host daemon.
+Successful built acceptance emits versioned JSON with artifact SHA-256 hashes,
+Node/platform and explicit outcomes. Set `CB_ACCEPTANCE_PROOF` to save that
+non-secret proof outside the disposable fixture state. A configured CI job is
+not evidence of a completed CI run; retain its actual result link for a release
+decision.
 
-Record the source commit, Node/npm versions, lockfile, build/test output and
-artifact hashes outside the running installation. Keep the current immutable
-release and state backup available for rollback. Treat historical blueprint
-candidate reports as evidence for those candidates, not proof that the same
-changes are present on `main`.
+## Task state, results and cancellation
 
-`CB_DATA_DIR` selects state for the CLI and daemon. Use an absolute path. State
-contains credentials, session histories, notification content and Telegram
-configuration; back it up with owner-only access. Do not copy live credentials
-into fixtures, PRs or build artifacts. A clone alone does not isolate state if
-the CLI or daemon falls back to the operator's default state directory.
+`CB_DATA_DIR` selects private state for both CLI and daemon. Relative and `~/`
+paths are resolved by the caller; services should use explicit absolute paths.
+Daemon ownership files and its socket are owner-only. Startup fails closed for
+malformed ownership files, a live owner, an active unidentified socket or an
+unresolved recovery guard. Inspect those files as the owner rather than deleting
+them while another process may be running.
 
-## Gates before an operator-approved deployment
+Each accepted task has an immutable ID and submission metadata. Task receipts
+under `tasks/` use flushed atomic writes. Pending/running work becomes
+`interrupted` after an abrupt daemon restart and is never automatically executed
+again. Graceful shutdown cancels active and queued work before releasing its
+socket. Obtain the original task receipt before deciding whether an uncertain
+remote submission needs another attempt; reuse its idempotency key instead of
+creating duplicate work.
 
-1. Identify each real service, UID, launcher, immutable executable path, state
-   directory, REST/proxy path, workspace ownership and active job. Confirm
-   which process is the sole Telegram poller for each bot. Record metadata
-   without printing credentials or private histories.
-2. Select the exact release version and registry destination, confirm publish
-   permissions, and verify the built artifact against the recorded commit.
-3. Test migration, state adoption and rollback using copies of state with
-   private values removed. Preserve active jobs and result receipts; avoid
-   replaying uncertain remote submissions.
-4. Use a dedicated authorized Telegram bot/provider account for live acceptance.
-   Confirm provider capabilities, charge budget and data retention first. Use
-   native Claude/Codex/OpenCode tmux fixtures and a macOS runner for platform
-   claims. Validate dashboard compatibility separately.
-5. Schedule the actual service/poller handover with the operator. Verify health,
-   owner/workspace identity, state preservation and notification delivery.
-   Roll back to the recorded executable and compatible state snapshot if
-   acceptance fails; do not run two pollers during rollback.
+Use `cb --tasks`, `cb --task <id>` and `cb --cancel <id>` for task control.
+The authenticated REST equivalents are `POST /api/tasks` (HTTP 202 acceptance),
+`GET /api/tasks/:id`, and `POST /api/tasks/:id/cancel`. Acceptance is separate
+from completion. A stored terminal result remains addressable after session
+cleanup and daemon restart. Invalid state is preserved and reported instead of
+silently replacing it with an empty index.
 
-Local unit/integration checks do not satisfy these deployment gates. No service
-restart, configuration migration, credential rotation, provider charge or
-publication is implied by a successful local validation.
+The default execution policy keeps Claude's normal permissions. Bypass requires
+an explicit policy selection for the intended session; task receipts retain the
+policy used. A policy change is rejected while tasks/submissions are pending.
+Caller repository identity is carried with submissions; an existing session from
+another directory is not silently reused as the target.
 
-## Diagnosing notification delivery
+## Notification delivery
 
-`POST /api/notify` requires a loopback caller and the current REST API key in
-`x-claude-b-key`. Accepted completion/error events go to the inbox and matching
-hooks independently of Telegram availability. Delivery errors are logged per
-channel. Webhook receivers should verify signatures and deduplicate event IDs
-as documented in the README. The current retry queue is in memory; a daemon
-restart can lose pending deliveries, so durable delivery requires separate work.
+`POST /api/notify` requires loopback plus the REST API key in `x-claude-b-key`.
+Accepted events reach the durable outbox independently of Telegram availability.
+Versioned outbox records retain stable event IDs/timestamps and disjoint
+per-channel delivered, skipped and failed ledgers. Transient failures retry after
+restart with a default budget of eight failed operational attempts per channel;
+permanent failures and exhausted budgets remain in the failed ledger without
+automatic replay. Shutdown aborts do not consume that retry budget. Invalid or
+unknown receipt versions are preserved and reported. Delivery is at least once:
+receivers must verify
+webhook signatures and deduplicate event IDs as documented in README. Inbox
+persistence deduplicates stable delivery IDs. Intentionally unconfigured optional
+channels are skipped; configured unavailable channels retain retryable work.
 
-Inspect logs under the selected state directory without copying tokens or
-private notification text into public issues. Check hook registration, event
-and session filters, receiver status codes, Telegram configuration and sole
-poller ownership before changing a running service. Use copied transcripts for
-context parsing diagnostics; a cold in-memory transcript cache is expected
-until the first notification after daemon startup.
+Telegram pairing is private and owner-authorized. Message/session/result/pending
+maps use chat plus message identity. Historical bare-ID notifications cannot be
+assigned safely to an owner and are no longer reply/Listen targets. Pane routing
+uses stable pane/process identity; changed or missing panes reject delivery.
+Transcript fixtures cover native text envelopes without tool-result wrappers.
+Never run two Telegram pollers for the same bot during acceptance or handover.
+
+## Capture and deploy an immutable release
+
+Record source commit, Node/npm versions, lockfile, build/test/native/artifact/CI
+results and artifact hashes. Keep the current immutable release and compatible
+private state backup for rollback. Historical blueprint candidate reports prove
+only those candidates; verify that each change exists in the release source.
+
+State includes credentials, session histories, task output, outbox payloads and
+Telegram configuration. Back it up with owner-only access and restore permissions
+before starting a candidate. Do not include real state, `.env`, `.npmrc`, logs,
+keys or private fixtures in artifacts or public issues. A separate clone alone
+does not isolate runtime state; always set its `CB_DATA_DIR`.
+
+Before an actual deployment, identify the service/UID/launcher/state/proxy,
+workspace ownership, active jobs and sole bot poller. Select the immutable
+published version/digest and verify registry permissions. Test copied-state
+adoption and rollback, dashboard compatibility and operator-specific access.
+Dedicated Telegram/provider acceptance needs authorized accounts, capabilities,
+charge budgets and retention decisions. Local fakes and terminal fixtures do not
+prove those external entitlements.
+
+Schedule the operator's actual service/poller handover only after that evidence
+is available. Verify health, correct workspace/owner, retained receipts and
+notification delivery; roll back to the recorded executable and compatible
+snapshot if acceptance fails. Source validation does not authorize or perform a
+production restart, credential rotation, provider charge or registry publication.

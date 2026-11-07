@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { checkStdinArtifact } from './check-stdin.mjs';
+import { checkDaemonArtifact } from './check-daemon.mjs';
 
 const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
 const [artifact] = JSON.parse(execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], {
@@ -54,3 +55,4 @@ try {
 }
 
 await checkStdinArtifact();
+await checkDaemonArtifact();

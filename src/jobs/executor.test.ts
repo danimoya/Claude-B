@@ -7,27 +7,32 @@ import { tmpdir } from 'node:os';
 import { captureTaskExecutor, inspectExecutorProcess, recoverTaskExecutor, type ExecutorProcess } from './executor.js';
 import { TaskStore } from './store.js';
 import { Session } from '../session/session.js';
+import type { TaskExecutor } from './types.js';
 
 vi.mock('../utils/claude-detector.js', () => ({ getClaudePath: () => process.env.CLAUDE_PATH! }));
 
 describe('owned executor recovery', () => {
   let dir: string;
-  const children: ChildProcess[] = [];
+  const children: Array<{ child: ChildProcess; executor?: TaskExecutor }> = [];
   beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'cb-owned-executor-')); });
   afterEach(async () => {
     vi.unstubAllEnvs();
-    for (const child of children.splice(0)) {
-      if (!child.pid) continue;
-      try { await recoverTaskExecutor(captureTaskExecutor(child.pid), { graceMs: 100 }); }
-      catch { child.kill('SIGKILL'); }
+    for (const { child, executor } of children.splice(0)) {
+      if (!child.pid || child.exitCode !== null || child.signalCode) continue;
+      try {
+        const recovered = await recoverTaskExecutor(executor, { graceMs: 100 });
+        if (!recovered.stopped) child.kill('SIGKILL');
+      } catch { child.kill('SIGKILL'); }
     }
     await rm(dir, { recursive: true, force: true });
   });
 
   it('terminates only the verified detached fixture before recording interrupted recovery', async () => {
     const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });
-    children.push(child); await once(child, 'spawn');
+    const owned: { child: ChildProcess; executor?: TaskExecutor } = { child };
+    children.push(owned); await once(child, 'spawn');
     const executor = captureTaskExecutor(child.pid!);
+    owned.executor = executor;
     const store = new TaskStore(dir);
     const { task } = await store.accept({ sessionId: 'fixture-session', prompt: 'private fixture only', workingDir: dir, executionPolicy: 'default' });
     await store.update(task.id, { status: 'running', executor, output: 'partial', rawOutput: 'partial' });
