@@ -95,15 +95,35 @@ describe('daemon instance ownership', () => {
     expect((await stat(path('sock'))).isSocket()).toBe(true);
   });
 
-  it('cannot release a replacement lock or another live owner socket/PID', async () => {
+  it.each([111, 222])('cannot release a replacement lock with PID %i or another live owner socket/PID', async replacementPid => {
     const instance = lock(111);
     await instance.acquire();
     await listen();
     await instance.recordSocket();
     expect((await stat(path('sock'))).mode & 0o777).toBe(0o600);
+    const original = await stat(path('lock'));
     await rm(path('lock'));
+    await writeFile(path('lock'), `${replacementPid}\n`);
+    // The original inode remains pinned even when the replacement claims the
+    // same PID, so correctness does not depend on filesystem allocation luck.
+    expect((await stat(path('lock'))).ino).not.toBe(original.ino);
+    await writeFile(path('pid'), '222\n');
+    await instance.release();
+    expect(await readFile(path('lock'), 'utf8')).toBe(`${replacementPid}\n`);
+    expect(await readFile(path('pid'), 'utf8')).toBe('222\n');
+    expect((await stat(path('sock'))).isSocket()).toBe(true);
+  });
+
+  it.each(['release', 'recordSocket'])('preserves an in-place ownership rewrite during %s', async operation => {
+    const instance = lock(111);
+    await instance.acquire();
+    await listen();
+    await instance.recordSocket();
+    const original = await stat(path('lock'));
     await writeFile(path('lock'), '222\n');
     await writeFile(path('pid'), '222\n');
+    expect((await stat(path('lock'))).ino).toBe(original.ino);
+    if (operation === 'recordSocket') await expect(instance.recordSocket()).rejects.toThrow('ownership was lost');
     await instance.release();
     expect(await readFile(path('lock'), 'utf8')).toBe('222\n');
     expect(await readFile(path('pid'), 'utf8')).toBe('222\n');

@@ -1,5 +1,5 @@
 import { createConnection } from 'net';
-import { chmod, link, lstat, mkdir, readFile, unlink, writeFile } from 'fs/promises';
+import { chmod, link, lstat, mkdir, open, readFile, unlink, writeFile, type FileHandle } from 'fs/promises';
 import type { Stats } from 'fs';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
@@ -59,6 +59,7 @@ export class DaemonInstanceLock {
   private readonly pid: number;
   private readonly isAlive: (pid: number) => boolean;
   private readonly socketActive: (path: string) => Promise<boolean>;
+  private ownershipHandle?: FileHandle;
   private identity?: Stats;
   private socketIdentity?: Stats;
 
@@ -86,15 +87,31 @@ export class DaemonInstanceLock {
     }
   }
 
+  private async ownsLock(): Promise<boolean> {
+    if (!sameFile(this.identity, await statOrMissing(this.lockPath))) return false;
+    try {
+      // The descriptor pins the original inode; the contents also protect
+      // against an in-place rewrite of that inode by another owner.
+      return await this.owner(this.lockPath) === this.pid
+        && sameFile(this.identity, await statOrMissing(this.lockPath));
+    } catch {
+      return false;
+    }
+  }
+
   async acquire(): Promise<void> {
-    if (this.identity) throw new Error('Daemon lock already acquired');
+    if (this.ownershipHandle) throw new Error('Daemon lock already acquired');
     await mkdir(this.configDir, { recursive: true, mode: 0o700 });
     const directory = await lstat(this.configDir);
     if (!directory.isDirectory() || (process.getuid && directory.uid !== process.getuid())) throw new Error('Daemon state directory must be owned by the current user');
     await chmod(this.configDir, 0o700);
     const claim = join(this.configDir, `.daemon-claim-${this.pid}-${randomUUID()}`);
-    await writeFile(claim, `${this.pid}\n`, { flag: 'wx', mode: 0o600 });
     try {
+      this.ownershipHandle = await open(claim, 'wx', 0o600);
+      await this.ownershipHandle.writeFile(`${this.pid}\n`);
+      // Keep this descriptor open until release. Otherwise unlinking the lock
+      // can immediately recycle its inode for an unrelated replacement.
+      this.identity = await this.ownershipHandle.stat();
       try {
         await link(claim, this.lockPath);
       } catch (error) {
@@ -118,7 +135,6 @@ export class DaemonInstanceLock {
           if (sameFile(await statOrMissing(recovery), await statOrMissing(claim))) await unlink(recovery);
         }
       }
-      this.identity = await lstat(claim);
       const existingPid = await this.owner(this.pidPath);
       if (existingPid !== undefined && this.isAlive(existingPid)) throw new Error(`Daemon PID file belongs to a live process (${existingPid})`);
       const socket = await statOrMissing(this.socketPath);
@@ -139,7 +155,10 @@ export class DaemonInstanceLock {
 
   /** Call after the IPC listener binds, before accepting startup as complete. */
   async recordSocket(): Promise<void> {
-    if (!sameFile(this.identity, await statOrMissing(this.lockPath))) throw new Error('Daemon lock ownership was lost');
+    if (!await this.ownsLock()) {
+      await this.release();
+      throw new Error('Daemon lock ownership was lost');
+    }
     this.socketIdentity = await statOrMissing(this.socketPath);
     if (!this.socketIdentity?.isSocket()) throw new Error('Daemon listener did not create a socket');
     if (process.getuid && this.socketIdentity.uid !== process.getuid()) throw new Error('Daemon socket belongs to another user');
@@ -148,15 +167,21 @@ export class DaemonInstanceLock {
 
   /** Call only after closing the IPC server; foreign state is always preserved. */
   async release(): Promise<void> {
-    if (!sameFile(this.identity, await statOrMissing(this.lockPath))) return;
-    let owner: number | undefined;
-    try { owner = await this.owner(this.pidPath); } catch { /* preserve malformed PID/socket */ }
-    if (owner === this.pid) {
-      if (sameFile(this.socketIdentity, await statOrMissing(this.socketPath))) await unlink(this.socketPath);
-      await unlink(this.pidPath).catch(() => {});
+    try {
+      if (!await this.ownsLock()) return;
+      let owner: number | undefined;
+      try { owner = await this.owner(this.pidPath); } catch { /* preserve malformed PID/socket */ }
+      if (owner === this.pid) {
+        if (sameFile(this.socketIdentity, await statOrMissing(this.socketPath))) await unlink(this.socketPath);
+        await unlink(this.pidPath).catch(() => {});
+      }
+      if (await this.ownsLock()) await unlink(this.lockPath);
+    } finally {
+      const handle = this.ownershipHandle;
+      this.ownershipHandle = undefined;
+      this.identity = undefined;
+      this.socketIdentity = undefined;
+      await handle?.close();
     }
-    await unlink(this.lockPath);
-    this.identity = undefined;
-    this.socketIdentity = undefined;
   }
 }
