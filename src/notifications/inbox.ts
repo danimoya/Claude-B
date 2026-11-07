@@ -6,6 +6,7 @@ export interface Notification {
   id: string;
   timestamp: string;
   sessionId: string;
+  promptId?: string;
   sessionName?: string;
   type: 'prompt.completed' | 'prompt.error' | 'remote.completed';
   goal?: string;

@@ -266,10 +266,16 @@ export async function registerSessionRoutes(
         }));
       }
     };
+    const errorHandler = (info: { promptId?: string; code?: number | null; error?: string }) => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'prompt.error', promptId: info.promptId, exitCode: info.code, error: info.error }));
+      }
+    };
 
     // Subscribe to session events
     session.on('output', outputHandler);
     session.on('prompt.completed', completionHandler);
+    session.on('prompt.error', errorHandler);
 
     // Send buffered output
     const lastOutput = session.getLastOutput();
@@ -311,11 +317,13 @@ export async function registerSessionRoutes(
     socket.on('close', () => {
       session.off('output', outputHandler);
       session.off('prompt.completed', completionHandler);
+      session.off('prompt.error', errorHandler);
     });
 
     socket.on('error', () => {
       session.off('output', outputHandler);
       session.off('prompt.completed', completionHandler);
+      session.off('prompt.error', errorHandler);
     });
   });
 }

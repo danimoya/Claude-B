@@ -8,11 +8,12 @@ import { existsSync } from 'fs';
 import { nanoid } from 'nanoid';
 import { spawn, spawnSync } from 'child_process';
 import { SessionManager } from './session-manager.js';
+import { submitPromptWithDelivery } from './prompt-delivery.js';
 import { RestServer } from '../rest/server.js';
 import { HookEngine } from '../hooks/engine.js';
 import { HookEventType } from '../hooks/events.js';
 import { OrchestrationManager, createHost } from '../orchestration/index.js';
-import { NotificationInbox, NotificationInput } from '../notifications/inbox.js';
+import { NotificationInbox } from '../notifications/inbox.js';
 import { ClaudeBTelegramBot } from '../telegram/bot.js';
 import { VoicePipeline } from '../telegram/voice.js';
 import { createAIProvider } from '../telegram/ai-provider.js';
@@ -98,16 +99,11 @@ class Daemon {
         if (!session) throw new Error('Session not found');
         this.sessionManager.select(sessionId);
 
-        // Register notification listener BEFORE sending prompt to avoid race condition
-        // (notification event fires synchronously right after prompt.completed)
-        const notificationHandler = (notifData: NotificationInput) => {
-          this.notificationInbox.addNotification(notifData).catch(() => {});
-          this.forwardToTelegram(notifData);
-          session.off('notification', notificationHandler);
-        };
-        session.on('notification', notificationHandler);
-
-        await session.sendPrompt(prompt);
+        await submitPromptWithDelivery(session, prompt, {
+          hooks: this.hookEngine,
+          inbox: this.notificationInbox,
+          forward: (notification) => this.forwardToTelegram(notification),
+        });
       },
       getSessions: () => {
         const claudePanes = this.listTmuxClaudePanes();
@@ -621,34 +617,11 @@ class Daemon {
     }
 
     try {
-      // Register listeners BEFORE sending prompt to avoid race conditions
-      // (notification fires synchronously right after prompt.completed in same tick)
-      const completionHandler = (info: { promptId?: string; code?: number }) => {
-        this.hookEngine.dispatch('prompt.completed', {
-          sessionId: session!.id,
-          promptId: info.promptId || '',
-          status: info.code === 0 || info.code === null ? 'success' : 'failed',
-          output: session!.getLastOutput()
-        }).catch(() => {});
-        session!.off('prompt.completed', completionHandler);
-      };
-      session.on('prompt.completed', completionHandler);
-
-      const notificationHandler = (notifData: NotificationInput) => {
-        this.notificationInbox.addNotification(notifData).catch(() => {});
-        this.forwardToTelegram(notifData);
-        session!.off('notification', notificationHandler);
-      };
-      session.on('notification', notificationHandler);
-
-      const promptId = await session.sendPrompt(prompt);
-
-      // Dispatch prompt.received hook
-      this.hookEngine.dispatch('prompt.received', {
-        sessionId: session.id,
-        promptId,
-        prompt
-      }).catch(() => {});
+      const promptId = await submitPromptWithDelivery(session, prompt, {
+        hooks: this.hookEngine,
+        inbox: this.notificationInbox,
+        forward: (notification) => this.forwardToTelegram(notification),
+      });
 
       return { data: { promptId, sessionId: session.id } };
     } catch (error) {
@@ -1487,51 +1460,11 @@ class Daemon {
         true
       );
 
-      const promptId = await session.sendPrompt(prompt);
-
-      // Listen for completion to write notification to inbox
-      const completionHandler = (info: { promptId?: string; code?: number }) => {
-        if (info.promptId === promptId) {
-          const structured = session.getStructuredResult();
-          const fullResult = structured?.result || session.getLastOutput();
-          this.notificationInbox.addNotification({
-            sessionId: session.id,
-            sessionName: session.name,
-            type: info.code === 0 || info.code === null ? 'prompt.completed' : 'prompt.error',
-            goal: session.goal,
-            exitCode: info.code ?? null,
-            durationMs: structured?.durationMs,
-            costUsd: structured?.costUsd,
-            resultPreview: fullResult.slice(0, 200),
-            resultFull: fullResult.slice(0, 50000),
-            claudeSessionId: session.getClaudeSessionId(),
-            viewCommand: `cb -l`,
-          }).catch(() => {});
-
-          // Forward to Telegram
-          this.forwardToTelegram({
-            sessionId: session.id,
-            sessionName: session.name,
-            type: info.code === 0 || info.code === null ? 'prompt.completed' : 'prompt.error',
-            goal: session.goal,
-            exitCode: info.code ?? null,
-            durationMs: structured?.durationMs,
-            costUsd: structured?.costUsd,
-            resultPreview: fullResult.slice(0, 200),
-            resultFull: fullResult,
-          });
-
-          this.hookEngine.dispatch('prompt.completed', {
-            sessionId: session.id,
-            promptId,
-            status: info.code === 0 || info.code === null ? 'success' : 'failed',
-            output: session.getLastOutput()
-          }).catch(() => {});
-
-          session.off('prompt.completed', completionHandler);
-        }
-      };
-      session.on('prompt.completed', completionHandler);
+      const promptId = await submitPromptWithDelivery(session, prompt, {
+        hooks: this.hookEngine,
+        inbox: this.notificationInbox,
+        forward: (notification) => this.forwardToTelegram(notification),
+      });
 
       return { data: { sessionId: session.id, promptId, goal: session.goal } };
     } catch (error) {

@@ -3,7 +3,7 @@ import { Socket } from 'net';
 import { randomUUID } from 'crypto';
 import { nanoid } from 'nanoid';
 import { EventEmitter } from 'events';
-import { mkdir, writeFile, readFile, appendFile } from 'fs/promises';
+import { mkdir, writeFile, readFile, appendFile, rm } from 'fs/promises';
 import { existsSync } from 'fs';
 import { getClaudePath } from '../utils/claude-detector.js';
 import type * as NodePty from 'node-pty';
@@ -110,15 +110,14 @@ export class Session extends EventEmitter {
    * Persist last output and structured result to disk.
    */
   private async persistOutput(): Promise<void> {
-    try {
-      await this.ensureSessionDir();
-      if (this.lastOutput) {
-        await writeFile(`${this.sessionDir}/last-output.txt`, this.lastOutput);
-      }
-      if (this.lastStructuredResult) {
-        await writeFile(`${this.sessionDir}/last-result.json`, JSON.stringify(this.lastStructuredResult));
-      }
-    } catch { /* ignore */ }
+    await this.ensureSessionDir();
+    // Empty output is meaningful: it must replace an earlier prompt's result.
+    await writeFile(`${this.sessionDir}/last-output.txt`, this.lastOutput);
+    if (this.lastStructuredResult) {
+      await writeFile(`${this.sessionDir}/last-result.json`, JSON.stringify(this.lastStructuredResult));
+    } else {
+      await rm(`${this.sessionDir}/last-result.json`, { force: true });
+    }
   }
 
   static create(name: string | undefined, configDir: string, model?: string, goal?: string, fireAndForget?: boolean): Session {
@@ -193,110 +192,65 @@ export class Session extends EventEmitter {
       this.markReady();
     }
 
-    // Check for completion markers (Claude's response ended)
-    // This is heuristic - we look for common patterns indicating the AI finished
-    const fullOutput = this.currentPromptOutput.join('');
-    if (this.isProcessing && this.detectPromptCompletion(fullOutput)) {
-      this.completeCurrentPrompt();
-    }
+    // --print output is arbitrary text. Only process close establishes a
+    // terminal result; prompt-looking text and separators are ordinary output.
   }
 
-  private detectPromptCompletion(output: string): boolean {
-    // Detection heuristics for when Claude finishes responding:
-    // 1. Output ends with a prompt indicator (>)
-    // 2. Output contains the typical Claude Code ending patterns
-    // 3. After a period of no new output (handled by timeout)
-
-    // For --print mode, completion is indicated by process exit
-    // For interactive mode, we look for patterns
-    const trimmed = output.trim();
-
-    // Check for common completion patterns
-    if (trimmed.endsWith('>') || trimmed.endsWith('> ')) {
-      return true;
-    }
-
-    // Check if output contains typical response end markers
-    if (trimmed.includes('─────') && trimmed.split('─────').length > 2) {
-      // Multiple separator lines often indicate end of response
-      return true;
-    }
-
-    return false;
-  }
-
-  private completeCurrentPrompt(): void {
-    if (!this.isProcessing) return;
-
-    this.isProcessing = false;
-    this.status = 'idle';
-    this.lastActivityAt = new Date().toISOString();
-    this.lastOutput = this.currentPromptOutput.join('');
-
-    // Save to history
-    if (this.lastPromptId) {
-      this.savePromptToHistory({
-        id: this.lastPromptId,
-        prompt: '', // We don't store the prompt here, it was logged when sent
-        timestamp: new Date().toISOString(),
-        status: 'completed',
-        output: this.lastOutput
-      }).catch(() => {});
-    }
-
-    // Persist output to disk for restart recovery
-    this.persistOutput().catch(() => {});
-
-    // Notify watchers that processing completed
-    this.broadcastStatus('completed', { promptId: this.lastPromptId });
-
-    this.emit('prompt.completed', { promptId: this.lastPromptId });
-    this.notifyCompletion(0);
-    this.currentPromptOutput = [];
-
-    // Process next prompt in queue
-    this.processNextPrompt();
-  }
-
-  private handleProcessExit(code: number | null): void {
+  private async handleProcessExit(code: number | null, failureOverride?: string): Promise<void> {
     this.process = null;
-    this.isReady = false; // Reset ready state for next process
+    this.isReady = false;
 
     if (this.isProcessing) {
-      this.status = 'idle';
       this.lastOutput = this.currentPromptOutput.join('');
+      this.lastActivityAt = new Date().toISOString();
+      let failure = failureOverride || (code !== 0 || this.lastStructuredResult?.isError
+        ? this.lastStructuredResult?.result || this.lastOutput || `Process terminated (exit ${code})`
+        : undefined);
 
-      // Persist output to disk for restart recovery
-      this.persistOutput().catch(() => {});
+      // Keep isProcessing set until persistence is finished so a newly queued
+      // prompt cannot overwrite these fields while the terminal receipt writes.
+      try {
+        await this.persistOutput();
+        if (this.lastPromptId) {
+          await this.savePromptToHistory({
+            id: this.lastPromptId,
+            prompt: '',
+            timestamp: this.lastActivityAt,
+            status: failure ? 'error' : 'completed',
+            output: this.lastOutput,
+          });
+        }
+      } catch (error) {
+        failure = `Failed to persist result: ${error instanceof Error ? error.message : String(error)}`;
+      }
 
-      // Notify watchers that processing completed
-      this.broadcastStatus('completed', { promptId: this.lastPromptId, exitCode: code });
-
-      this.emit('prompt.completed', { promptId: this.lastPromptId, code });
-      this.notifyCompletion(code);
-      this.currentPromptOutput = [];
-      this.isProcessing = false;
-    }
-
-    // Process exited - for --print mode this is expected after each prompt
-    // Restart for next prompt if needed
-    this.processNextPrompt();
-  }
-
-  private handleProcessError(error: Error): void {
-    this.status = 'idle';
-    this.lastOutput = `Error: ${error.message}`;
-    this.emit('prompt.error', { promptId: this.lastPromptId, error: error.message });
-    this.process = null;
-    this.isProcessing = false;
-
-    // Emit errors for any queued prompts and clear the queue
-    while (this.promptQueue.length > 0) {
-      const queued = this.promptQueue.shift();
-      if (queued) {
-        this.emit('prompt.error', { promptId: queued.promptId, error: error.message });
+      this.status = 'idle';
+      this.broadcastStatus(failure ? 'error' : 'completed', { promptId: this.lastPromptId, exitCode: code, error: failure });
+      try {
+        if (failure) {
+          this.emit('prompt.error', { promptId: this.lastPromptId, code, error: failure });
+        } else {
+          this.emit('prompt.completed', { promptId: this.lastPromptId, code });
+        }
+      } catch (error) {
+        console.error('Prompt terminal observer failed:', error);
+      }
+      try {
+        this.notifyCompletion(code, failure);
+      } catch (error) {
+        console.error('Prompt notification observer failed:', error);
+      } finally {
+        this.currentPromptOutput = [];
+        this.isProcessing = false;
       }
     }
+
+    await this.processNextPrompt();
+  }
+
+  private async handleProcessError(error: Error): Promise<void> {
+    this.currentPromptOutput.push(`Error: ${error.message}`);
+    await this.handleProcessExit(null, error.message);
   }
 
   async sendPrompt(prompt: string): Promise<string> {
@@ -328,19 +282,18 @@ export class Session extends EventEmitter {
     this.isProcessing = true;
     this.currentPromptOutput = [];
     this.jsonBuffer = '';
-
-    // Log the prompt
-    await this.savePromptToHistory({
-      id: promptId,
-      prompt,
-      timestamp: new Date().toISOString(),
-      status: 'pending'
-    });
-
-    // Notify watchers that processing started
-    this.broadcastStatus('processing', { promptId, prompt: prompt.slice(0, 100) });
+    this.lastStructuredResult = undefined;
+    this.lastOutput = '';
 
     try {
+      // Failure to write the initial receipt is a terminal failure too.
+      await this.savePromptToHistory({
+        id: promptId,
+        prompt,
+        timestamp: new Date().toISOString(),
+        status: 'pending'
+      });
+      this.broadcastStatus('processing', { promptId, prompt: prompt.slice(0, 100) });
       const claudePath = getClaudePath();
       const args = ['--print', '--dangerously-skip-permissions', '--output-format', 'json'];
       if (this.model) {
@@ -364,32 +317,34 @@ export class Session extends EventEmitter {
       this.process = proc;
 
       proc.stdout?.on('data', (chunk: Buffer) => {
+        if (this.process !== proc) return;
         const text = chunk.toString();
         this.jsonBuffer += text;
         this.handleOutput(text);
       });
 
       proc.stderr?.on('data', (chunk: Buffer) => {
+        if (this.process !== proc) return;
         this.handleOutput(chunk.toString());
       });
 
-      proc.on('exit', (code) => {
+      proc.once('close', (code) => {
+        if (this.process !== proc) return;
         // Parse JSON output before handling exit to extract session_id and structured result
         this.parseClaudeJsonOutput(this.jsonBuffer);
-        this.handleProcessExit(code);
+        this.handleProcessExit(code).catch((error) => { console.error('Failed to finalize prompt:', error); });
       });
 
       proc.on('error', (error) => {
-        this.handleProcessError(error);
+        if (this.process !== proc) return;
+        this.handleProcessError(error).catch((failure) => { console.error('Failed to finalize prompt:', failure); });
       });
 
       // Write prompt and close stdin
       proc.stdin?.write(prompt);
       proc.stdin?.end();
     } catch (error) {
-      this.isProcessing = false;
-      this.status = 'idle';
-      this.emit('prompt.error', { promptId, error: error instanceof Error ? error.message : String(error) });
+      await this.handleProcessError(error instanceof Error ? error : new Error(String(error)));
     }
   }
 
@@ -402,7 +357,7 @@ export class Session extends EventEmitter {
       }
       // Store structured result for richer notifications
       this.lastStructuredResult = {
-        result: parsed.result || '',
+        result: typeof parsed.result === 'string' ? parsed.result : '',
         durationMs: parsed.duration_ms || 0,
         costUsd: parsed.total_cost_usd || 0,
         numTurns: parsed.num_turns || 0,
@@ -457,9 +412,9 @@ export class Session extends EventEmitter {
     }
   }
 
-  private notifyCompletion(code: number | null): void {
+  private notifyCompletion(code: number | null, failure?: string): void {
     const sessionLabel = this.name || this.id;
-    const isSuccess = code === 0 || code === null;
+    const isSuccess = !failure && code === 0 && !this.lastStructuredResult?.isError;
     const status = isSuccess ? 'completed' : `failed (exit ${code})`;
     const viewCmd = `cb -l`;
 
@@ -470,9 +425,7 @@ export class Session extends EventEmitter {
       ? `$${this.lastStructuredResult.costUsd.toFixed(4)}`
       : '';
 
-    const resultPreview = this.lastStructuredResult?.result?.slice(0, 200)
-      || this.lastOutput?.slice(0, 200)
-      || '';
+    const resultPreview = (this.lastStructuredResult?.result ?? this.lastOutput).slice(0, 200);
 
     // Channel 1: Terminal bell
     try { process.stdout.write('\x07'); } catch { /* ignore */ }
@@ -486,12 +439,14 @@ export class Session extends EventEmitter {
     } catch { /* ignore */ }
 
     // Full result (capped at 50KB)
-    const fullResult = this.lastStructuredResult?.result || this.lastOutput || '';
+    const output = this.lastStructuredResult?.result ?? this.lastOutput;
+    const fullResult = failure && failure !== output ? `${output}\n${failure}`.trim() : output;
     const resultFull = fullResult.slice(0, 50000);
 
     // Channel 3: Emit structured notification event (daemon writes to inbox)
     this.emit('notification', {
       sessionId: this.id,
+      promptId: this.lastPromptId,
       sessionName: this.name,
       type: isSuccess ? 'prompt.completed' as const : 'prompt.error' as const,
       goal: this.goal,
@@ -514,11 +469,11 @@ export class Session extends EventEmitter {
 
   getLastOutput(): string {
     // Return parsed result if available (from --output-format json)
-    if (this.lastStructuredResult?.result) {
+    if (this.lastStructuredResult) {
       return this.lastStructuredResult.result;
     }
     // Fall back to raw output, attempting JSON parse
-    const raw = this.lastOutput || this.outputBuffer.join('');
+    const raw = this.isProcessing ? this.currentPromptOutput.join('') : this.lastOutput;
     try {
       const parsed = JSON.parse(raw.trim());
       if (parsed.result !== undefined) return parsed.result;
@@ -527,7 +482,7 @@ export class Session extends EventEmitter {
   }
 
   getLastRawOutput(): string {
-    return this.lastOutput || this.outputBuffer.join('');
+    return this.isProcessing ? this.currentPromptOutput.join('') : this.lastOutput;
   }
 
   getFullTranscript(): string {
