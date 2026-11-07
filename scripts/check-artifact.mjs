@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { checkStdinArtifact } from './check-stdin.mjs';
 
 const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
 const [artifact] = JSON.parse(execFileSync('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], {
@@ -33,6 +34,17 @@ try {
     encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000,
   });
   assert(help.includes('Claude-B'), 'Built CLI did not render help');
+  for (const flag of ['--config', '--export', '--import']) {
+    assert(!help.includes(flag), `Unsupported option still advertised: ${flag}`);
+    assert.throws(() => execFileSync(process.execPath, ['bin/cb', flag], {
+      encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000,
+    }), /Command failed/, `Unsupported option accepted: ${flag}`);
+  }
+  writeFileSync(join(stateDir, 'daemon.log'), 'artifact log fixture\n');
+  const logs = execFileSync(process.execPath, ['bin/cb', '--logs'], {
+    encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000,
+  });
+  assert(logs.includes('artifact log fixture'), 'CLI did not read selected state log');
   execFileSync(process.execPath, ['--check', 'dist/daemon/index.js'], {
     stdio: 'pipe', timeout: 10_000,
   });
@@ -40,3 +52,5 @@ try {
 } finally {
   rmSync(stateDir, { recursive: true, force: true });
 }
+
+await checkStdinArtifact();

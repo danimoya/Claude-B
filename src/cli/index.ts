@@ -10,8 +10,10 @@ import { DaemonClient } from '../daemon/client.js';
 import { version } from '../utils/version.js';
 import { detectClaude } from '../utils/claude-detector.js';
 import { runInit } from './init.js';
-import * as tunnel from '../tunnel/manager.js';
+import { readLogTail } from './logs.js';
+import { createPromptReader } from './stdin.js';
 import { startDaemon } from './daemon-launch.js';
+import * as tunnel from '../tunnel/manager.js';
 
 // Type definitions for API responses
 interface SessionInfo {
@@ -143,6 +145,8 @@ program
     }
   });
 
+const readPrompt = createPromptReader(process.stdin);
+
 // Default command: send prompt
 program
   .argument('[prompt...]', 'Prompt to send to Claude')
@@ -154,7 +158,7 @@ program
   .option('-m, --model <model>', 'Claude model to use')
   .option('-k, --kill <id>', 'Kill/terminate session')
   .option('-w, --watch', 'Watch live output (tail -f style)')
-  .option('-x, --select <id>', 'Select session for subsequent commands')
+  .option('-x, --select <id>', 'Select session, optionally submitting a prompt')
   .option('-c, --current', 'Show current selected session')
   .option('-r, --rest [port]', 'Start REST API server')
   .option('--rest-stop', 'Stop REST API server')
@@ -171,9 +175,6 @@ program
   .option('--webhooks', 'List all webhooks')
   .option('--hook-stats', 'Show hook statistics')
   .option('--api-key', 'Generate/show API key for REST access')
-  .option('--config', 'Edit configuration')
-  .option('--export <id>', 'Export session transcript')
-  .option('--import <file>', 'Import session from file')
   // Orchestration options
   .option('--remote-add <url>', 'Add a remote Claude-B host')
   .option('--remote-key <apiKey>', 'API key for remote host (use with --remote-add)')
@@ -300,11 +301,6 @@ USE CASES — when to reach for which group of commands:
         return;
       }
 
-      if (options.select) {
-        await selectSession(client, options.select);
-        return;
-      }
-
       if (options.current) {
         await showCurrentSession(client);
         return;
@@ -422,16 +418,6 @@ USE CASES — when to reach for which group of commands:
         return;
       }
 
-      if (options.remote) {
-        if (promptParts.length === 0) {
-          console.error(chalk.red('Prompt required for remote execution'));
-          return;
-        }
-        const prompt = promptParts.join(' ');
-        await sendRemotePrompt(client, options.remote, prompt);
-        return;
-      }
-
       // Notification inbox commands
       if (options.inbox) {
         await showInbox(client);
@@ -523,22 +509,40 @@ USE CASES — when to reach for which group of commands:
         return;
       }
 
+      // Administrative operations above never consume a redirected stdin.
+      // Prompt data is read literally and never sent back through Commander.
+      const prompt = await readPrompt(promptParts);
+      if (options.select) {
+        await selectSession(client, options.select);
+        if (prompt === undefined) {
+          client.close();
+          process.exit(0);
+        }
+      }
+
+      if (options.remote) {
+        if (prompt === undefined) {
+          console.error(chalk.red('Prompt required for remote execution'));
+          return;
+        }
+        await sendRemotePrompt(client, options.remote, prompt);
+        return;
+      }
+
       // Remote fire-and-forget
       if (options.remoteFire) {
-        if (promptParts.length === 0) {
+        if (prompt === undefined) {
           console.error(chalk.red('Prompt required for remote fire-and-forget'));
           return;
         }
-        const prompt = promptParts.join(' ');
         await fireRemotePrompt(client, options.remoteFire, prompt, options.goal);
         return;
       }
 
-      // If we have a prompt, send it (or fire-and-forget)
-      if (promptParts.length > 0) {
-        const prompt = promptParts.join(' ');
+      // If we have a prompt, send it (or fire-and-forget).
+      if (prompt !== undefined) {
         if (options.fire) {
-          await fireAndForgetPrompt(client, prompt, options.goal);
+          await fireAndForgetPrompt(client, prompt, options.goal, options.model);
         } else {
           await sendPrompt(client, prompt, options.model);
         }
@@ -652,17 +656,16 @@ async function killSession(client: DaemonClient, sessionId: string): Promise<voi
 async function watchSession(client: DaemonClient): Promise<void> {
   console.log(chalk.gray('Watching session output (Ctrl+C to stop)...'));
   await client.watch();
+  process.exit(0);
 }
 
 async function selectSession(client: DaemonClient, sessionId: string): Promise<void> {
   const result = await client.send({ method: 'session.select', params: { sessionId } });
-  client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
     process.exit(1);
   }
   console.log(chalk.green(`Selected session: ${sessionId}`));
-  process.exit(0);
 }
 
 async function showCurrentSession(client: DaemonClient): Promise<void> {
@@ -785,12 +788,10 @@ async function showStatus(client: DaemonClient): Promise<void> {
 }
 
 async function showLogs(): Promise<void> {
-  const { homedir } = await import('os');
-  const logFile = `${homedir()}/.claude-b/daemon.log`;
-  console.log(chalk.gray(`Log file: ${logFile}`));
-  // In a real implementation, we'd tail the log file
-  console.log(chalk.gray('(Log viewing implementation pending)'));
-  process.exit(0);
+  const log = await readLogTail();
+  console.log(chalk.gray(`Log file: ${log.path}`));
+  if (log.missing) console.log(chalk.gray('No daemon log found.'));
+  else if (log.text) console.log(log.text);
 }
 
 async function sendPrompt(client: DaemonClient, prompt: string, model?: string): Promise<void> {
@@ -798,7 +799,8 @@ async function sendPrompt(client: DaemonClient, prompt: string, model?: string):
   const result = await client.send({ method: 'prompt.send', params: { prompt, model } });
   if (result.error) {
     console.error(chalk.red(result.error));
-    return;
+    client.close();
+    process.exit(1);
   }
   const data = result.data as PromptData & { sessionId?: string } | undefined;
   const sessionInfo = data?.sessionId ? ` on ${chalk.cyan(data.sessionId)}` : '';
@@ -809,13 +811,16 @@ async function sendPrompt(client: DaemonClient, prompt: string, model?: string):
   await client.send({ method: 'session.watch' });
 
   // Listen for status updates
-  client.on('status', (statusData: { status: string; promptId?: string }) => {
+  client.on('status', (statusData: { status: string; promptId?: string; error?: string }) => {
     if (statusData.status === 'processing') {
       console.log(chalk.yellow(`[Processing prompt ${statusData.promptId || ''}...]`));
     } else if (statusData.status === 'completed') {
       console.log(chalk.green(`\n[Completed]`));
     } else if (statusData.status === 'error') {
-      console.log(chalk.red(`\n[Error]`));
+      if (statusData.promptId && data?.promptId && statusData.promptId !== data.promptId) return;
+      console.error(chalk.red(`\n[Error] ${statusData.error || 'Prompt failed'}`));
+      client.close();
+      process.exitCode = 1;
     }
   });
 
@@ -846,10 +851,11 @@ async function sendPrompt(client: DaemonClient, prompt: string, model?: string):
     });
   });
 
-  // Wait for completion or connection close
+  // Wait for completion or connection close.
   await new Promise<void>((resolve) => {
     client.on('close', resolve);
   });
+  process.exit(process.exitCode ?? 0);
 }
 
 async function waitForDaemon(maxWaitMs = 5000): Promise<void> {
@@ -1208,10 +1214,10 @@ async function sendRemotePrompt(client: DaemonClient, hostId: string, prompt: st
 }
 
 // Fire-and-forget functions
-async function fireAndForgetPrompt(client: DaemonClient, prompt: string, goal?: string): Promise<void> {
+async function fireAndForgetPrompt(client: DaemonClient, prompt: string, goal?: string, model?: string): Promise<void> {
   const result = await client.send({
     method: 'prompt.fire',
-    params: { prompt, goal }
+    params: { prompt, goal, model }
   });
   client.close();
 
@@ -1784,25 +1790,8 @@ async function showVoiceStatus(client: DaemonClient): Promise<void> {
   process.exit(0);
 }
 
-// Handle stdin for piped input or parse arguments
-const hasArgs = process.argv.length > 2;
-
-if (!process.stdin.isTTY && !hasArgs) {
-  // Piped input mode: read from stdin
-  let input = '';
-  process.stdin.setEncoding('utf8');
-  process.stdin.on('data', (chunk) => {
-    input += chunk;
-  });
-  process.stdin.on('end', () => {
-    if (input.trim()) {
-      const client = new DaemonClient();
-      sendPrompt(client, input.trim()).catch(console.error);
-    } else {
-      program.parse();
-    }
-  });
-} else {
-  // Normal mode: parse arguments
-  program.parse();
-}
+// Parse CLI options normally. Only the submission path consumes piped data.
+program.parseAsync().catch((error) => {
+  console.error(chalk.red(error instanceof Error ? error.message : String(error)));
+  process.exitCode = 1;
+});
