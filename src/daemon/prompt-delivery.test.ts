@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from 'vitest';
 import type { Session } from '../session/session.js';
 import { submitPromptWithDelivery } from './prompt-delivery.js';
 import type { NotificationInput } from '../notifications/inbox.js';
+import type { TaskRecord } from '../jobs/types.js';
+import type { DeliveryRecord } from '../notifications/outbox.js';
 
 function notification(promptId: string, type: 'prompt.completed' | 'prompt.error' = 'prompt.completed'): NotificationInput {
   return { sessionId: 'session', promptId, type, exitCode: type === 'prompt.error' ? 1 : 0, resultFull: promptId, viewCommand: 'cb -l' };
@@ -82,4 +84,24 @@ describe('prompt-scoped delivery', () => {
     expect(sinks.forward).toHaveBeenCalledTimes(2);
     expect(emitter.listenerCount('notification')).toBe(0);
   });
+  it('uses the durable outbox and canonical stored owner for reused terminal task IDs', async () => {
+    const { emitter, session, sinks } = fixture();
+    const task: TaskRecord = {
+      id: 'existing-task', taskId: 'existing-task', promptId: 'existing-task', sessionId: 'original-owner',
+      prompt: 'same', status: 'completed', workingDir: '/fixture', executionPolicy: 'default',
+      output: 'durable result', rawOutput: 'durable result', createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(), completedAt: new Date().toISOString(), exitCode: 0
+    };
+    Object.assign(emitter, { taskStore: { get: vi.fn().mockResolvedValue(task) } });
+    emitter.sendPrompt.mockResolvedValue('existing-task');
+    const enqueue = vi.fn().mockResolvedValue({} as DeliveryRecord);
+    const options = { idempotencyKey: 'stable-voice-key' };
+    expect(await submitPromptWithDelivery(session, 'same', { ...sinks, outbox: { enqueue } }, options)).toBe('existing-task');
+    expect(emitter.sendPrompt).toHaveBeenCalledWith('same', options);
+    expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'original-owner', promptId: 'existing-task', resultFull: 'durable result' }));
+    expect(sinks.inbox.addNotification).not.toHaveBeenCalled();
+    expect(sinks.forward).not.toHaveBeenCalled();
+    expect(emitter.listenerCount('notification')).toBe(0);
+  });
+
 });

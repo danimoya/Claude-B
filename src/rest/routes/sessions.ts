@@ -1,6 +1,8 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { SessionManager } from '../../daemon/session-manager.js';
 import { WebSocket } from 'ws';
+import type { TaskSubmission } from '../../jobs/types.js';
+import { acceptedTask, submissionOptions, taskError, taskSubmissionProperties } from './tasks.js';
 
 interface CreateSessionBody {
   name?: string;
@@ -9,7 +11,7 @@ interface CreateSessionBody {
   executionPolicy?: 'default' | 'bypass';
 }
 
-interface SendPromptBody {
+interface SendPromptBody extends TaskSubmission {
   prompt: string;
 }
 
@@ -98,9 +100,8 @@ export async function registerSessionRoutes(
   }, async (request, reply) => {
     const session = sessionManager.get(request.params.id);
     if (!session) return reply.status(404).send({ error: 'Session not found' });
-    if (session.status === 'busy') return reply.status(409).send({ error: 'Cannot change execution policy while a session is busy' });
-    session.executionPolicy = request.body.executionPolicy;
-    await sessionManager.save();
+    try { await sessionManager.setExecutionPolicy(session.id, request.body.executionPolicy); }
+    catch { return reply.status(409).send({ error: 'Cannot change execution policy while tasks are pending or shutdown is in progress' }); }
     return { sessionId: session.id, executionPolicy: session.executionPolicy };
   });
 
@@ -170,7 +171,8 @@ export async function registerSessionRoutes(
         type: 'object',
         required: ['prompt'],
         properties: {
-          prompt: { type: 'string', minLength: 1 }
+          prompt: { type: 'string', minLength: 1 },
+          ...taskSubmissionProperties
         }
       }
     }
@@ -188,18 +190,14 @@ export async function registerSessionRoutes(
     }
 
     try {
-      const promptId = await session.sendPrompt(prompt);
-      return {
-        sessionId: id,
-        promptId,
-        status: 'queued',
-        message: 'Prompt queued for processing'
-      };
+      const options = submissionOptions(request.body, request.headers['idempotency-key']);
+      const promptId = await session.sendPrompt(prompt, options);
+      const task = await sessionManager.getTask(promptId);
+      if (!task) throw new Error('Durable task receipt unavailable');
+      if (task.sessionId !== session.id) return reply.status(409).send({ error: 'Task belongs to a different session' });
+      return reply.status(202).send(acceptedTask(task));
     } catch (error) {
-      return reply.status(500).send({
-        error: 'Internal Server Error',
-        message: error instanceof Error ? error.message : 'Failed to send prompt'
-      });
+      return taskError(reply, error);
     }
   });
 
@@ -314,9 +312,11 @@ export async function registerSessionRoutes(
         if (msg.type === 'input' && msg.data) {
           session.writeStdin(msg.data);
         } else if (msg.type === 'prompt' && msg.prompt) {
-          session.sendPrompt(msg.prompt).then(promptId => {
+          session.sendPrompt(msg.prompt, { taskId: msg.taskId, idempotencyKey: msg.idempotencyKey }).then(promptId => {
             socket.send(JSON.stringify({
               type: 'prompt.queued',
+              status: 'accepted',
+              taskId: promptId,
               promptId
             }));
           }).catch(error => {

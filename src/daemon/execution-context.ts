@@ -30,11 +30,11 @@ export async function selectExecutionSession(manager: SessionManager, options: {
     const policy = executionPolicy(options.executionPolicy, session?.executionPolicy ?? 'default');
     if (!session) session = await manager.create(undefined, options.model, undefined, false, directory, policy);
     else {
-      if (session.status === 'busy' && ((options.model && session.model !== options.model) || policy !== session.executionPolicy)) {
+      if (session.hasPendingTasks() && ((options.model && session.model !== options.model) || policy !== session.executionPolicy)) {
         throw new Error('Cannot change model or execution policy while a session is busy');
       }
       if (options.model) session.model = options.model;
-      session.executionPolicy = policy;
+      if (session.executionPolicy !== policy) await session.setExecutionPolicy(policy);
     }
     manager.select(session.id);
     await manager.save();

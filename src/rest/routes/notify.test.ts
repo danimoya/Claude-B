@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { RestServer } from '../server.js';
 import { SessionManager } from '../../daemon/session-manager.js';
-import { HookEngine } from '../../hooks/engine.js';
+import { HookEngine, type HookExecutionResult } from '../../hooks/engine.js';
+import { createEvent } from '../../hooks/events.js';
 import { NotificationInbox } from '../../notifications/inbox.js';
 import type { ClaudeBTelegramBot } from '../../telegram/bot.js';
 
@@ -44,12 +45,14 @@ describe('external notifications', () => {
     await server.initialize();
   }
 
-  function notify(payload: Record<string, unknown>, key?: string, ip = '127.0.0.1') {
-    return server.getApp().inject({
+  async function notify(payload: Record<string, unknown>, key?: string, ip = '127.0.0.1', flush = true) {
+    const response = await server.getApp().inject({
       method: 'POST', url: '/api/notify', payload,
       remoteAddress: ip,
       headers: { 'x-claude-b-key': key ?? server.getAuthManager().getApiKey()! },
     });
+    if (flush) await server.getNotificationOutbox().drain();
+    return response;
   }
 
   it.each([undefined, false, true])('dispatches and persists when Telegram running=%s', async online => {
@@ -123,4 +126,70 @@ describe('external notifications', () => {
     expect(engine.getEventHistory()).toHaveLength(0);
     expect(await inbox.getAll()).toHaveLength(0);
   });
+  it('acknowledges durable ingestion while hooks are stalled, including a second notification', async () => {
+    await initialize();
+    let release!: (result: HookExecutionResult) => void;
+    const stalled = new Promise<HookExecutionResult>(resolve => { release = resolve; });
+    const dispatch = vi.spyOn(engine, 'dispatch').mockImplementationOnce(() => stalled);
+    const first = await notify({ sessionId: 'external', eventId: 'first-stalled' }, undefined, '127.0.0.1', false);
+    expect(first.statusCode).toBe(200);
+    await vi.waitFor(() => expect(dispatch).toHaveBeenCalledOnce());
+    const second = await notify({ sessionId: 'external', eventId: 'second-stalled' }, undefined, '127.0.0.1', false);
+    expect(second.statusCode).toBe(200);
+    expect(await inbox.getAll()).toHaveLength(2);
+    release({ event: createEvent('prompt.completed', { sessionId: 'external', promptId: 'first', status: 'success' }), shellResults: [], webhookResults: [] });
+    await server.getNotificationOutbox().drain(true);
+  });
+
+  it('retains a durable event after inbox storage failure and deduplicates an explicit retry', async () => {
+    await initialize();
+    vi.spyOn(inbox, 'addNotification').mockRejectedValueOnce(new Error('storage unavailable'));
+    const payload = { sessionId: 'external', eventId: 'inbox-retry', resultPreview: 'exact' };
+    expect((await notify(payload, undefined, '127.0.0.1', false)).statusCode).toBe(503);
+    expect(await server.getNotificationOutbox().list()).toHaveLength(1);
+    expect((await notify(payload)).statusCode).toBe(200);
+    expect(await server.getNotificationOutbox().list()).toHaveLength(1);
+    expect(await inbox.getAll()).toHaveLength(1);
+  });
+
+  it('retries failed webhook subscribers with the same signed event metadata', async () => {
+    await initialize();
+    await engine.addWebhook('prompt.completed', 'https://receiver.invalid', { retries: 1, secret: 'test-secret' });
+    const receiver = vi.spyOn(globalThis, 'fetch')
+      .mockImplementationOnce(async () => new Response('busy', { status: 503 }))
+      .mockImplementation(async () => new Response('ok'));
+    try {
+      expect((await notify({ sessionId: 'external', eventId: 'signed-retry', resultPreview: 'done' })).statusCode).toBe(200);
+      const before = (await server.getNotificationOutbox().list())[0];
+      expect(before.delivered).toContain('inbox');
+      expect(before.delivered).not.toContain('hooks');
+      await server.getNotificationOutbox().drain(true);
+      expect(receiver).toHaveBeenCalledTimes(2);
+      expect(receiver.mock.calls[0][1]?.body).toBe(receiver.mock.calls[1][1]?.body);
+      expect(new Headers(receiver.mock.calls[0][1]?.headers).get('x-claude-b-signature'))
+        .toBe(new Headers(receiver.mock.calls[1][1]?.headers).get('x-claude-b-signature'));
+      expect(new Set(engine.getEventHistory().map(event => event.id)).size).toBe(1);
+      expect(await inbox.getAll()).toHaveLength(1);
+    } finally { receiver.mockRestore(); }
+  });
+
+  it('rejects conflicting stable event IDs and negative duration/cost fields', async () => {
+    await initialize();
+    expect((await notify({ sessionId: 'external', eventId: 'conflict', resultPreview: 'first' })).statusCode).toBe(200);
+    expect((await notify({ sessionId: 'external', eventId: 'conflict', resultPreview: 'changed' })).statusCode).toBe(409);
+    expect((await notify({ sessionId: 'external', durationMs: -1 })).statusCode).toBe(400);
+    expect((await notify({ sessionId: 'external', costUsd: -1 })).statusCode).toBe(400);
+    expect(await inbox.getAll()).toHaveLength(1);
+  });
+
+  it('normalizes recorded tmux identity before transcript caching and durable delivery', async () => {
+    await initialize();
+    session.mockResolvedValueOnce('tmux:%42@1234');
+    expect((await notify({ sessionId: 'tmux:project:1.0', transcriptPath: '/fixture/transcript', resultPreview: 'done' })).statusCode).toBe(200);
+    expect(session).toHaveBeenCalledWith('tmux:project:1.0', undefined, 'claude', undefined);
+    expect(transcript).toHaveBeenCalledWith('tmux:%42@1234', '/fixture/transcript');
+    expect((await inbox.getAll())[0].sessionId).toBe('tmux:%42@1234');
+    expect(engine.getEventHistory()[0].payload).toMatchObject({ sessionId: 'tmux:%42@1234' });
+  });
+
 });

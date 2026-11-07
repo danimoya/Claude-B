@@ -1,7 +1,8 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { ClaudeBTelegramBot } from '../../telegram/bot.js';
 import { AuthManager } from '../auth.js';
-import { NotificationInbox } from '../../notifications/inbox.js';
+import { NotificationInbox, type NotificationInput } from '../../notifications/inbox.js';
+import { NotificationConflictError, type NotificationOutbox } from '../../notifications/outbox.js';
 import { HookEngine } from '../../hooks/engine.js';
 import { randomUUID } from 'node:crypto';
 
@@ -9,6 +10,7 @@ import { randomUUID } from 'node:crypto';
 // running inside a tmux pane). The pane reports its own completion — Claude-B
 // dispatches it to hooks and the inbox, with optional Telegram delivery.
 interface NotifyBody {
+  eventId?: string;
   sessionId: string;         // opaque; use "tmux:<target>" for tmux-hosted sessions
   sessionName?: string;      // human label, e.g. "dimensigon:1.0 ✳ Investigate repository"
   type?: 'prompt.completed' | 'prompt.error';
@@ -40,8 +42,9 @@ export async function registerNotifyRoutes(
   authManager: AuthManager,
   inbox: NotificationInbox | null,
   onTmuxTranscript: ((sessionId: string, transcriptPath: string) => void) | null,
-  onTmuxSession: ((sessionId: string, sessionName: string | undefined, agent: string, goal: string | undefined) => void) | null,
-  hookEngine: HookEngine | null = null
+  onTmuxSession: ((sessionId: string, sessionName: string | undefined, agent: string, goal: string | undefined) => string | void | Promise<string | void>) | null,
+  hookEngine: HookEngine | null = null,
+  outbox: NotificationOutbox | null = null
 ): Promise<void> {
 
   app.post<{ Body: NotifyBody }>('/api/notify', {
@@ -51,12 +54,13 @@ export async function registerNotifyRoutes(
         required: ['sessionId'],
         properties: {
           sessionId:     { type: 'string', minLength: 1 },
+          eventId:       { type: 'string', minLength: 1, maxLength: 256 },
           sessionName:   { type: 'string' },
           type:          { type: 'string', enum: ['prompt.completed', 'prompt.error'] },
           goal:          { type: 'string' },
           exitCode:      { type: ['integer', 'null'] },
-          durationMs:    { type: 'number' },
-          costUsd:       { type: 'number' },
+          durationMs:    { type: 'number', minimum: 0 },
+          costUsd:       { type: 'number', minimum: 0 },
           resultPreview: { type: 'string' },
           transcriptPath:{ type: 'string' },
           agent:         { type: 'string' },
@@ -91,23 +95,35 @@ export async function registerNotifyRoutes(
       resultPreview: body.resultPreview,
     };
 
-    // Cache the transcript path for this tmux session so the voice pipeline
-    // can later ground optimizePrompt with real turn history. Fire-and-forget;
-    // if the callback isn't wired, skip silently.
-    if (body.transcriptPath && onTmuxTranscript) {
+    // Bind display addresses to the recorded stable pane/process identity
+    // before persisting routing context. Resolution failures remain non-fatal.
+    if (onTmuxSession && body.sessionId.startsWith('tmux:')) {
       try {
-        onTmuxTranscript(body.sessionId, body.transcriptPath);
-      } catch { /* non-fatal */ }
+        const canonical = await onTmuxSession(body.sessionId, body.sessionName, body.agent || 'claude', body.goal);
+        if (typeof canonical === 'string' && canonical) notif.sessionId = canonical;
+      } catch { /* accepted notifications remain independent of pane discovery */ }
+    }
+    if (body.transcriptPath && onTmuxTranscript) {
+      try { await onTmuxTranscript(notif.sessionId, body.transcriptPath); } catch { /* non-fatal */ }
     }
 
-    // Register Codex tmux panes so they appear in the Telegram /sessions list.
-    // Claude panes are enumerated directly from tmux (pane_current_command ==
-    // "claude"), but Codex panes report "node", so the daemon only learns about
-    // them from these notify POSTs. Fire-and-forget; skip silently if unwired.
-    if (body.agent && onTmuxSession && body.sessionId.startsWith('tmux:')) {
+    if (outbox) {
+      const eventId = `external:${body.eventId || randomUUID()}`;
+      const notification: NotificationInput = {
+        ...notif, deliveryId: eventId, promptId: eventId, agent: body.agent,
+        transcriptPath: body.transcriptPath, resultFull: body.resultPreview?.slice(0, 50000), viewCommand: 'cb -i'
+      };
       try {
-        onTmuxSession(body.sessionId, body.sessionName, body.agent, body.goal);
-      } catch { /* non-fatal */ }
+        await outbox.enqueue(notification, eventId);
+        // Persist the local inbox before acknowledging ingestion; network
+        // channels remain asynchronous and retry through durable receipts.
+        if (inbox) await inbox.addNotification(notification);
+      } catch (error) {
+        if (error instanceof NotificationConflictError) return reply.status(409).send({ error: 'Notification event ID conflicts with an existing event' });
+        return reply.status(503).send({ error: 'Notification storage unavailable' });
+      }
+      void outbox.drain().catch(() => app.log.error('Notification delivery deferred'));
+      return { ok: true };
     }
 
     // Each delivery channel is independent. Start the hooks exactly once;

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { SessionManager } from './session-manager.js';
-import { rm, mkdir } from 'fs/promises';
+import { rm, mkdir, readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -137,6 +137,13 @@ describe('SessionManager', () => {
   });
 
   describe('persistence', () => {
+    it('rejects new and in-flight session creation once shutdown begins', async () => {
+      const creating = manager.create('racing shutdown');
+      const stopping = manager.stopAll();
+      await expect(creating).rejects.toThrow('closing');
+      await stopping;
+      await expect(manager.create('too late')).rejects.toThrow('closing');
+    });
     it('should persist and restore sessions', async () => {
       await manager.create('persistent-session', 'opus');
       await manager.save();
@@ -151,6 +158,38 @@ describe('SessionManager', () => {
       expect(list[0].model).toBe('opus');
 
       await newManager.stopAll();
+    });
+
+    it('preserves corrupt JSON and blocks saves or shutdown from replacing it with an empty index', async () => {
+      const path = join(testDir, 'sessions', 'index.json');
+      const bytes = '{"sessions": [broken original state';
+      await writeFile(path, bytes);
+      const recovering = new SessionManager(testDir);
+      await expect(recovering.load()).rejects.toThrow('preserved');
+      await expect(recovering.save()).rejects.toThrow('preserved');
+      await expect(recovering.stopAll()).rejects.toThrow('preserved');
+      expect(await readFile(path, 'utf8')).toBe(bytes);
+    });
+
+    it('rejects malformed session schemas before changing index or task receipts', async () => {
+      const session = await manager.create('preserved');
+      const task = (await manager.getTaskStore().accept({ sessionId: session.id, prompt: 'not executed', workingDir: testDir, executionPolicy: 'default' })).task;
+      const taskPath = join(testDir, 'tasks', `${task.id}.json`);
+      const taskBytes = await readFile(taskPath, 'utf8');
+      const path = join(testDir, 'sessions', 'index.json');
+      for (const index of [
+        { sessions: null }, { sessions: [{}] },
+        { sessions: [{ ...session.getState(), executionPolicy: 'unsafe' }] },
+        { sessions: [{ ...session.getState(), workingDir: '../outside' }] },
+        { sessions: [session.getState(), session.getState()] },
+        { sessions: [session.getState()], selectedId: 'nonexistent' },
+      ]) {
+        const bytes = JSON.stringify(index);
+        await writeFile(path, bytes);
+        await expect(new SessionManager(testDir).load()).rejects.toThrow('preserved');
+        expect(await readFile(path, 'utf8')).toBe(bytes);
+        expect(await readFile(taskPath, 'utf8')).toBe(taskBytes);
+      }
     });
   });
 });

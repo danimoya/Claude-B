@@ -146,4 +146,28 @@ describe('webhook delivery', () => {
   it('assigns unique IDs to separate events', () => {
     expect(event().id).not.toBe(event().id);
   });
+  it('aborts an in-flight HTTP request and clears all deadline timers', async () => {
+    fetchMock.mockImplementation((_url: string, options: RequestInit) => new Promise((_resolve, reject) => {
+      options.signal!.addEventListener('abort', () => reject(new Error('request aborted')));
+    }));
+    const controller = new AbortController();
+    const pending = executeWebhook(webhook, event(), controller.signal);
+    controller.abort();
+    expect(await pending).toMatchObject({ success: false, response: 'Webhook delivery aborted', retryCount: 0 });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('cancels retry backoff without sending a later request', async () => {
+    fetchMock.mockImplementation(async () => new Response('busy', { status: 503 }));
+    const controller = new AbortController();
+    const pending = executeWebhook(webhook, event(), controller.signal);
+    await vi.advanceTimersByTimeAsync(0);
+    controller.abort();
+    expect(await pending).toMatchObject({ success: false, response: 'Webhook delivery aborted' });
+    await vi.runAllTimersAsync();
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
 });

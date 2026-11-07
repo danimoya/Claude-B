@@ -94,4 +94,30 @@ describe('shell hook payload handling', () => {
     expect(result.success).toBe(true);
     expect(JSON.parse(result.stdout)).toEqual(event.payload.args);
   });
+  it('exposes the stable event ID without allowing payload override', async () => {
+    const event = eventWithOutput('fixture');
+    (event.payload as unknown as Record<string, unknown>).EVENT_ID = 'forged';
+    expect(await executeShellHook({ ...hook, command: 'printf "%s|%s" "$EVENT_ID" "$CLAUDE_B_EVENT_ID"' }, event))
+      .toMatchObject({ success: true, stdout: `${event.id}|${event.id}` });
+  });
+
+  it('does not launch an already aborted shell hook', async () => {
+    const controller = new AbortController(); controller.abort();
+    const sentinel = join(dir, 'not-started');
+    expect(await executeShellHook({ ...hook, command: `touch '${sentinel}'` }, eventWithOutput('fixture'), controller.signal))
+      .toMatchObject({ success: false, stderr: 'Hook delivery aborted' });
+    await expect(readFile(sentinel)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('aborts the shell process group so descendants cannot execute delayed work', async () => {
+    const sentinel = join(dir, 'descendant-ran');
+    const controller = new AbortController();
+    const pending = executeShellHook({ ...hook, command: `trap '' TERM; (sleep 0.6; printf x > '${sentinel}') & wait` }, eventWithOutput('fixture'), controller.signal);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    controller.abort();
+    expect(await pending).toMatchObject({ success: false, exitCode: null, stderr: 'Hook delivery aborted' });
+    await new Promise(resolve => setTimeout(resolve, 450));
+    await expect(readFile(sentinel)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
 });

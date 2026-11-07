@@ -8,13 +8,16 @@ import { spawn, spawnSync } from 'child_process';
 import { SessionManager } from './session-manager.js';
 import { DaemonInstanceLock } from './instance-lock.js';
 import { selectExecutionSession } from './execution-context.js';
-import type { ExecutionPolicy } from '../session/session.js';
+import { Session, type ExecutionPolicy } from '../session/session.js';
+import { TERMINAL_TASK_STATUSES, type TaskRecord, type TaskSubmission } from '../jobs/types.js';
 import { submitPromptWithDelivery } from './prompt-delivery.js';
 import { RestServer } from '../rest/server.js';
 import { HookEngine } from '../hooks/engine.js';
 import { HookEventType } from '../hooks/events.js';
 import { OrchestrationManager, createHost, redactRemoteHost } from '../orchestration/index.js';
 import { NotificationInbox } from '../notifications/inbox.js';
+import { NotificationOutbox } from '../notifications/outbox.js';
+import { createDeliveryOutbox } from '../notifications/delivery.js';
 import { ClaudeBTelegramBot } from '../telegram/bot.js';
 import { VoicePipeline } from '../telegram/voice.js';
 import { createAIProvider } from '../telegram/ai-provider.js';
@@ -42,6 +45,7 @@ class Daemon {
   private hookEngine: HookEngine;
   private orchestrationManager: OrchestrationManager;
   private notificationInbox: NotificationInbox;
+  private notificationOutbox: NotificationOutbox;
   private telegramBot: ClaudeBTelegramBot;
   private clients: Set<Socket> = new Set();
   private startTime: number = Date.now();
@@ -104,17 +108,14 @@ class Daemon {
         this.sessionManager.select(sessionId);
 
         await submitPromptWithDelivery(session, prompt, {
+          outbox: this.notificationOutbox,
           hooks: this.hookEngine,
           inbox: this.notificationInbox,
           forward: (notification) => this.forwardToTelegram(notification),
         });
       },
       onExecutionPolicy: async (sessionId, policy) => {
-        const session = this.sessionManager.get(sessionId);
-        if (!session) throw new Error('Session not found');
-        if (session.status === 'busy') throw new Error('Cannot change execution policy while a session is busy');
-        session.executionPolicy = policy;
-        await this.sessionManager.save();
+        await this.sessionManager.setExecutionPolicy(sessionId, policy);
       },
       getSessions: () => {
         const claudePanes = this.listTmuxClaudePanes();
@@ -146,6 +147,14 @@ class Daemon {
           status: session.status,
         };
       },
+    });
+    this.notificationOutbox = createDeliveryOutbox(configDir, {
+      inbox: this.notificationInbox, hooks: this.hookEngine, telegram: this.telegramBot,
+    });
+    this.sessionManager.on('task.terminal', (task: TaskRecord) => {
+      void this.notificationOutbox.enqueue(Session.notificationForTask(task)).then(() => this.notificationOutbox.drain()).catch(() => {
+        this.log('Task notification remains recoverable from its durable receipt');
+      });
     });
   }
 
@@ -200,6 +209,11 @@ class Daemon {
       // No token configured or invalid — that's fine
       this.log(`Telegram bot not started: ${err instanceof Error ? err.message : String(err)}`);
     }
+
+    for (const task of await this.sessionManager.listTasks()) {
+      if (TERMINAL_TASK_STATUSES.has(task.status)) await this.notificationOutbox.enqueue(Session.notificationForTask(task));
+    }
+    this.notificationOutbox.start();
 
     // Create server
     this.server = createServer((socket) => this.handleConnection(socket));
@@ -271,6 +285,7 @@ class Daemon {
     socket: Socket
   ): Promise<{ data?: Record<string, unknown>; error?: string }> {
     const { method, params } = message;
+    if (this.shuttingDown && !['daemon.status', 'task.get', 'task.find', 'task.list', 'session.list'].includes(method)) return { error: 'Daemon is shutting down; no new work was accepted' };
 
     switch (method) {
       case 'daemon.status':
@@ -286,11 +301,18 @@ class Daemon {
         const session = params?.sessionId ? this.sessionManager.get(params.sessionId as string) : this.sessionManager.current();
         if (!session) return { error: 'Session not found' };
         if (params?.executionPolicy !== 'default' && params?.executionPolicy !== 'bypass') return { error: 'Execution policy must be default or bypass' };
-        if (session.status === 'busy') return { error: 'Cannot change execution policy while a session is busy' };
-        session.executionPolicy = params.executionPolicy;
-        await this.sessionManager.save();
+        await this.sessionManager.setExecutionPolicy(session.id, params.executionPolicy);
         return { data: { sessionId: session.id, executionPolicy: session.executionPolicy } };
       }
+
+      case 'task.get':
+        return { data: { task: await this.sessionManager.getTask(params?.taskId as string) } };
+      case 'task.find':
+        return { data: { task: await this.sessionManager.getTaskStore().findByIdempotencyKey(params?.idempotencyKey as string) } };
+      case 'task.list':
+        return { data: { tasks: await this.sessionManager.listTasks(params?.sessionId as string | undefined) } };
+      case 'task.cancel':
+        return { data: { task: await this.sessionManager.cancelTask(params?.taskId as string) } };
 
       case 'session.kill':
         return this.killSession(params?.sessionId as string);
@@ -317,7 +339,7 @@ class Daemon {
         return this.unwatchSession(socket);
 
       case 'prompt.send':
-        return this.sendPrompt(params?.prompt as string, params?.model as string | undefined, params?.executionPolicy as ExecutionPolicy | undefined, params?.workingDir as string | undefined, params?.sessionId as string | undefined);
+        return this.sendPrompt(params?.prompt as string, params?.model as string | undefined, params?.executionPolicy as ExecutionPolicy | undefined, params?.workingDir as string | undefined, params?.sessionId as string | undefined, { taskId: params?.taskId as string | undefined, idempotencyKey: params?.idempotencyKey as string | undefined });
 
       case 'stdin':
         return this.handleStdin(params?.data as string, socket);
@@ -429,7 +451,8 @@ class Daemon {
           params?.goal as string | undefined,
           params?.model as string | undefined,
           params?.executionPolicy as ExecutionPolicy | undefined,
-          params?.workingDir as string | undefined
+          params?.workingDir as string | undefined,
+          { taskId: params?.taskId as string | undefined, idempotencyKey: params?.idempotencyKey as string | undefined }
         );
 
       case 'orchestration.fire':
@@ -495,6 +518,7 @@ class Daemon {
   }
 
   private async createSession(name?: string, model?: string, workingDir?: string, executionPolicy: ExecutionPolicy = 'default'): Promise<{ data?: Record<string, unknown>; error?: string }> {
+    if (this.shuttingDown) return { error: 'Daemon is shutting down' };
     try {
       const session = await this.sessionManager.create(name, model, undefined, false, workingDir, executionPolicy);
       // Dispatch session.created hook
@@ -599,15 +623,17 @@ class Daemon {
     return { data: { success: true } };
   }
 
-  private async sendPrompt(prompt: string, model?: string, executionPolicy?: ExecutionPolicy, workingDir?: string, sessionId?: string): Promise<{ data?: Record<string, unknown>; error?: string }> {
+  private async sendPrompt(prompt: string, model?: string, executionPolicy?: ExecutionPolicy, workingDir?: string, sessionId?: string, submission?: TaskSubmission): Promise<{ data?: Record<string, unknown>; error?: string }> {
     try {
       const session = await selectExecutionSession(this.sessionManager, { sessionId, workingDir, model, executionPolicy });
       const promptId = await submitPromptWithDelivery(session, prompt, {
+        outbox: this.notificationOutbox,
         hooks: this.hookEngine,
         inbox: this.notificationInbox,
         forward: (notification) => this.forwardToTelegram(notification),
-      });
-      return { data: { promptId, sessionId: session.id } };
+      }, submission);
+      const task = await this.sessionManager.getTask(promptId);
+      return { data: { promptId, taskId: promptId, sessionId: task?.sessionId ?? session.id, status: 'accepted' } };
     } catch (error) {
       return { error: error instanceof Error ? error.message : 'Failed to send prompt' };
     }
@@ -640,6 +666,7 @@ class Daemon {
         sessionManager: this.sessionManager,
         hookEngine: this.hookEngine,
         notificationInbox: this.notificationInbox,
+        notificationOutbox: this.notificationOutbox,
         telegramBot: this.telegramBot,
         orchestrationManager: this.orchestrationManager,
         configDir: this.config.configDir,
@@ -1282,7 +1309,6 @@ class Daemon {
    * under the 2000-char budget the bot already uses.
    */
   private readLastTurnsFromTranscript(path: string, turns: number): string {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
     const fs = require('fs') as typeof import('fs');
     const raw = fs.readFileSync(path, 'utf8');
     const lines = raw.split('\n').filter((l) => l.length > 0);
@@ -1434,7 +1460,8 @@ class Daemon {
     goal?: string,
     model?: string,
     executionPolicy: ExecutionPolicy = 'default',
-    workingDir?: string
+    workingDir?: string,
+    submission?: TaskSubmission
   ): Promise<{ data?: Record<string, unknown>; error?: string }> {
     if (!prompt) return { error: 'Prompt is required' };
 
@@ -1449,12 +1476,14 @@ class Daemon {
       );
 
       const promptId = await submitPromptWithDelivery(session, prompt, {
+        outbox: this.notificationOutbox,
         hooks: this.hookEngine,
         inbox: this.notificationInbox,
         forward: (notification) => this.forwardToTelegram(notification),
-      });
+      }, submission);
 
-      return { data: { sessionId: session.id, promptId, goal: session.goal } };
+      const task = await this.sessionManager.getTask(promptId);
+      return { data: { sessionId: task?.sessionId ?? session.id, promptId, taskId: promptId, goal: task?.goal ?? session.goal, status: 'accepted' } };
     } catch (error) {
       return { error: error instanceof Error ? error.message : 'Failed to fire task' };
     }
@@ -1512,9 +1541,12 @@ class Daemon {
   }
 
   async cleanupFailedStart(): Promise<void> {
+    this.shuttingDown = true;
     if (this.cleanupInterval) clearInterval(this.cleanupInterval);
     await this.telegramBot.stop().catch(() => {});
+    await this.sessionManager.stopAll().catch(() => {});
     this.orchestrationManager.stopHealthChecks();
+    await this.notificationOutbox.stop().catch(() => {});
     if (this.server?.listening) {
       for (const client of this.clients) client.destroy();
       await new Promise<void>(resolve => this.server!.close(() => resolve()));
@@ -1525,50 +1557,29 @@ class Daemon {
   private async shutdown(): Promise<void> {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
-    this.log('Shutting down...');
-
-    // Dispatch daemon.stopped hook (don't await - best effort)
-    this.hookEngine.dispatch('daemon.stopped', { pid: process.pid }).catch(() => {});
-
-    // Stop REST server if running
-    if (this.restServer) {
-      await this.restServer.stop();
-      this.hookEngine.dispatch('rest.stopped', {}).catch(() => {});
-      this.restServer = null;
-    }
-
-    // Stop cleanup interval
-    if (this.cleanupInterval) {
-      clearInterval(this.cleanupInterval);
-    }
-
-    // Stop Telegram bot
-    if (this.telegramBot.isRunning()) {
-      await this.telegramBot.stop();
-    }
-
-    // Stop orchestration
-    await this.orchestrationManager.shutdown();
-
-    // Close all client connections
-    for (const client of this.clients) {
-      client.end();
-    }
-
-    // Stop all sessions
-    await this.sessionManager.stopAll();
-
-    // Close server
-    if (this.server?.listening) {
-      for (const client of this.clients) client.destroy();
-      await new Promise<void>(resolve => this.server!.close(() => resolve()));
-    }
-
-    await this.instanceLock.release();
-
+    if (this.cleanupInterval) clearInterval(this.cleanupInterval);
+    let failed = false;
+    const settle = async (label: string, operation: Promise<unknown>) => {
+      try { await operation; }
+      catch { failed = true; this.log(`${label} could not finish; persisted state was preserved`); }
+    };
+    // Close acceptance before waiting for cancellation or network shutdown.
+    const sessionsStopped = settle('Task cancellation', this.sessionManager.stopAll());
+    const remoteStopped = settle('Remote request shutdown', this.orchestrationManager.shutdown());
+    const serverClosed = this.server?.listening
+      ? new Promise<void>(resolve => this.server!.close(() => resolve())) : Promise.resolve();
+    for (const client of this.clients) client.destroy();
+    await settle('REST shutdown', this.restServer?.stop() || Promise.resolve());
+    await settle('Telegram shutdown', this.telegramBot.stop());
+    await remoteStopped;
+    await sessionsStopped;
+    await settle('Notification shutdown', this.notificationOutbox.stop());
+    await settle('IPC shutdown', serverClosed);
+    await settle('Daemon ownership cleanup', this.instanceLock.release());
     this.log('Daemon stopped');
-    process.exit(0);
+    process.exit(failed ? 1 : 0);
   }
+
 }
 
 // Start daemon

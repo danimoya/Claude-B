@@ -14,6 +14,7 @@ export interface ShellHook {
 }
 
 export interface ShellHookResult {
+  retryable?: boolean;
   hookId: string;
   success: boolean;
   exitCode: number | null;
@@ -46,6 +47,8 @@ function buildHookEnv(event: HookEvent): NodeJS.ProcessEnv {
   }
 
   // Assign metadata last so payload keys cannot override it.
+  env.CLAUDE_B_EVENT_ID = event.id || '';
+  env.EVENT_ID = event.id || '';
   env.CLAUDE_B_EVENT = event.type;
   env.CLAUDE_B_TIMESTAMP = event.timestamp;
   env.EVENT = event.type;
@@ -59,77 +62,52 @@ function buildHookEnv(event: HookEvent): NodeJS.ProcessEnv {
 
 export async function executeShellHook(
   hook: ShellHook,
-  event: HookEvent
+  event: HookEvent,
+  signal?: AbortSignal
 ): Promise<ShellHookResult> {
   const startTime = Date.now();
-  const timeout = hook.timeout || 30000;
-
-  // The operator-authored command is trusted shell source; payload values are
-  // passed only through the environment and are never parsed as shell source.
-  const command = hook.command;
+  const timeout = Number.isFinite(hook.timeout) && hook.timeout! > 0 ? Math.min(hook.timeout!, 60000) : 30000;
+  if (signal?.aborted) return { hookId: hook.id, success: false, retryable: false, exitCode: null, stdout: '', stderr: 'Hook delivery aborted', duration: 0 };
   const env = buildHookEnv(event);
-
   return new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
-    let killed = false;
-
-    const proc = spawn('sh', ['-c', command], {
-      env,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      detached: false
+    let stopped: string | undefined;
+    let finished = false;
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    const proc = spawn('sh', ['-c', hook.command], {
+      env, stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32'
     });
-
-    // Set timeout
-    const timeoutId = setTimeout(() => {
-      killed = true;
-      proc.kill('SIGTERM');
-      setTimeout(() => {
-        try {
-          proc.kill('SIGKILL');
-        } catch {
-          // Already dead
-        }
-      }, 1000);
-    }, timeout);
-
-    proc.stdout?.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString();
-      // Limit output size
-      if (stdout.length > 100000) {
-        stdout = stdout.slice(-100000);
-      }
-    });
-
-    proc.stderr?.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString();
-      if (stderr.length > 100000) {
-        stderr = stderr.slice(-100000);
-      }
-    });
-
-    proc.on('close', (code) => {
+    const finish = (code: number | null, error?: string) => {
+      if (finished) return;
+      finished = true;
       clearTimeout(timeoutId);
-      resolve({
-        hookId: hook.id,
-        success: code === 0 && !killed,
-        exitCode: killed ? null : code,
-        stdout: stdout.trim(),
-        stderr: killed ? `Hook timed out after ${timeout}ms` : stderr.trim(),
-        duration: Date.now() - startTime
-      });
-    });
-
-    proc.on('error', (error) => {
-      clearTimeout(timeoutId);
-      resolve({
-        hookId: hook.id,
-        success: false,
-        exitCode: null,
-        stdout: '',
-        stderr: error.message,
-        duration: Date.now() - startTime
-      });
-    });
+      if (stopped) kill('SIGKILL');
+      if (killTimer) clearTimeout(killTimer);
+      signal?.removeEventListener('abort', abort);
+      resolve({ hookId: hook.id, success: code === 0 && !stopped && !error, retryable: false,
+        exitCode: stopped ? null : code, stdout: stdout.trim(),
+        stderr: stopped || error || stderr.trim(), duration: Date.now() - startTime });
+    };
+    const kill = (kind: NodeJS.Signals) => {
+      if (process.platform !== 'win32' && proc.pid) {
+        try { process.kill(-proc.pid, kind); return; } catch { /* process group already gone */ }
+      }
+      try { proc.kill(kind); } catch { /* already closed */ }
+    };
+    const stop = (reason: string) => {
+      if (finished || stopped) return;
+      stopped = reason;
+      killTimer = setTimeout(() => { kill('SIGKILL'); finish(null); }, 250);
+      kill('SIGTERM');
+    };
+    const abort = () => stop('Hook delivery aborted');
+    const timeoutId = setTimeout(() => stop(`Hook timed out after ${timeout}ms`), timeout);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+    proc.stdout?.on('data', (chunk: Buffer) => { stdout = (stdout + chunk.toString()).slice(-100000); });
+    proc.stderr?.on('data', (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-100000); });
+    proc.once('close', code => finish(code));
+    proc.on('error', error => finish(null, error.message));
   });
 }

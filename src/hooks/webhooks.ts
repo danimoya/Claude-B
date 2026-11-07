@@ -19,6 +19,8 @@ export interface Webhook {
 }
 
 export interface WebhookResult {
+  retryable?: boolean;
+  retryAfterMs?: number;
   webhookId: string;
   success: boolean;
   statusCode: number | null;
@@ -112,10 +114,14 @@ async function makeRequest(
   webhook: Webhook,
   body: string,
   headers: Headers,
-  timeout: number
+  timeout: number,
+  signal?: AbortSignal
 ): Promise<{ statusCode: number; response: string; retryAfter: string | null }> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
+  const abort = () => controller.abort(signal?.reason);
+  signal?.addEventListener('abort', abort, { once: true });
+  if (signal?.aborted) abort();
 
   try {
     const response = await fetch(webhook.url, {
@@ -128,7 +134,14 @@ async function makeRequest(
     });
 
     // Keep the deadline active while consuming the response body too.
-    let responseText = await response.text();
+    let responseText: string;
+    try { responseText = await response.text(); }
+    catch (error) {
+      // A known terminal HTTP rejection stays terminal even if reading its
+      // diagnostic body fails. Never turn HTTP 400 into a network retry.
+      if (response.status >= 300 && response.status < 500 && response.status !== 429) responseText = 'Response body unavailable';
+      else throw error;
+    }
     if (responseText.length > 10000) {
       responseText = responseText.slice(0, 10000) + '...(truncated)';
     }
@@ -140,12 +153,24 @@ async function makeRequest(
     };
   } finally {
     clearTimeout(timeoutId);
+    signal?.removeEventListener('abort', abort);
   }
+}
+
+function waitForRetry(delay: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new Error('Webhook delivery aborted'));
+  return new Promise((resolve, reject) => {
+    const abort = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort); reject(new Error('Webhook delivery aborted')); };
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve(); }, delay);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+  });
 }
 
 export async function executeWebhook(
   webhook: Webhook,
-  event: HookEvent
+  event: HookEvent,
+  signal?: AbortSignal
 ): Promise<WebhookResult> {
   const startTime = Date.now();
   const timeout = Number.isFinite(webhook.timeout) && webhook.timeout! > 0
@@ -175,15 +200,21 @@ export async function executeWebhook(
       `sha256=${createHmac('sha256', webhook.secret).update(body).digest('hex')}`);
   }
 
+  const aborted = (attempt: number): WebhookResult => ({ webhookId: webhook.id,
+    success: false, retryable: true, statusCode: null, response: 'Webhook delivery aborted',
+    duration: Date.now() - startTime, retryCount: attempt });
   for (let attempt = 0; ; attempt++) {
+    if (signal?.aborted) return aborted(attempt);
     let retryAfter: string | null = null;
     try {
-      const result = await makeRequest(webhook, body, headers, timeout);
+      const result = await makeRequest(webhook, body, headers, timeout, signal);
       const retryable = result.statusCode === 429 || result.statusCode >= 500;
       if (!retryable || attempt === maxRetries) {
         return {
           webhookId: webhook.id,
           success: result.statusCode >= 200 && result.statusCode < 300,
+          retryable,
+          retryAfterMs: retryable ? retryDelay(result.retryAfter, attempt) : undefined,
           statusCode: result.statusCode,
           response: result.response,
           duration: Date.now() - startTime,
@@ -192,10 +223,13 @@ export async function executeWebhook(
       }
       retryAfter = result.retryAfter;
     } catch (error) {
+      if (signal?.aborted) return aborted(attempt);
       if (attempt === maxRetries) {
         return {
           webhookId: webhook.id,
           success: false,
+          retryable: true,
+          retryAfterMs: retryDelay(null, attempt),
           statusCode: null,
           response: error instanceof Error ? error.message : String(error),
           duration: Date.now() - startTime,
@@ -204,6 +238,7 @@ export async function executeWebhook(
       }
     }
 
-    await new Promise(resolve => setTimeout(resolve, retryDelay(retryAfter, attempt)));
+    try { await waitForRetry(retryDelay(retryAfter, attempt), signal); }
+    catch { return aborted(attempt); }
   }
 }
