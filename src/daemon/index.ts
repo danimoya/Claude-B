@@ -3,11 +3,11 @@ import { loadEnv, getDataDir } from '../config/env.js';
 loadEnv();
 
 import { createServer, Server, Socket } from 'net';
-import { mkdir, writeFile, unlink, readFile } from 'fs/promises';
-import { existsSync } from 'fs';
 import { nanoid } from 'nanoid';
 import { spawn, spawnSync } from 'child_process';
 import { SessionManager } from './session-manager.js';
+import { DaemonInstanceLock } from './instance-lock.js';
+import { selectExecutionSession } from './execution-context.js';
 import type { ExecutionPolicy } from '../session/session.js';
 import { submitPromptWithDelivery } from './prompt-delivery.js';
 import { RestServer } from '../rest/server.js';
@@ -36,6 +36,8 @@ interface RestConfig {
 class Daemon {
   private server: Server | null = null;
   private config: DaemonConfig;
+  private instanceLock: DaemonInstanceLock;
+  private shuttingDown = false;
   private sessionManager: SessionManager;
   private hookEngine: HookEngine;
   private orchestrationManager: OrchestrationManager;
@@ -73,6 +75,7 @@ class Daemon {
       logFile: `${configDir}/daemon.log`,
       configDir
     };
+    this.instanceLock = new DaemonInstanceLock(configDir);
     this.sessionManager = new SessionManager(configDir);
     this.hookEngine = new HookEngine(configDir);
     this.orchestrationManager = new OrchestrationManager(configDir);
@@ -163,31 +166,7 @@ class Daemon {
   }
 
   async start(): Promise<void> {
-    // Ensure config directory exists
-    await mkdir(this.config.configDir, { recursive: true });
-    await this.acquireLock();
-
-    // Check if daemon is already running
-    if (existsSync(this.config.pidFile)) {
-      const pid = parseInt(await readFile(this.config.pidFile, 'utf-8'), 10);
-      try {
-        process.kill(pid, 0); // Check if process exists
-        console.error(`Daemon already running (PID: ${pid})`);
-        await this.releaseLock();
-        process.exit(1);
-      } catch {
-        // Process doesn't exist, clean up stale files
-        await this.cleanup();
-      }
-    }
-
-    // Clean up old socket
-    if (existsSync(this.config.socketPath)) {
-      await unlink(this.config.socketPath);
-    }
-
-    // Write PID file
-    await writeFile(this.config.pidFile, process.pid.toString());
+    await this.instanceLock.acquire();
 
     // Load sessions, hooks, and orchestration
     await this.sessionManager.load();
@@ -225,11 +204,14 @@ class Daemon {
     // Create server
     this.server = createServer((socket) => this.handleConnection(socket));
 
-    this.server.listen(this.config.socketPath, () => {
-      this.log(`Daemon started on ${this.config.socketPath}`);
-      // Dispatch daemon.started hook
-      this.hookEngine.dispatch('daemon.started', { pid: process.pid }).catch(() => {});
+    await new Promise<void>((resolve, reject) => {
+      this.server!.once('error', reject);
+      this.server!.listen(this.config.socketPath, () => {
+        this.instanceLock.recordSocket().then(resolve, reject);
+      });
     });
+    this.log(`Daemon started on ${this.config.socketPath}`);
+    this.hookEngine.dispatch('daemon.started', { pid: process.pid }).catch(() => {});
 
     // Handle shutdown
     process.on('SIGTERM', () => this.shutdown());
@@ -329,13 +311,13 @@ class Daemon {
         return this.detachSession(socket);
 
       case 'session.watch':
-        return this.watchSession(socket);
+        return this.watchSession(socket, params?.sessionId as string | undefined);
 
       case 'session.unwatch':
         return this.unwatchSession(socket);
 
       case 'prompt.send':
-        return this.sendPrompt(params?.prompt as string, params?.model as string | undefined, params?.executionPolicy as ExecutionPolicy | undefined);
+        return this.sendPrompt(params?.prompt as string, params?.model as string | undefined, params?.executionPolicy as ExecutionPolicy | undefined, params?.workingDir as string | undefined, params?.sessionId as string | undefined);
 
       case 'stdin':
         return this.handleStdin(params?.data as string, socket);
@@ -446,7 +428,8 @@ class Daemon {
           params?.name as string | undefined,
           params?.goal as string | undefined,
           params?.model as string | undefined,
-          params?.executionPolicy as ExecutionPolicy | undefined
+          params?.executionPolicy as ExecutionPolicy | undefined,
+          params?.workingDir as string | undefined
         );
 
       case 'orchestration.fire':
@@ -599,8 +582,8 @@ class Daemon {
     return { data: { success: true } };
   }
 
-  private watchSession(socket: Socket): { data?: Record<string, unknown>; error?: string } {
-    const session = this.sessionManager.current();
+  private watchSession(socket: Socket, sessionId?: string): { data?: Record<string, unknown>; error?: string } {
+    const session = sessionId ? this.sessionManager.get(sessionId) : this.sessionManager.current();
     if (!session) {
       return { error: 'No session selected' };
     }
@@ -616,41 +599,14 @@ class Daemon {
     return { data: { success: true } };
   }
 
-  private async sendPrompt(prompt: string, model?: string, executionPolicy?: ExecutionPolicy): Promise<{ data?: Record<string, unknown>; error?: string }> {
-    if (executionPolicy !== undefined && executionPolicy !== 'default' && executionPolicy !== 'bypass') return { error: 'Invalid execution policy' };
-    let session = this.sessionManager.current();
-
-    // Auto-create session if none exists
-    if (!session) {
-      const result = await this.createSession(undefined, model, undefined, executionPolicy);
-      if (result.error) {
-        return result;
-      }
-      session = this.sessionManager.current();
-    }
-
-    if (!session) {
-      return { error: 'Failed to get or create session' };
-    }
-
-    // Apply model override if provided
-    if (executionPolicy !== undefined && session.executionPolicy !== executionPolicy) {
-      if (session.status === 'busy') return { error: 'Cannot change execution policy while a session is busy' };
-      session.executionPolicy = executionPolicy;
-      await this.sessionManager.save();
-    }
-    if (model && session.model !== model) {
-      session.model = model;
-      this.sessionManager.save().catch(() => {});
-    }
-
+  private async sendPrompt(prompt: string, model?: string, executionPolicy?: ExecutionPolicy, workingDir?: string, sessionId?: string): Promise<{ data?: Record<string, unknown>; error?: string }> {
     try {
+      const session = await selectExecutionSession(this.sessionManager, { sessionId, workingDir, model, executionPolicy });
       const promptId = await submitPromptWithDelivery(session, prompt, {
         hooks: this.hookEngine,
         inbox: this.notificationInbox,
         forward: (notification) => this.forwardToTelegram(notification),
       });
-
       return { data: { promptId, sessionId: session.id } };
     } catch (error) {
       return { error: error instanceof Error ? error.message : 'Failed to send prompt' };
@@ -1477,7 +1433,8 @@ class Daemon {
     name?: string,
     goal?: string,
     model?: string,
-    executionPolicy: ExecutionPolicy = 'default'
+    executionPolicy: ExecutionPolicy = 'default',
+    workingDir?: string
   ): Promise<{ data?: Record<string, unknown>; error?: string }> {
     if (!prompt) return { error: 'Prompt is required' };
 
@@ -1487,7 +1444,7 @@ class Daemon {
         model,
         goal || prompt.slice(0, 100),
         true,
-        undefined,
+        workingDir,
         executionPolicy
       );
 
@@ -1554,72 +1511,20 @@ class Daemon {
     // In production, also write to log file
   }
 
-  private isProcessAlive(pid: number): boolean {
-    if (!Number.isInteger(pid) || pid <= 0) return false;
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
+  async cleanupFailedStart(): Promise<void> {
+    if (this.cleanupInterval) clearInterval(this.cleanupInterval);
+    await this.telegramBot.stop().catch(() => {});
+    this.orchestrationManager.stopHealthChecks();
+    if (this.server?.listening) {
+      for (const client of this.clients) client.destroy();
+      await new Promise<void>(resolve => this.server!.close(() => resolve()));
     }
-  }
-
-  private async acquireLock(): Promise<void> {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        await writeFile(this.config.lockFile, `${process.pid}\n`, { flag: 'wx' });
-        return;
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code !== 'EEXIST') throw error;
-
-        let existingPid = NaN;
-        try {
-          existingPid = parseInt(await readFile(this.config.lockFile, 'utf-8'), 10);
-        } catch {
-          // If the lock cannot be read, remove it once and retry.
-        }
-
-        if (this.isProcessAlive(existingPid)) {
-          console.error(`Daemon already running (lock held by PID: ${existingPid})`);
-          process.exit(1);
-        }
-
-        await unlink(this.config.lockFile).catch(() => {});
-      }
-    }
-
-    throw new Error('Failed to acquire daemon lock');
-  }
-
-  private async releaseLock(): Promise<void> {
-    try {
-      const lockPid = parseInt(await readFile(this.config.lockFile, 'utf-8'), 10);
-      if (lockPid === process.pid) {
-        await unlink(this.config.lockFile);
-      }
-    } catch {
-      // Ignore cleanup errors
-    }
-  }
-
-  private async cleanup(releaseLock = false): Promise<void> {
-    try {
-      if (existsSync(this.config.pidFile)) {
-        await unlink(this.config.pidFile);
-      }
-      if (existsSync(this.config.socketPath)) {
-        await unlink(this.config.socketPath);
-      }
-      if (releaseLock) {
-        await this.releaseLock();
-      }
-    } catch {
-      // Ignore cleanup errors
-    }
+    await this.instanceLock.release();
   }
 
   private async shutdown(): Promise<void> {
+    if (this.shuttingDown) return;
+    this.shuttingDown = true;
     this.log('Shutting down...');
 
     // Dispatch daemon.stopped hook (don't await - best effort)
@@ -1654,10 +1559,12 @@ class Daemon {
     await this.sessionManager.stopAll();
 
     // Close server
-    this.server?.close();
+    if (this.server?.listening) {
+      for (const client of this.clients) client.destroy();
+      await new Promise<void>(resolve => this.server!.close(() => resolve()));
+    }
 
-    // Clean up files
-    await this.cleanup(true);
+    await this.instanceLock.release();
 
     this.log('Daemon stopped');
     process.exit(0);
@@ -1666,7 +1573,8 @@ class Daemon {
 
 // Start daemon
 const daemon = new Daemon();
-daemon.start().catch((error) => {
+daemon.start().catch(async (error) => {
+  await daemon.cleanupFailedStart().catch(() => {});
   console.error('Failed to start daemon:', error);
   process.exit(1);
 });

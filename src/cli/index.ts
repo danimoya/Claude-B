@@ -554,7 +554,7 @@ USE CASES — when to reach for which group of commands:
         if (options.fire) {
           await fireAndForgetPrompt(client, prompt, options.goal, options.model, options.executionPolicy);
         } else {
-          await sendPrompt(client, prompt, options.model, options.executionPolicy);
+          await sendPrompt(client, prompt, options.model, options.executionPolicy, options.select);
         }
         return;
       }
@@ -635,7 +635,7 @@ async function detachSession(client: DaemonClient): Promise<void> {
 }
 
 async function createSession(client: DaemonClient, name?: string, model?: string, executionPolicy?: string): Promise<void> {
-  const result = await client.send({ method: 'session.create', params: { name, model, executionPolicy } });
+  const result = await client.send({ method: 'session.create', params: { name, model, executionPolicy, workingDir: process.cwd() } });
   client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
@@ -804,9 +804,9 @@ async function showLogs(): Promise<void> {
   else if (log.text) console.log(log.text);
 }
 
-async function sendPrompt(client: DaemonClient, prompt: string, model?: string, executionPolicy?: string): Promise<void> {
+async function sendPrompt(client: DaemonClient, prompt: string, model?: string, executionPolicy?: string, sessionId?: string): Promise<void> {
   console.log(chalk.gray('Sending prompt...'));
-  const result = await client.send({ method: 'prompt.send', params: { prompt, model, executionPolicy } });
+  const result = await client.send({ method: 'prompt.send', params: { prompt, model, executionPolicy, workingDir: process.cwd(), sessionId } });
   if (result.error) {
     console.error(chalk.red(result.error));
     client.close();
@@ -818,7 +818,7 @@ async function sendPrompt(client: DaemonClient, prompt: string, model?: string, 
   console.log(chalk.gray('Watching output (Ctrl+C to detach)...\n'));
 
   // Start watching for output immediately
-  await client.send({ method: 'session.watch' });
+  await client.send({ method: 'session.watch', params: { sessionId: data?.sessionId } });
 
   // Listen for status updates
   client.on('status', (statusData: { status: string; promptId?: string; error?: string }) => {
@@ -874,8 +874,7 @@ async function waitForDaemon(maxWaitMs = 5000): Promise<void> {
   for (let i = 0; i < maxAttempts; i++) {
     try {
       const testClient = new DaemonClient();
-      const result = await testClient.send({ method: 'status' });
-      testClient.close();
+      const result = await testClient.send({ method: 'daemon.status' }).finally(() => testClient.close());
       if (result.data) return;
     } catch {
       // Not ready yet
@@ -1227,7 +1226,7 @@ async function sendRemotePrompt(client: DaemonClient, hostId: string, prompt: st
 async function fireAndForgetPrompt(client: DaemonClient, prompt: string, goal?: string, model?: string, executionPolicy?: string): Promise<void> {
   const result = await client.send({
     method: 'prompt.fire',
-    params: { prompt, goal, model, executionPolicy }
+    params: { prompt, goal, model, executionPolicy, workingDir: process.cwd() }
   });
   client.close();
 

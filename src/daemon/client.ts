@@ -19,44 +19,66 @@ export class DaemonClient extends EventEmitter {
   private socket: Socket | null = null;
   private socketPath: string;
   private messageId = 0;
+  private connecting: Promise<Socket> | null = null;
+  private requestTimeoutMs: number;
   private pendingRequests: Map<number, {
     resolve: (value: DaemonResponse) => void;
     reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
   }> = new Map();
   private buffer = '';
 
-  constructor(socketPath?: string) {
+  constructor(socketPath?: string, requestTimeoutMs = 30000) {
     super();
     this.socketPath = socketPath || join(getDataDir(), 'daemon.sock');
+    this.requestTimeoutMs = requestTimeoutMs;
   }
 
-  private async connect(): Promise<Socket> {
-    if (this.socket?.writable) {
-      return this.socket;
-    }
+  private connect(): Promise<Socket> {
+    if (this.connecting) return this.connecting;
+    if (this.socket?.writable && !this.socket.destroyed) return Promise.resolve(this.socket);
 
-    return new Promise((resolve, reject) => {
-      const socket = createConnection(this.socketPath);
-
-      socket.on('connect', () => {
-        this.socket = socket;
+    const socket = createConnection(this.socketPath);
+    this.socket = socket;
+    this.buffer = '';
+    this.connecting = new Promise((resolve, reject) => {
+      const terminate = (error: Error) => {
+        if (this.socket === socket) {
+          this.socket = null;
+          this.connecting = null;
+          this.buffer = '';
+          this.rejectPending(error);
+          this.emit('close');
+        }
+        reject(error);
+      };
+      socket.once('connect', () => {
+        if (this.socket !== socket) {
+          socket.destroy();
+          reject(new Error('Daemon connection closed'));
+          return;
+        }
+        this.connecting = null;
         resolve(socket);
       });
-
       socket.on('data', (data) => {
-        this.handleData(data.toString());
+        if (this.socket === socket) this.handleData(data.toString());
       });
-
       socket.on('error', (error) => {
-        this.socket = null;
-        reject(error);
+        terminate(error);
+        socket.destroy();
       });
-
-      socket.on('close', () => {
-        this.socket = null;
-        this.emit('close');
-      });
+      socket.once('close', () => terminate(new Error('Daemon connection closed')));
     });
+    return this.connecting;
+  }
+
+  private rejectPending(error: Error): void {
+    for (const pending of this.pendingRequests.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pendingRequests.clear();
   }
 
   private handleData(data: string): void {
@@ -89,6 +111,7 @@ export class DaemonClient extends EventEmitter {
           const pending = this.pendingRequests.get(message.id);
           if (pending) {
             this.pendingRequests.delete(message.id);
+            clearTimeout(pending.timer);
             pending.resolve(message);
           }
         }
@@ -100,26 +123,26 @@ export class DaemonClient extends EventEmitter {
 
   async send(message: DaemonMessage): Promise<DaemonResponse> {
     const socket = await this.connect();
+    if (this.socket !== socket || !socket.writable || socket.destroyed) throw new Error('Daemon connection closed');
     const id = ++this.messageId;
+    const payload = JSON.stringify({ ...message, id }) + '\n';
 
     return new Promise((resolve, reject) => {
-      this.pendingRequests.set(id, { resolve, reject });
-
-      const payload = JSON.stringify({ ...message, id }) + '\n';
-      socket.write(payload, (error) => {
-        if (error) {
-          this.pendingRequests.delete(id);
-          reject(error);
-        }
-      });
-
-      // Timeout after 30 seconds
-      setTimeout(() => {
-        if (this.pendingRequests.has(id)) {
-          this.pendingRequests.delete(id);
-          reject(new Error('Request timeout'));
-        }
-      }, 30000);
+      const fail = (error: Error) => {
+        const pending = this.pendingRequests.get(id);
+        if (!pending) return;
+        this.pendingRequests.delete(id);
+        clearTimeout(pending.timer);
+        reject(error);
+      };
+      const timer = setTimeout(() => fail(new Error('Request timeout')), this.requestTimeoutMs);
+      timer.unref();
+      this.pendingRequests.set(id, { resolve, reject, timer });
+      try {
+        socket.write(payload, (error) => { if (error) fail(error); });
+      } catch (error) {
+        fail(error instanceof Error ? error : new Error(String(error)));
+      }
     });
   }
 
@@ -199,7 +222,12 @@ export class DaemonClient extends EventEmitter {
   }
 
   close(): void {
-    this.socket?.end();
+    const socket = this.socket;
     this.socket = null;
+    this.connecting = null;
+    this.buffer = '';
+    this.rejectPending(new Error('Daemon client closed'));
+    socket?.destroy();
+    if (socket) this.emit('close');
   }
 }

@@ -75,19 +75,19 @@ export async function checkStdinArtifact() {
     const prompt = '  --help is literal input\n"quoted" $(literal) été ✓\n\n';
     let result = await run(['--model', 'fixture-model'], prompt);
     assert.deepEqual(result.requests.find(r => r.method === 'prompt.send')?.params,
-      { prompt, model: 'fixture-model' });
+      { prompt, model: 'fixture-model', workingDir: process.cwd() });
 
     result = await run(['-x', 'target-session', '-m', 'fixture-model'], prompt);
     assert.equal(result.requests[0]?.method, 'session.select');
     assert.deepEqual(result.requests[0]?.params, { sessionId: 'target-session' });
-    assert.deepEqual(result.requests[1]?.params, { prompt, model: 'fixture-model' });
+    assert.deepEqual(result.requests[1]?.params, { prompt, model: 'fixture-model', workingDir: process.cwd(), sessionId: 'target-session' });
 
     result = await run(['-x', 'target-session']);
     assert.deepEqual(result.requests.map(r => r.method), ['session.select']);
 
     result = await run(['-f', '-m', 'fixture-model', '--goal', 'fixture-goal'], prompt);
     assert.deepEqual(result.requests.find(r => r.method === 'prompt.fire')?.params,
-      { prompt, model: 'fixture-model', goal: 'fixture-goal' });
+      { prompt, model: 'fixture-model', goal: 'fixture-goal', workingDir: process.cwd() });
 
     result = await run(['--remote', 'fixture-host'], prompt);
     assert.deepEqual(result.requests.find(r => r.method === 'orchestration.prompt')?.params,
