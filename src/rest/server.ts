@@ -22,6 +22,7 @@ import { createDeliveryOutbox } from '../notifications/delivery.js';
 import { Session } from '../session/session.js';
 import { isTerminalTask } from '../jobs/store.js';
 import type { TaskRecord } from '../jobs/types.js';
+import type { TranscriptTurn } from '../utils/transcript.js';
 
 export interface RestServerOptions {
   host: string;
@@ -38,6 +39,7 @@ export interface RestServerOptions {
   // transcriptPath. Daemon uses this to cache tmux session → transcript
   // mappings for the voice pipeline's context lookup.
   onTmuxTranscript?: (sessionId: string, transcriptPath: string) => void;
+  onTmuxContext?: (sessionId: string, turns: TranscriptTurn[]) => void | Promise<void>;
   // Optional hook invoked by /api/notify when the payload carries an `agent`
   // field (e.g. "codex"). Daemon uses this to register non-Claude tmux panes
   // so they surface in the Telegram /sessions list.
@@ -53,6 +55,7 @@ export class RestServer {
   private orchestrationManager: OrchestrationManager | null;
   private authManager: AuthManager;
   private onTmuxTranscript: ((sessionId: string, transcriptPath: string) => void) | null;
+  private onTmuxContext: ((sessionId: string, turns: TranscriptTurn[]) => void | Promise<void>) | null;
   private onTmuxSession: ((sessionId: string, sessionName: string | undefined, agent: string, goal: string | undefined) => string | void | Promise<string | void>) | null;
   private host: string;
   private port: number;
@@ -87,6 +90,7 @@ export class RestServer {
     this.telegramBot = options.telegramBot || null;
     this.orchestrationManager = options.orchestrationManager || null;
     this.onTmuxTranscript = options.onTmuxTranscript || null;
+    this.onTmuxContext = options.onTmuxContext || null;
     this.onTmuxSession = options.onTmuxSession || null;
     this.authManager = new AuthManager(options.configDir);
     this.ownsOutbox = !options.notificationOutbox;
@@ -191,7 +195,8 @@ export class RestServer {
         this.onTmuxTranscript,
         this.onTmuxSession,
         this.hookEngine,
-        this.notificationOutbox
+        this.notificationOutbox,
+        this.onTmuxContext
       );
 
     // Register orchestration routes if manager is available

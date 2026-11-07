@@ -101,14 +101,14 @@ describe('Telegram private chat authorization', () => {
     expect(bot.configManager.getPendingPrompt('123', 'pending')).toBeUndefined();
   });
 
-  it('retains a pending prompt after a failed submission and permits an explicit retry', async () => {
+  it('retains an uncertain submission for review without replaying a failed callback', async () => {
     pending();
     onPrompt.mockRejectedValueOnce(new Error('provider unavailable'));
     await bot.handleCallback(callback('confirm:pending'));
     expect(bot.configManager.getPendingPrompt('123', 'pending')).toBeDefined();
     await bot.handleCallback(callback('confirm:pending'));
-    expect(onPrompt).toHaveBeenCalledTimes(2);
-    expect(bot.configManager.getPendingPrompt('123', 'pending')).toBeUndefined();
+    expect(onPrompt).toHaveBeenCalledTimes(1);
+    expect(bot.configManager.getPendingPrompt('123', 'pending')?.state).toBe('uncertain');
   });
 
   it('does not submit an old prompt while an edit is pending', async () => {

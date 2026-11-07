@@ -4,10 +4,11 @@ loadEnv();
 
 import { createServer, Server, Socket } from 'net';
 import { nanoid } from 'nanoid';
-import { spawn, spawnSync } from 'child_process';
 import { SessionManager } from './session-manager.js';
 import { DaemonInstanceLock } from './instance-lock.js';
 import { selectExecutionSession } from './execution-context.js';
+import { TmuxRegistry } from './tmux-registry.js';
+import { readLastTurnsFromTranscript, type TranscriptTurn } from '../utils/transcript.js';
 import { Session, type ExecutionPolicy } from '../session/session.js';
 import { TERMINAL_TASK_STATUSES, type TaskRecord, type TaskSubmission } from '../jobs/types.js';
 import { submitPromptWithDelivery } from './prompt-delivery.js';
@@ -40,6 +41,8 @@ class Daemon {
   private server: Server | null = null;
   private config: DaemonConfig;
   private instanceLock: DaemonInstanceLock;
+  private tmuxRegistry: TmuxRegistry;
+  private tmuxInlineContext = new Map<string, { turns: TranscriptTurn[]; lastSeen: number }>();
   private shuttingDown = false;
   private sessionManager: SessionManager;
   private hookEngine: HookEngine;
@@ -56,19 +59,12 @@ class Daemon {
     port: parseInt(process.env.CB_REST_PORT || process.env.REST_PORT || '3847', 10)
   };
 
-  // Maps virtual tmux session ids ("tmux:general:1.0") → Claude Code transcript
+  // Maps canonical native invocation IDs to bounded transcript context.
   // path, populated by the cb-notify.sh hook via /api/notify. Used by the
   // voice pipeline's context lookup so `optimizePrompt` knows what the pane
   // was just working on. In-memory only, 24h TTL.
   private tmuxTranscriptCache = new Map<string, { transcriptPath: string; lastSeen: number }>();
   private static readonly TMUX_TRANSCRIPT_TTL_MS = 24 * 60 * 60 * 1000;
-
-  // Registry of Codex-backed tmux sessions, populated from /api/notify
-  // (codex-notify.sh sends `agent: "codex"`). Claude panes are discovered
-  // directly from tmux by `pane_current_command`, but Codex panes report
-  // `node`, so the daemon can only learn of them from these POSTs. Entries are
-  // listed in /sessions while their pane is still alive; pruned otherwise.
-  private codexTmuxSessions = new Map<string, { name?: string; goal?: string; lastSeen: number }>();
 
   constructor() {
     const configDir = getDataDir();
@@ -80,6 +76,7 @@ class Daemon {
       configDir
     };
     this.instanceLock = new DaemonInstanceLock(configDir);
+    this.tmuxRegistry = new TmuxRegistry({ stateFile: `${configDir}/tmux-registry.json` });
     this.sessionManager = new SessionManager(configDir);
     this.hookEngine = new HookEngine(configDir);
     this.orchestrationManager = new OrchestrationManager(configDir);
@@ -92,14 +89,11 @@ class Daemon {
         const data = result.data as { sessionId: string; name?: string };
         return { sessionId: data.sessionId, name: data.name };
       },
-      onPrompt: async (sessionId: string, prompt: string) => {
-        // Virtual tmux-backed session: sessionId is "tmux:<target>" where
-        // <target> is a tmux target string like "general:1.0".
-        // Replies to notifications from external Claude Code panes land here;
-        // we type the reply directly into the pane via tmux send-keys.
+      onPrompt: async (sessionId: string, prompt: string, options?: { idempotencyKey?: string }) => {
+        // Native replies require the same verified foreground invocation.
         if (sessionId.startsWith('tmux:')) {
-          const target = sessionId.slice('tmux:'.length);
-          await this.sendToTmuxPane(target, prompt);
+          await this.tmuxRegistry.send(sessionId, prompt);
+          await this.tmuxRegistry.flush();
           return;
         }
 
@@ -107,28 +101,22 @@ class Daemon {
         if (!session) throw new Error('Session not found');
         this.sessionManager.select(sessionId);
 
-        await submitPromptWithDelivery(session, prompt, {
+        const taskId = await submitPromptWithDelivery(session, prompt, {
           outbox: this.notificationOutbox,
           hooks: this.hookEngine,
           inbox: this.notificationInbox,
           forward: (notification) => this.forwardToTelegram(notification),
-        });
+        }, options);
+        return { taskId };
       },
       onExecutionPolicy: async (sessionId, policy) => {
         await this.sessionManager.setExecutionPolicy(sessionId, policy);
       },
-      getSessions: () => {
-        const claudePanes = this.listTmuxClaudePanes();
-        const claudeIds = new Set(claudePanes.map((p) => p.id));
-        // Codex panes are deduped against Claude panes by id (a given target is
-        // only ever one or the other, but guard anyway).
-        const codexPanes = this.listCodexTmuxPanes().filter((p) => !claudeIds.has(p.id));
-        return [
-          ...this.sessionManager.list(),
-          ...claudePanes,
-          ...codexPanes,
-        ];
+      getPromptReceipt: async (key) => {
+        const task = await this.sessionManager.getTaskStore().findByIdempotencyKey(key);
+        return task ? { taskId: task.id } : undefined;
       },
+      getSessions: () => [...this.sessionManager.list(), ...this.tmuxRegistry.discover()],
       getInboxCount: () => this.notificationInbox.count(),
       getSessionContext: (sessionId: string) => {
         // tmux-hosted session: resolve from the cached transcript populated
@@ -179,6 +167,7 @@ class Daemon {
 
     // Load sessions, hooks, and orchestration
     await this.sessionManager.load();
+    await this.tmuxRegistry.restore();
     await this.hookEngine.load();
     await this.orchestrationManager.load();
     this.orchestrationManager.startHealthChecks();
@@ -672,8 +661,12 @@ class Daemon {
         configDir: this.config.configDir,
         onTmuxTranscript: (sessionId, transcriptPath) =>
           this.rememberTmuxTranscript(sessionId, transcriptPath),
-        onTmuxSession: (sessionId, sessionName, agent, goal) =>
-          this.rememberCodexTmuxSession(sessionId, sessionName, agent, goal),
+        onTmuxSession: async (sessionId, sessionName, agent, goal) => {
+          const canonical = this.tmuxRegistry.register(sessionId, sessionName, agent, goal);
+          if (canonical) await this.tmuxRegistry.flush();
+          return canonical;
+        },
+        onTmuxContext: (sessionId, turns) => this.rememberTmuxContext(sessionId, turns),
       });
 
       const address = await this.restServer.start();
@@ -1079,354 +1072,42 @@ class Daemon {
     };
   }
 
-  /**
-   * Enumerate live tmux panes that are running `claude` and expose them
-   * as virtual sessions so they show up in the Telegram /sessions list and
-   * are targetable by /select.
-   *
-   * Virtual session id = "tmux:<session:window.pane>" — the same opaque
-   * identifier format used by the Stop hook's /api/notify payloads, so the
-   * Telegram bot's existing sessionMap (for reply-to-notification routing)
-   * and the /select handler line up with zero changes.
-   *
-   * Status is inferred from the first glyph of the pane title — Claude Code
-   * uses `✳` when idle/waiting and a braille spinner char (`⠂⠄⠠⠐⠈⠁⠃⠇`…)
-   * while working. Anything that isn't `✳` is treated as busy.
-   */
-  private listTmuxClaudePanes(): Array<{
-    id: string;
-    name: string;
-    status: string;
-    selected: boolean;
-    createdAt: string;
-    goal?: string;
-  }> {
-    try {
-      const out = spawnSync(
-        'tmux',
-        ['list-panes', '-a', '-F', '#{session_name}:#{window_index}.#{pane_index}|#{pane_current_command}|#{pane_title}'],
-        { encoding: 'utf8', timeout: 2000 }
-      );
-      if (out.status !== 0 || !out.stdout) return [];
-
-      const panes: ReturnType<Daemon['listTmuxClaudePanes']> = [];
-      for (const line of out.stdout.split('\n')) {
-        if (!line) continue;
-        const [target, cmd, rawTitle] = line.split('|', 3);
-        if (cmd !== 'claude') continue;
-
-        const title = (rawTitle || '').trim();
-        // First grapheme is the busy/idle glyph; everything after is the slug.
-        // We split on the first space after the glyph.
-        const spaceIdx = title.indexOf(' ');
-        const glyph = spaceIdx >= 0 ? title.slice(0, spaceIdx) : title;
-        const slug = spaceIdx >= 0 ? title.slice(spaceIdx + 1) : '';
-        const status = glyph === '✳' ? 'idle' : 'busy';
-
-        panes.push({
-          id: `tmux:${target}`,
-          name: title ? `${target} ${title}` : target,
-          status,
-          selected: false,
-          createdAt: '', // unknown for external panes
-          goal: slug || undefined,
-        });
-      }
-      return panes;
-    } catch {
-      return [];
-    }
-  }
-
-  /**
-   * Record a tmux session → Claude Code transcript mapping. Called from
-   * /api/notify when the cb-notify.sh hook forwards a Stop event with a
-   * transcriptPath. Prunes entries older than TMUX_TRANSCRIPT_TTL_MS.
-   */
   private rememberTmuxTranscript(sessionId: string, transcriptPath: string): void {
     if (!sessionId.startsWith('tmux:') || !transcriptPath) return;
-    const now = Date.now();
-    this.tmuxTranscriptCache.set(sessionId, { transcriptPath, lastSeen: now });
-
-    // Opportunistic TTL prune — cheap, runs at write time.
-    for (const [key, entry] of this.tmuxTranscriptCache) {
-      if (now - entry.lastSeen > Daemon.TMUX_TRANSCRIPT_TTL_MS) {
-        this.tmuxTranscriptCache.delete(key);
-      }
+    this.tmuxTranscriptCache.delete(sessionId);
+    this.tmuxTranscriptCache.set(sessionId, { transcriptPath, lastSeen: Date.now() });
+    for (const [id, cached] of this.tmuxTranscriptCache) {
+      if (Date.now() - cached.lastSeen > Daemon.TMUX_TRANSCRIPT_TTL_MS || this.tmuxTranscriptCache.size > 500) this.tmuxTranscriptCache.delete(id);
     }
   }
 
-  /**
-   * Record a Codex tmux session seen via /api/notify. Called when the payload
-   * carries `agent: "codex"`. Unlike Claude panes (enumerated from tmux), Codex
-   * panes report `node` as their current command, so this registry is the only
-   * way the daemon learns about them for the /sessions list.
-   */
-  private rememberCodexTmuxSession(
-    sessionId: string,
-    sessionName: string | undefined,
-    agent: string,
-    goal: string | undefined
-  ): void {
-    if (agent !== 'codex' || !sessionId.startsWith('tmux:')) return;
-    const now = Date.now();
-    this.codexTmuxSessions.set(sessionId, {
-      name: sessionName,
-      goal: goal ? goal.split('/').filter(Boolean).pop() : undefined,
-      lastSeen: now,
-    });
-
-    // Opportunistic TTL prune.
-    for (const [key, entry] of this.codexTmuxSessions) {
-      if (now - entry.lastSeen > Daemon.TMUX_TRANSCRIPT_TTL_MS) {
-        this.codexTmuxSessions.delete(key);
-      }
+  private rememberTmuxContext(sessionId: string, turns: TranscriptTurn[]): void {
+    if (!sessionId.startsWith('tmux:')) return;
+    this.tmuxInlineContext.delete(sessionId);
+    this.tmuxInlineContext.set(sessionId, { lastSeen: Date.now(), turns: turns.slice(-6).map(turn => ({ role: turn.role, text: turn.text.slice(0, 600) })) });
+    for (const [id, cached] of this.tmuxInlineContext) {
+      if (Date.now() - cached.lastSeen > Daemon.TMUX_TRANSCRIPT_TTL_MS || this.tmuxInlineContext.size > 500) this.tmuxInlineContext.delete(id);
     }
   }
 
-  /**
-   * Enumerate registered Codex tmux sessions whose pane is still alive, as
-   * virtual sessions for the Telegram /sessions list. Liveness is confirmed
-   * against the current set of tmux targets (one cheap `tmux list-panes -a`);
-   * dead entries are pruned from the registry. Status is always reported as
-   * "idle" — Codex only notifies at turn boundaries, so the daemon has no
-   * busy/idle signal between turns the way Claude's pane-title glyph provides.
-   */
-  private listCodexTmuxPanes(): Array<{
-    id: string;
-    name: string;
-    status: string;
-    selected: boolean;
-    createdAt: string;
-    goal?: string;
-  }> {
-    if (this.codexTmuxSessions.size === 0) return [];
-
-    // Build the set of live tmux targets so we don't list panes that have
-    // since closed. Targets only — cheaper than pulling command/title.
-    const live = new Set<string>();
-    try {
-      const out = spawnSync(
-        'tmux',
-        ['list-panes', '-a', '-F', '#{session_name}:#{window_index}.#{pane_index}'],
-        { encoding: 'utf8', timeout: 2000 }
-      );
-      if (out.status === 0 && out.stdout) {
-        for (const line of out.stdout.split('\n')) {
-          if (line) live.add(line.trim());
-        }
-      }
-    } catch {
-      // tmux unavailable — fall through, registry entries simply won't list
+  private buildTmuxSessionContext(sessionId: string) {
+    const pane = this.tmuxRegistry.aliveSessions().find(entry => entry.id === sessionId);
+    if (!pane) {
+      this.tmuxTranscriptCache.delete(sessionId);
+      this.tmuxInlineContext.delete(sessionId);
+      return undefined;
     }
-
-    const sessions: ReturnType<Daemon['listCodexTmuxPanes']> = [];
-    for (const [id, entry] of this.codexTmuxSessions) {
-      const target = id.slice('tmux:'.length);
-      if (!live.has(target)) {
-        this.codexTmuxSessions.delete(id); // pane closed — forget it
-        continue;
-      }
-      sessions.push({
-        id,
-        name: entry.name || `${target} codex`,
-        status: 'idle',
-        selected: false,
-        createdAt: '',
-        goal: entry.goal,
-      });
-    }
-    return sessions;
-  }
-
-  /**
-   * Build a SessionContext for a tmux-hosted session so the Telegram voice
-   * pipeline can ground `optimizePrompt` with real conversation history.
-   *
-   * Looks up the cached transcript, pulls the pane's current name/goal/status
-   * from a fresh tmux enumeration, and walks the JSONL backwards to extract
-   * the last N real user↔assistant turn pairs. Tool-result wrappers
-   * (<task-notification>, <system-reminder>, tool_result content arrays) are
-   * filtered out — they'd just confuse the optimizer with internal noise.
-   */
-  private buildTmuxSessionContext(sessionId: string): {
-    sessionName?: string;
-    goal?: string;
-    lastOutput: string;
-    status: string;
-  } | undefined {
-    const target = sessionId.slice('tmux:'.length);
-
-    // Find the current pane entry for labels/status. If the pane has gone
-    // away we still return context from the transcript if we have one.
-    const panes = this.listTmuxClaudePanes();
-    const pane = panes.find((p) => p.id === sessionId);
-    // Codex panes aren't in the Claude enumeration — fall back to the registry
-    // populated from /api/notify for their label/goal.
-    const codex = pane ? undefined : this.codexTmuxSessions.get(sessionId);
-
-    const cached = this.tmuxTranscriptCache.get(sessionId);
-    if (!cached && !pane && !codex) return undefined;
-
     let lastOutput = '';
-    if (cached) {
-      try {
-        lastOutput = this.readLastTurnsFromTranscript(cached.transcriptPath, 3);
-      } catch {
-        // transcript file moved/rotated — drop the cache entry so we don't
-        // keep retrying a dead path
-        this.tmuxTranscriptCache.delete(sessionId);
-      }
+    const transcript = this.tmuxTranscriptCache.get(sessionId);
+    if (transcript && Date.now() - transcript.lastSeen <= Daemon.TMUX_TRANSCRIPT_TTL_MS) {
+      try { lastOutput = readLastTurnsFromTranscript(transcript.transcriptPath, 3); }
+      catch { this.tmuxTranscriptCache.delete(sessionId); }
     }
-
-    return {
-      sessionName: pane?.name || codex?.name || target,
-      goal: pane?.goal ?? codex?.goal,
-      lastOutput,
-      status: pane?.status || (codex ? 'idle' : 'unknown'),
-    };
-  }
-
-  /**
-   * Read the last `turns` user↔assistant exchanges from a Claude Code OR
-   * Codex transcript JSONL file and render them as a compact text block that
-   * can be handed to `optimizePrompt`.
-   *
-   * Two on-disk formats are supported (detected per-line, so a mixed file is
-   * harmless):
-   *  Claude Code:
-   *   - a "real" user message has `.message.content` as a string and does
-   *     NOT start with "<" (a <task-notification>/<system-reminder> wrapper)
-   *   - an assistant message is `.type == "assistant"`; join `content[]` items
-   *     where `type == "text"`
-   *  Codex rollout:
-   *   - `.type == "event_msg"` with `.payload.type == "user_message"` →
-   *     `.payload.message` (string); skip `<…>` env-context wrappers
-   *   - `.type == "event_msg"` with `.payload.type == "agent_message"` →
-   *     `.payload.message` (string)
-   *
-   * Each captured turn is trimmed to ~600 chars so the total output stays well
-   * under the 2000-char budget the bot already uses.
-   */
-  private readLastTurnsFromTranscript(path: string, turns: number): string {
-    const fs = require('fs') as typeof import('fs');
-    const raw = fs.readFileSync(path, 'utf8');
-    const lines = raw.split('\n').filter((l) => l.length > 0);
-
-    type Turn = { role: 'user' | 'assistant'; text: string };
-    const collected: Turn[] = [];
-
-    // Walk backwards — most recent first. Stop once we have `turns` user
-    // messages AND `turns` assistant messages (or run out of file).
-    let userCount = 0;
-    let assistantCount = 0;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (userCount >= turns && assistantCount >= turns) break;
-
-      let parsed: Record<string, unknown>;
-      try {
-        parsed = JSON.parse(lines[i]);
-      } catch {
-        continue;
-      }
-
-      const type = parsed.type as string | undefined;
-      if (!type) continue;
-
-      // ── Codex rollout format ──────────────────────────────────────────
-      if (type === 'event_msg') {
-        const payload = parsed.payload as { type?: string; message?: unknown } | undefined;
-        if (!payload || typeof payload.message !== 'string') continue;
-        if (payload.type === 'user_message' && userCount < turns) {
-          const trimmed = payload.message.trim();
-          if (!trimmed || trimmed.startsWith('<')) continue; // skip env-context wrappers
-          collected.push({ role: 'user', text: trimmed.slice(0, 600) });
-          userCount++;
-        } else if (payload.type === 'agent_message' && assistantCount < turns) {
-          const trimmed = payload.message.trim();
-          if (!trimmed) continue;
-          collected.push({ role: 'assistant', text: trimmed.slice(0, 600) });
-          assistantCount++;
-        }
-        continue;
-      }
-
-      // ── Claude Code format ────────────────────────────────────────────
-      const message = parsed.message as { role?: string; content?: unknown } | undefined;
-      if (!message) continue;
-
-      if (type === 'user' && userCount < turns) {
-        const content = message.content;
-        if (typeof content !== 'string') continue; // skip tool_result arrays
-        const trimmed = content.trim();
-        if (!trimmed || trimmed.startsWith('<')) continue; // skip wrappers
-        collected.push({ role: 'user', text: trimmed.slice(0, 600) });
-        userCount++;
-      } else if (type === 'assistant' && assistantCount < turns) {
-        const content = message.content;
-        if (!Array.isArray(content)) continue;
-        const text = (content as Array<{ type?: string; text?: string }>)
-          .filter((block) => block.type === 'text' && typeof block.text === 'string')
-          .map((block) => (block.text as string).trim())
-          .filter((t) => t.length > 0)
-          .join('\n');
-        if (!text) continue;
-        collected.push({ role: 'assistant', text: text.slice(0, 600) });
-        assistantCount++;
-      }
+    const inline = this.tmuxInlineContext.get(sessionId);
+    if (!lastOutput && inline && Date.now() - inline.lastSeen <= Daemon.TMUX_TRANSCRIPT_TTL_MS) {
+      lastOutput = inline.turns.map(turn => `${turn.role.toUpperCase()}: ${turn.text}`).join('\n\n');
     }
-
-    // Reverse to chronological order and format.
-    collected.reverse();
-    return collected
-      .map((turn) => (turn.role === 'user' ? `USER: ${turn.text}` : `ASSISTANT: ${turn.text}`))
-      .join('\n\n');
-  }
-
-  /**
-   * Type a prompt into an external Claude Code pane via tmux send-keys.
-   * Used when Telegram replies target a "tmux:<target>" virtual session ID.
-   *
-   * Uses `send-keys -l` so the text is sent literally (no key-name expansion,
-   * no risk of a stray "Enter" in the middle of a prompt), followed by a
-   * separate Enter to submit. This is the equivalent of pasting + pressing
-   * Return inside the pane.
-   */
-  private async sendToTmuxPane(target: string, text: string): Promise<void> {
-    // Accept only sane tmux targets — session:window.pane style. Reject
-    // anything containing shell metacharacters to avoid process injection
-    // even though we're using argv (defense in depth).
-    if (!/^[A-Za-z0-9_./:%@+-]+$/.test(target)) {
-      throw new Error(`Invalid tmux target: ${target}`);
-    }
-
-    const runTmux = (args: string[], stdin?: string) => new Promise<void>((resolve, reject) => {
-      const proc = spawn('tmux', args, {
-        stdio: [stdin !== undefined ? 'pipe' : 'ignore', 'ignore', 'pipe'],
-      });
-      let stderr = '';
-      proc.stderr?.on('data', (c: Buffer) => { stderr += c.toString(); });
-      proc.on('error', reject);
-      proc.on('exit', (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(`tmux exited ${code}: ${stderr.trim()}`));
-      });
-      if (stdin !== undefined) proc.stdin?.end(stdin);
-    });
-
-    // Stage the text in a tmux paste buffer, then paste it with bracketed-
-    // paste markers (-p). Claude Code's TUI uses the explicit start/end
-    // markers to finalize the [Pasted N lines] block deterministically.
-    // Using send-keys -l instead races: characters arrive fast, the TUI
-    // detects a paste heuristically, and the trailing Enter can land
-    // inside the paste-settle window — pasted content visible, never
-    // submitted. The settle delay below covers any residual lag before
-    // Enter submits the input.
-    const bufferName = `cb-${process.pid}-${Date.now()}`;
-    await runTmux(['load-buffer', '-b', bufferName, '-'], text);
-    await runTmux(['paste-buffer', '-p', '-d', '-b', bufferName, '-t', target]);
-    await new Promise((r) => setTimeout(r, 150));
-    await runTmux(['send-keys', '-t', target, 'Enter']);
+    return { sessionName: pane.name, goal: pane.goal, status: pane.status, lastOutput: lastOutput.slice(-2000) };
   }
 
   private forwardToTelegram(notification: {
@@ -1574,6 +1255,7 @@ class Daemon {
     await remoteStopped;
     await sessionsStopped;
     await settle('Notification shutdown', this.notificationOutbox.stop());
+    await settle('Native session identity persistence', this.tmuxRegistry.flush());
     await settle('IPC shutdown', serverClosed);
     await settle('Daemon ownership cleanup', this.instanceLock.release());
     this.log('Daemon stopped');

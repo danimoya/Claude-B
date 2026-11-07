@@ -95,7 +95,7 @@ describe('Telegram scoped routing and voice editing', () => {
     await bot.handleCallback(callback(123, 'confirm:77'));
     await bot.handleCallback(callback(123, 'confirm:77'));
     expect(onPrompt).toHaveBeenCalledOnce();
-    expect(onPrompt).toHaveBeenCalledWith('session-123', 'edited literal prompt');
+    expect(onPrompt).toHaveBeenCalledWith('session-123', 'edited literal prompt', { idempotencyKey: 'telegram:123:77' });
   });
 
   it('keeps a failed edit pending and prevents stale confirmation until the edit is retried', async () => {
@@ -109,7 +109,7 @@ describe('Telegram scoped routing and voice editing', () => {
     await bot.handleMessage(message(123, 'new prompt'));
     await bot.handleCallback(callback(123, 'confirm:77'));
     expect(onPrompt).toHaveBeenCalledOnce();
-    expect(onPrompt).toHaveBeenCalledWith('session-123', 'new prompt');
+    expect(onPrompt).toHaveBeenCalledWith('session-123', 'new prompt', { idempotencyKey: 'telegram:123:77' });
   });
 
   it('does not block another chat with the same pending message ID during confirmation', async () => {

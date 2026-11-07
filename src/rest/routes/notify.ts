@@ -5,11 +5,13 @@ import { NotificationInbox, type NotificationInput } from '../../notifications/i
 import { NotificationConflictError, type NotificationOutbox } from '../../notifications/outbox.js';
 import { HookEngine } from '../../hooks/engine.js';
 import { randomUUID } from 'node:crypto';
+import type { TranscriptTurn } from '../../utils/transcript.js';
 
 // Payload accepted from external hook scripts (e.g. Claude Code Stop hook
 // running inside a tmux pane). The pane reports its own completion — Claude-B
 // dispatches it to hooks and the inbox, with optional Telegram delivery.
 interface NotifyBody {
+  contextTurns?: TranscriptTurn[];
   eventId?: string;
   sessionId: string;         // opaque; use "tmux:<target>" for tmux-hosted sessions
   sessionName?: string;      // human label, e.g. "dimensigon:1.0 ✳ Investigate repository"
@@ -44,7 +46,8 @@ export async function registerNotifyRoutes(
   onTmuxTranscript: ((sessionId: string, transcriptPath: string) => void) | null,
   onTmuxSession: ((sessionId: string, sessionName: string | undefined, agent: string, goal: string | undefined) => string | void | Promise<string | void>) | null,
   hookEngine: HookEngine | null = null,
-  outbox: NotificationOutbox | null = null
+  outbox: NotificationOutbox | null = null,
+  onTmuxContext: ((sessionId: string, turns: TranscriptTurn[]) => void | Promise<void>) | null = null
 ): Promise<void> {
 
   app.post<{ Body: NotifyBody }>('/api/notify', {
@@ -64,6 +67,12 @@ export async function registerNotifyRoutes(
           resultPreview: { type: 'string' },
           transcriptPath:{ type: 'string' },
           agent:         { type: 'string' },
+          contextTurns: { type: 'array', maxItems: 6, items: {
+            type: 'object', additionalProperties: false, required: ['role', 'text'], properties: {
+              role: { type: 'string', enum: ['user', 'assistant'] },
+              text: { type: 'string', minLength: 1, maxLength: 600 }
+            }
+          } },
         },
       },
     },
@@ -105,6 +114,10 @@ export async function registerNotifyRoutes(
     }
     if (body.transcriptPath && onTmuxTranscript) {
       try { await onTmuxTranscript(notif.sessionId, body.transcriptPath); } catch { /* non-fatal */ }
+    }
+
+    if (body.contextTurns?.length && onTmuxContext) {
+      try { await onTmuxContext(notif.sessionId, body.contextTurns); } catch { /* context caching is optional */ }
     }
 
     if (outbox) {

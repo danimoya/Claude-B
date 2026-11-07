@@ -15,6 +15,7 @@ describe('external notifications', () => {
   let engine: HookEngine;
   let inbox: NotificationInbox;
   const transcript = vi.fn();
+  const context = vi.fn();
   const session = vi.fn();
   const broadcast = vi.fn();
 
@@ -36,7 +37,7 @@ describe('external notifications', () => {
     server = new RestServer({
       host: '127.0.0.1', port: 0, configDir: dir,
       sessionManager: new SessionManager(dir), hookEngine: engine,
-      notificationInbox: inbox, onTmuxTranscript: transcript, onTmuxSession: session,
+      notificationInbox: inbox, onTmuxTranscript: transcript, onTmuxSession: session, onTmuxContext: context,
       telegramBot: online === undefined ? undefined : {
         isRunning: () => online,
         broadcastNotification: broadcast,
@@ -190,6 +191,34 @@ describe('external notifications', () => {
     expect(transcript).toHaveBeenCalledWith('tmux:%42@1234', '/fixture/transcript');
     expect((await inbox.getAll())[0].sessionId).toBe('tmux:%42@1234');
     expect(engine.getEventHistory()[0].payload).toMatchObject({ sessionId: 'tmux:%42@1234' });
+  });
+
+  it('accepts bounded visible context only after authentication and pane identity normalization', async () => {
+    await initialize();
+    session.mockResolvedValueOnce('tmux:%42@1234');
+    const turns = [{ role: 'user', text: 'Question' }, { role: 'assistant', text: 'Answer' }];
+    expect((await notify({ sessionId: 'tmux:project:1.0', agent: 'opencode', contextTurns: turns })).statusCode).toBe(200);
+    expect(context).toHaveBeenCalledWith('tmux:%42@1234', turns);
+    context.mockClear();
+    expect((await notify({ sessionId: 'tmux:project:1.0', contextTurns: turns }, 'wrong')).statusCode).toBe(401);
+    expect(context).not.toHaveBeenCalled();
+    for (const contextTurns of [Array.from({ length: 7 }, () => turns[0]), [{ role: 'tool', text: 'hidden' }], [{ role: 'assistant', text: 'x'.repeat(601) }]]) {
+      expect((await notify({ sessionId: 'tmux:project:1.0', contextTurns })).statusCode).toBe(400);
+    }
+    expect(context).not.toHaveBeenCalled();
+  });
+
+  it('deadletters a terminal HTTP 400 subscriber without retrying it through the outer outbox', async () => {
+    await initialize();
+    await engine.addWebhook('prompt.completed', 'https://reject.invalid', { retries: 0 });
+    const receiver = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response('bad payload', { status: 400 }));
+    try {
+      expect((await notify({ sessionId: 'external', eventId: 'permanent-rejection' })).statusCode).toBe(200);
+      await server.getNotificationOutbox().drain(true);
+      expect(receiver).toHaveBeenCalledOnce();
+      expect((await server.getNotificationOutbox().list())[0]).toMatchObject({ failed: ['hooks'] });
+      expect(await inbox.getAll()).toHaveLength(1);
+    } finally { receiver.mockRestore(); }
   });
 
 });
