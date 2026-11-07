@@ -1,81 +1,58 @@
-# Docker Compose for Claude-B Multi-Host Orchestration Testing
-#
-# Usage:
-#   export ANTHROPIC_API_KEY=your-key-here
-#   docker-compose up -d
-#
-# This creates 3 Claude-B instances to test orchestration features:
-#   - host1: Primary instance (port 3847)
-#   - host2: Secondary instance (port 3848)
-#   - host3: Tertiary instance (port 3849)
-#
-# Each instance runs its own REST API server.
-# Use the primary instance to orchestrate across all hosts.
+# Isolated three-host example. Set CB_WORKSPACE to an existing repository.
+# State volumes are unique to the Compose project; no Telegram bot is enabled.
+x-claude-b: &claude-b
+  build:
+    context: .
+  image: claude-b:0.7.0
+  environment:
+    CB_REST_HOST: 0.0.0.0
+    CB_REST_PORT: '3847'
+    CB_DATA_DIR: /home/node/.claude-b
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  user: '${CB_UID:-1000}:${CB_GID:-1000}'
+  depends_on:
+    state-init:
+      condition: service_completed_successfully
+  restart: 'no'
+  stop_grace_period: 15s
 
 services:
+  # Only these project-owned state volumes are initialized as root. The
+  # repository is never mounted here; every daemon runs as the requested UID.
+  state-init:
+    build:
+      context: .
+    image: claude-b:0.7.0
+    user: '0:0'
+    entrypoint: ['/bin/sh', '-ec']
+    command:
+      - 'test "$$STATE_UID" -gt 0; for state in /state/host1 /state/host2 /state/host3; do chown -R "$$STATE_UID:$$STATE_GID" "$$state"; chmod 700 "$$state"; done'
+    environment:
+      STATE_UID: ${CB_UID:-1000}
+      STATE_GID: ${CB_GID:-1000}
+    volumes:
+      - host1-data:/state/host1
+      - host2-data:/state/host2
+      - host3-data:/state/host3
+    restart: 'no'
   host1:
-    build: .
-    container_name: claude-b-host1
-    environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - PORT=3847
-      - HOST_NAME=host1
-    ports:
-      - "3847:3847"
+    <<: *claude-b
+    ports: ['127.0.0.1:3847:3847']
     volumes:
-      - host1-data:/root/.claude-b
-    networks:
-      - claude-b-net
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3847/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-
+      - host1-data:/home/node/.claude-b
+      - ${CB_WORKSPACE:-.}:/workspace
   host2:
-    build: .
-    container_name: claude-b-host2
-    environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - PORT=3847
-      - HOST_NAME=host2
-    ports:
-      - "3848:3847"
+    <<: *claude-b
+    ports: ['127.0.0.1:3848:3847']
     volumes:
-      - host2-data:/root/.claude-b
-    networks:
-      - claude-b-net
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3847/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-
+      - host2-data:/home/node/.claude-b
+      - ${CB_WORKSPACE:-.}:/workspace
   host3:
-    build: .
-    container_name: claude-b-host3
-    environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - PORT=3847
-      - HOST_NAME=host3
-    ports:
-      - "3849:3847"
+    <<: *claude-b
+    ports: ['127.0.0.1:3849:3847']
     volumes:
-      - host3-data:/root/.claude-b
-    networks:
-      - claude-b-net
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3847/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-
-networks:
-  claude-b-net:
-    driver: bridge
+      - host3-data:/home/node/.claude-b
+      - ${CB_WORKSPACE:-.}:/workspace
 
 volumes:
   host1-data:

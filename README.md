@@ -847,113 +847,92 @@ Config file: `~/.claude-b/config.json`
 
 ## Docker
 
-### Multi-Host Orchestration Testing
+The image runs the daemon as an unprivileged user, includes a pinned Claude Code
+executable, and checks both IPC and `/api/health` before declaring readiness.
+State lives in `/home/node/.claude-b`; the target repository lives in `/workspace`.
+Credentials belong in runtime environment variables or the mounted state directory.
 
-Run multiple Claude-B instances for testing orchestration features:
+### Persistent CLI and repository mounts
 
 ```bash
-# Set your API key
+# Build the current checkout without touching a host daemon
+# Run from this repository; the build cleans only its container output.
+docker build -t claude-b:0.7.0 .
+
+# Enter the repository you want Claude to work on
+cd /path/to/your/project
+
+# Use the persistent launcher from the Claude-B checkout
+CB_DOCKER_IMAGE=claude-b:0.7.0 /path/to/Claude-B/scripts/docker-launcher.sh --new work
+CB_DOCKER_IMAGE=claude-b:0.7.0 /path/to/Claude-B/scripts/docker-launcher.sh 'Analyze this repository'
+```
+
+The launcher uses your UID/GID for bind-mount access and preserves the caller's
+subdirectory under `/workspace`. Repeated calls enter the same container. Set
+`CB_DOCKER_CONTAINER` for another workspace and `CB_DOCKER_DATA_DIR` for separate
+state; a caller outside an existing container's workspace is rejected. Set
+`CB_DOCKER_PORT` to publish REST on that localhost port. The installer's Docker
+method installs this launcher in `~/.local/bin/cb` and requires an explicit
+`CB_DOCKER_IMAGE`: use a verified local build or a separately published immutable
+release image. This source branch does not update any registry tag.
+
+### Three isolated instances
+
+```bash
+# Use a separate Compose project and repository, with matching workspace ownership
+export CB_UID=$(id -u) CB_GID=$(id -g)
+export CB_WORKSPACE=/path/to/your/project
 export ANTHROPIC_API_KEY=your-key-here
 
-# Start 3 instances
-docker-compose up -d
+docker compose -p claude-b-test up --build -d
 
-# Instances available at:
-#   host1: http://localhost:3847
-#   host2: http://localhost:3848
-#   host3: http://localhost:3849
+# IPC and REST must both pass; published ports are localhost-only
+curl --fail http://127.0.0.1:3847/api/health
+curl --fail http://127.0.0.1:3848/api/health
+curl --fail http://127.0.0.1:3849/api/health
 
-# Configure orchestration from primary host
-cb -r                                           # Start REST API
-cb --remote-add http://localhost:3848 --remote-key <api-key> --remote-name host2
-cb --remote-add http://localhost:3849 --remote-key <api-key> --remote-name host3
+# Execute the CLI inside a particular repository-aware daemon
+docker compose -p claude-b-test exec -T -w /workspace host1 cb --new work
 
-# Send prompts to remote hosts
-cb --remote host2 "Analyze this codebase"
-cb --remote-health                              # Check health status
-
-# Stop containers
-docker-compose down
+# Stop this project; keep its named state volumes for reuse
+docker compose -p claude-b-test down
 ```
 
-### Single Instance
+A short initializer owns only this project's three state volumes as root; it
+never mounts or changes the host repository. Each daemon then runs as
+`CB_UID:CB_GID` (defaults `1000:1000`). Stop the whole project before changing
+those IDs. This example enables no Telegram poller. Provide separate authorized
+bot configuration only when intentionally assigning polling ownership.
+
+### Single instance and REST credentials
 
 ```bash
-# Build image
-docker build -t claude-b .
+mkdir -p /path/to/private-state
+docker run -d --name claudeb-test \
+  --user "$(id -u):$(id -g)" \
+  --mount type=bind,source=/path/to/private-state,target=/home/node/.claude-b \
+  --mount type=bind,source=/path/to/your/project,target=/workspace \
+  --env ANTHROPIC_API_KEY \
+  -p 127.0.0.1:3850:3847 claude-b:0.7.0
 
-# Run container
-docker run -d \
-  -e ANTHROPIC_API_KEY=your-key \
-  -p 3847:3847 \
-  --name claude-b \
-  claude-b
-```
+# Check health without exposing a credential
+curl --fail http://127.0.0.1:3850/api/health
 
-### Testing REST API and Hooks
-
-Build and run a test container:
-
-```bash
-# Build the image
-docker build -t claudeb-test:latest .
-
-# Run container with API key
-docker run -d \
-  --name claudeb-test \
-  -e ANTHROPIC_API_KEY=your-key-here \
-  -p 3850:3847 \
-  claudeb-test:latest
-
-# Wait for startup and get API key from logs
-sleep 3
-docker logs claudeb-test
-# Look for: API Key: cb_xxxxx...
-```
-
-Test the REST API:
-
-```bash
-# Set your API key (from docker logs output)
-API_KEY="cb_your_api_key_here"
-
-# Get JWT token
-TOKEN=$(curl -4 -s -X POST http://127.0.0.1:3850/api/auth/token \
-  -H "Content-Type: application/json" \
+# Read the owner-only bootstrap key into a variable; keys are not logged
+API_KEY=$(docker exec claudeb-test node -e 'process.stdout.write(require("fs").readFileSync(process.env.CB_DATA_DIR+"/api.key","utf8").trim())')
+TOKEN=$(curl --fail -s -X POST http://127.0.0.1:3850/api/auth/token \
+  -H 'Content-Type: application/json' \
   -d "{\"api_key\": \"$API_KEY\"}" | jq -r '.access_token')
-
-# Test health endpoint
-curl -4 -s http://127.0.0.1:3850/api/health | jq
-
-# List sessions
-curl -4 -s http://127.0.0.1:3850/api/sessions \
+curl --fail -s http://127.0.0.1:3850/api/sessions \
   -H "Authorization: Bearer $TOKEN" | jq
 
-# Create a session with model selection
-curl -4 -s -X POST http://127.0.0.1:3850/api/sessions \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "test-session", "model": "sonnet"}' | jq
-
-# Add a shell hook
-curl -4 -s -X POST http://127.0.0.1:3850/api/hooks/shell \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"event": "prompt.completed", "command": "echo Done!"}' | jq
-
-# Add a webhook with session filter
-curl -4 -s -X POST http://127.0.0.1:3850/api/hooks/webhook \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"event": "session.created", "url": "https://httpbin.org/post", "sessionFilter": "test-session"}' | jq
-
-# List all hooks
-curl -4 -s http://127.0.0.1:3850/api/hooks/shell -H "Authorization: Bearer $TOKEN" | jq
-curl -4 -s http://127.0.0.1:3850/api/hooks/webhook -H "Authorization: Bearer $TOKEN" | jq
-
-# Cleanup
-docker stop claudeb-test && docker rm claudeb-test
+# Stop and remove only this container; its bind-mounted state remains
+docker stop claudeb-test
+docker rm claudeb-test
 ```
+
+See [CB-06 validation](docs/backlog/CB-06.md) for the pinned image/executable
+versions, isolated smoke checks, and deployment limits.
 
 ## Development
 

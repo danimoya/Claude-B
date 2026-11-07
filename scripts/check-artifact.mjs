@@ -15,7 +15,7 @@ for (const required of ['package.json', 'README.md', 'LICENSE', 'OPERATIONS.md',
   assert(files.includes(required), `Package missing ${required}; run npm run build first`);
 }
 for (const path of files) {
-  assert(/^(bin\/|dist\/|scripts\/install\.sh$|package\.json$|README\.md$|OPERATIONS\.md$|LICENSE$)/.test(path),
+  assert(/^(bin\/|dist\/|scripts\/(install|docker-launcher)\.sh$|package\.json$|README\.md$|OPERATIONS\.md$|LICENSE$)/.test(path),
     `Unexpected published path: ${path}`);
   assert(!/(^|\/)(\.env(?:\..*)?|\.npmrc|api\.key|telegram\.json)$/.test(path),
     `Credential file included: ${path}`);

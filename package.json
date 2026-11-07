@@ -11,6 +11,7 @@
     "bin/",
     "dist/",
     "scripts/install.sh",
+    "scripts/docker-launcher.sh",
     "README.md",
     "OPERATIONS.md",
     "LICENSE"

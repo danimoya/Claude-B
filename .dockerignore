@@ -8,3 +8,12 @@ LICENSE
 *.log
 .env
 .env.*
+.npmrc
+.claude
+.codex
+.agents
+coverage
+test
+_SPRINTER-2026-06
+**/*.key
+**/*.pem

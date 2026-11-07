@@ -1,24 +1,35 @@
 #!/bin/sh
-set -e
+set -eu
 
-# Start daemon in background
+# Explicit commands such as `cb --version` run without starting a daemon.
+if [ "$#" -gt 0 ]; then exec "$@"; fi
+if [ "$(id -u)" -eq 0 ]; then
+  echo 'Run the Claude-B daemon as a non-root repository owner.' >&2
+  exit 1
+fi
+
 node /app/dist/daemon/index.js &
-DAEMON_PID=$!
-
-# Wait for socket to be ready
-SOCKET_PATH="${CB_DATA_DIR:-$HOME/.claude-b}/daemon.sock"
-echo "Waiting for daemon..."
-for i in $(seq 1 30); do
-  if [ -S "$SOCKET_PATH" ]; then
-    echo "Daemon ready"
-    break
+daemon_pid=$!
+cleanup() {
+  trap - EXIT TERM INT HUP
+  if [ -n "$daemon_pid" ]; then
+    kill -TERM "$daemon_pid" 2>/dev/null || true
+    attempts=0
+    while kill -0 "$daemon_pid" 2>/dev/null && [ "$attempts" -lt 50 ]; do
+      sleep 0.1
+      attempts=$((attempts + 1))
+    done
+    kill -KILL "$daemon_pid" 2>/dev/null || true
+    wait "$daemon_pid" 2>/dev/null || true
   fi
-  sleep 0.1
-done
+}
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 129' HUP
 
-# Start REST API
-echo "Starting REST API..."
-node /app/dist/cli/index.js --rest ${CB_REST_PORT:-${REST_PORT:-3847}}
-
-# Keep container running
-wait $DAEMON_PID
+CB_EXPECTED_DAEMON_PID="$daemon_pid" node /app/scripts/container-ready.mjs start
+status=0
+wait "$daemon_pid" || status=$?
+daemon_pid=''
+exit "$status"
