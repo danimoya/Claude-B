@@ -8,6 +8,7 @@ import { existsSync } from 'fs';
 import { nanoid } from 'nanoid';
 import { spawn, spawnSync } from 'child_process';
 import { SessionManager } from './session-manager.js';
+import type { ExecutionPolicy } from '../session/session.js';
 import { submitPromptWithDelivery } from './prompt-delivery.js';
 import { RestServer } from '../rest/server.js';
 import { HookEngine } from '../hooks/engine.js';
@@ -104,6 +105,13 @@ class Daemon {
           inbox: this.notificationInbox,
           forward: (notification) => this.forwardToTelegram(notification),
         });
+      },
+      onExecutionPolicy: async (sessionId, policy) => {
+        const session = this.sessionManager.get(sessionId);
+        if (!session) throw new Error('Session not found');
+        if (session.status === 'busy') throw new Error('Cannot change execution policy while a session is busy');
+        session.executionPolicy = policy;
+        await this.sessionManager.save();
       },
       getSessions: () => {
         const claudePanes = this.listTmuxClaudePanes();
@@ -290,7 +298,17 @@ class Daemon {
         return { data: { sessions: this.sessionManager.list() } };
 
       case 'session.create':
-        return this.createSession(params?.name as string | undefined, params?.model as string | undefined);
+        return this.createSession(params?.name as string | undefined, params?.model as string | undefined, params?.workingDir as string | undefined, params?.executionPolicy as ExecutionPolicy | undefined);
+
+      case 'session.policy': {
+        const session = params?.sessionId ? this.sessionManager.get(params.sessionId as string) : this.sessionManager.current();
+        if (!session) return { error: 'Session not found' };
+        if (params?.executionPolicy !== 'default' && params?.executionPolicy !== 'bypass') return { error: 'Execution policy must be default or bypass' };
+        if (session.status === 'busy') return { error: 'Cannot change execution policy while a session is busy' };
+        session.executionPolicy = params.executionPolicy;
+        await this.sessionManager.save();
+        return { data: { sessionId: session.id, executionPolicy: session.executionPolicy } };
+      }
 
       case 'session.kill':
         return this.killSession(params?.sessionId as string);
@@ -317,7 +335,7 @@ class Daemon {
         return this.unwatchSession(socket);
 
       case 'prompt.send':
-        return this.sendPrompt(params?.prompt as string, params?.model as string | undefined);
+        return this.sendPrompt(params?.prompt as string, params?.model as string | undefined, params?.executionPolicy as ExecutionPolicy | undefined);
 
       case 'stdin':
         return this.handleStdin(params?.data as string, socket);
@@ -427,7 +445,8 @@ class Daemon {
           params?.prompt as string,
           params?.name as string | undefined,
           params?.goal as string | undefined,
-          params?.model as string | undefined
+          params?.model as string | undefined,
+          params?.executionPolicy as ExecutionPolicy | undefined
         );
 
       case 'orchestration.fire':
@@ -492,9 +511,9 @@ class Daemon {
     };
   }
 
-  private async createSession(name?: string, model?: string): Promise<{ data?: Record<string, unknown>; error?: string }> {
+  private async createSession(name?: string, model?: string, workingDir?: string, executionPolicy: ExecutionPolicy = 'default'): Promise<{ data?: Record<string, unknown>; error?: string }> {
     try {
-      const session = await this.sessionManager.create(name, model);
+      const session = await this.sessionManager.create(name, model, undefined, false, workingDir, executionPolicy);
       // Dispatch session.created hook
       this.hookEngine.dispatch('session.created', { sessionId: session.id, name: session.name }).catch(() => {});
       return { data: { sessionId: session.id, name: session.name, model: session.model } };
@@ -597,12 +616,13 @@ class Daemon {
     return { data: { success: true } };
   }
 
-  private async sendPrompt(prompt: string, model?: string): Promise<{ data?: Record<string, unknown>; error?: string }> {
+  private async sendPrompt(prompt: string, model?: string, executionPolicy?: ExecutionPolicy): Promise<{ data?: Record<string, unknown>; error?: string }> {
+    if (executionPolicy !== undefined && executionPolicy !== 'default' && executionPolicy !== 'bypass') return { error: 'Invalid execution policy' };
     let session = this.sessionManager.current();
 
     // Auto-create session if none exists
     if (!session) {
-      const result = await this.createSession(undefined, model);
+      const result = await this.createSession(undefined, model, undefined, executionPolicy);
       if (result.error) {
         return result;
       }
@@ -614,6 +634,11 @@ class Daemon {
     }
 
     // Apply model override if provided
+    if (executionPolicy !== undefined && session.executionPolicy !== executionPolicy) {
+      if (session.status === 'busy') return { error: 'Cannot change execution policy while a session is busy' };
+      session.executionPolicy = executionPolicy;
+      await this.sessionManager.save();
+    }
     if (model && session.model !== model) {
       session.model = model;
       this.sessionManager.save().catch(() => {});
@@ -1451,7 +1476,8 @@ class Daemon {
     prompt: string,
     name?: string,
     goal?: string,
-    model?: string
+    model?: string,
+    executionPolicy: ExecutionPolicy = 'default'
   ): Promise<{ data?: Record<string, unknown>; error?: string }> {
     if (!prompt) return { error: 'Prompt is required' };
 
@@ -1460,7 +1486,9 @@ class Daemon {
         name || `task-${nanoid(4)}`,
         model,
         goal || prompt.slice(0, 100),
-        true
+        true,
+        undefined,
+        executionPolicy
       );
 
       const promptId = await submitPromptWithDelivery(session, prompt, {

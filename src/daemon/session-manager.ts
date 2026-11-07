@@ -1,7 +1,7 @@
 import { Socket } from 'net';
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
-import { Session, SessionState } from '../session/session.js';
+import { Session, SessionState, type ExecutionPolicy } from '../session/session.js';
 
 interface SessionIndex {
   sessions: SessionState[];
@@ -72,8 +72,8 @@ export class SessionManager {
     await writeFile(this.indexPath, JSON.stringify(index, null, 2));
   }
 
-  async create(name?: string, model?: string, goal?: string, fireAndForget?: boolean): Promise<Session> {
-    const session = Session.create(name, this.configDir, model, goal, fireAndForget);
+  async create(name?: string, model?: string, goal?: string, fireAndForget?: boolean, workingDir?: string, executionPolicy: ExecutionPolicy = 'default'): Promise<Session> {
+    const session = Session.create(name, this.configDir, model, goal, fireAndForget, workingDir, executionPolicy);
     this.sessions.set(session.id, session);
 
     // Auto-select if no session is selected
@@ -108,6 +108,7 @@ export class SessionManager {
     id: string;
     name?: string;
     model?: string;
+    executionPolicy?: ExecutionPolicy;
     status: string;
     selected: boolean;
     createdAt: string;
@@ -119,6 +120,7 @@ export class SessionManager {
       id: session.id,
       name: session.name,
       model: session.model,
+      executionPolicy: session.executionPolicy,
       status: session.status,
       selected: session.id === this.selectedId,
       createdAt: session.createdAt,

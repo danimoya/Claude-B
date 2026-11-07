@@ -5,6 +5,8 @@ import { WebSocket } from 'ws';
 interface CreateSessionBody {
   name?: string;
   model?: string;
+  workingDir?: string;
+  executionPolicy?: 'default' | 'bypass';
 }
 
 interface SendPromptBody {
@@ -39,18 +41,21 @@ export async function registerSessionRoutes(
         type: 'object',
         properties: {
           name: { type: 'string' },
-          model: { type: 'string' }
+          model: { type: 'string' },
+          workingDir: { type: 'string', minLength: 1 },
+          executionPolicy: { type: 'string', enum: ['default', 'bypass'] }
         }
       }
     }
   }, async (request: FastifyRequest<{ Body: CreateSessionBody }>) => {
-    const { name, model } = request.body || {};
-    const session = await sessionManager.create(name, model);
+    const { name, model, workingDir, executionPolicy } = request.body || {};
+    const session = await sessionManager.create(name, model, undefined, false, workingDir, executionPolicy);
 
     return {
       id: session.id,
       name: session.name,
       model: session.model,
+      executionPolicy: session.executionPolicy,
       status: session.status,
       createdAt: session.createdAt
     };
@@ -78,12 +83,27 @@ export async function registerSessionRoutes(
       status: state.status,
       createdAt: state.createdAt,
       workingDir: state.workingDir,
+      executionPolicy: state.executionPolicy,
       promptCount: state.promptCount,
       lastPromptId: state.lastPromptId
     };
   });
 
   // Delete/kill session
+  app.post<{ Params: SessionParams; Body: { executionPolicy: 'default' | 'bypass' } }>('/api/sessions/:id/policy', {
+    preHandler: [app.authenticate],
+    schema: { body: { type: 'object', required: ['executionPolicy'], properties: {
+      executionPolicy: { type: 'string', enum: ['default', 'bypass'] }
+    } } }
+  }, async (request, reply) => {
+    const session = sessionManager.get(request.params.id);
+    if (!session) return reply.status(404).send({ error: 'Session not found' });
+    if (session.status === 'busy') return reply.status(409).send({ error: 'Cannot change execution policy while a session is busy' });
+    session.executionPolicy = request.body.executionPolicy;
+    await sessionManager.save();
+    return { sessionId: session.id, executionPolicy: session.executionPolicy };
+  });
+
   app.delete<{ Params: SessionParams }>('/api/sessions/:id', {
     preHandler: [app.authenticate]
   }, async (request: FastifyRequest<{ Params: SessionParams }>, reply: FastifyReply) => {

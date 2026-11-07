@@ -4,7 +4,8 @@ import { randomUUID } from 'crypto';
 import { nanoid } from 'nanoid';
 import { EventEmitter } from 'events';
 import { mkdir, writeFile, readFile, appendFile, rm } from 'fs/promises';
-import { existsSync } from 'fs';
+import { existsSync, realpathSync, statSync } from 'fs';
+import { resolve } from 'path';
 import { getClaudePath } from '../utils/claude-detector.js';
 import type * as NodePty from 'node-pty';
 // Node-pty types are kept for the NodePty.IPty branches in write/resize/kill,
@@ -17,6 +18,8 @@ export interface StructuredResult {
   numTurns: number;
   isError: boolean;
 }
+
+export type ExecutionPolicy = 'default' | 'bypass';
 
 export interface SessionState {
   id: string;
@@ -31,6 +34,7 @@ export interface SessionState {
   claudeSessionId?: string;  // Claude Code's own session UUID for conversation continuity
   goal?: string;             // Task objective for fire-and-forget
   fireAndForget?: boolean;   // Whether this is a fire-and-forget task
+  executionPolicy?: ExecutionPolicy;
 }
 
 interface PromptEntry {
@@ -50,6 +54,7 @@ export class Session extends EventEmitter {
   public goal?: string;
   public fireAndForget: boolean = false;
   public lastActivityAt: string;
+  public executionPolicy: ExecutionPolicy;
 
   private workingDir: string;
   private sessionDir: string;
@@ -84,6 +89,7 @@ export class Session extends EventEmitter {
     this.goal = state.goal;
     this.fireAndForget = state.fireAndForget || false;
     this.lastActivityAt = state.lastActivityAt || state.createdAt;
+    this.executionPolicy = state.executionPolicy === 'bypass' ? 'bypass' : 'default';
   }
 
   /**
@@ -120,7 +126,10 @@ export class Session extends EventEmitter {
     }
   }
 
-  static create(name: string | undefined, configDir: string, model?: string, goal?: string, fireAndForget?: boolean): Session {
+  static create(name: string | undefined, configDir: string, model?: string, goal?: string, fireAndForget?: boolean, workingDir = process.cwd(), executionPolicy: ExecutionPolicy = 'default'): Session {
+    const projectDir = realpathSync(resolve(workingDir));
+    if (!statSync(projectDir).isDirectory()) throw new Error('Working directory must be a directory');
+    if (executionPolicy !== 'default' && executionPolicy !== 'bypass') throw new Error('Invalid execution policy');
     const now = new Date().toISOString();
     const state: SessionState = {
       id: nanoid(8),
@@ -129,7 +138,8 @@ export class Session extends EventEmitter {
       status: 'idle',
       createdAt: now,
       lastActivityAt: now,
-      workingDir: process.cwd(),
+      workingDir: projectDir,
+      executionPolicy,
       promptCount: 0,
       goal,
       fireAndForget
@@ -150,7 +160,8 @@ export class Session extends EventEmitter {
       promptCount: this.promptCount,
       claudeSessionId: this.claudeSessionId,
       goal: this.goal,
-      fireAndForget: this.fireAndForget
+      fireAndForget: this.fireAndForget,
+      executionPolicy: this.executionPolicy
     };
   }
 
@@ -295,7 +306,8 @@ export class Session extends EventEmitter {
       });
       this.broadcastStatus('processing', { promptId, prompt: prompt.slice(0, 100) });
       const claudePath = getClaudePath();
-      const args = ['--print', '--dangerously-skip-permissions', '--output-format', 'json'];
+      const args = ['--print', '--output-format', 'json'];
+      if (this.executionPolicy === 'bypass') args.push('--dangerously-skip-permissions');
       if (this.model) {
         args.push('--model', this.model);
       }

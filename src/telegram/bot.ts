@@ -96,7 +96,8 @@ export interface TelegramBotOptions {
   configDir: string;
   onPrompt?: (sessionId: string, prompt: string) => Promise<void>;
   onCreateSession?: () => Promise<{ sessionId: string; name?: string } | null>;
-  getSessions?: () => Array<{ id: string; name?: string; status: string }>;
+  getSessions?: () => Array<{ id: string; name?: string; status: string; executionPolicy?: 'default' | 'bypass' }>;
+  onExecutionPolicy?: (sessionId: string, policy: 'default' | 'bypass') => Promise<void>;
   getInboxCount?: () => Promise<{ total: number; unread: number }>;
   getSessionContext?: (sessionId: string) => SessionContext | undefined;
   voicePipeline?: VoicePipeline;
@@ -189,6 +190,7 @@ export class ClaudeBTelegramBot extends EventEmitter {
     this.bot.onText(/\/inbox/, (msg) => this.handleInbox(msg));
     this.bot.onText(/\/voice/, (msg) => this.handleVoiceStatus(msg));
     this.bot.onText(/\/help/, (msg) => this.handleHelp(msg));
+    this.bot.onText(/^\/policy(?:@\w+)?(?:\s+.*)?$/, (msg) => this.handlePolicy(msg));
     this.bot.onText(/^\/cancel(?:@\w+)?$/, (msg) => this.handleMessage({ ...msg, text: '/cancel' }));
 
     // Handle voice messages
@@ -483,7 +485,8 @@ export class ClaudeBTelegramBot extends EventEmitter {
     const lines = sessions.map(s => {
       const marker = s.id === selected ? '▸ ' : '  ';
       const name = s.name ? ` (${s.name})` : '';
-      return `${marker}${s.id.slice(0, 8)}${name} [${s.status}]`;
+      const policy = s.executionPolicy ? ` policy:${s.executionPolicy}` : '';
+      return `${marker}${s.id.slice(0, 8)}${name} [${s.status}${policy}]`;
     });
 
     // Build inline keyboard — one button per session
@@ -501,6 +504,42 @@ export class ClaudeBTelegramBot extends EventEmitter {
     } catch {
       // Fallback to plain text if keyboard fails
       await this.safeSend(chatId, `${text}\n\nUse /select <id> to choose one.`);
+    }
+  }
+
+  private async handlePolicy(msg: TelegramBot.Message): Promise<void> {
+    if (!await this.authorizeMessage(msg)) return;
+    const chatId = String(msg.chat.id);
+    const args = (msg.text || '').trim().split(/\s+/).slice(1);
+    const sessions = this.options.getSessions?.() || [];
+    const selected = this.selectedSession.get(chatId);
+    if (args.length === 0) {
+      const session = sessions.find(item => item.id === selected);
+      await this.safeSend(chatId, session?.executionPolicy
+        ? `Session ${session.id}: policy ${session.executionPolicy}`
+        : 'Usage: /policy <default|bypass> [session-id]. Select a managed session first.');
+      return;
+    }
+    if (args.length > 2 || !['default', 'bypass'].includes(args[0])) {
+      await this.safeSend(chatId, 'Usage: /policy <default|bypass> [session-id]');
+      return;
+    }
+    const target = args[1] || selected;
+    const exact = sessions.find(item => item.id === target || item.name === target);
+    const matches = exact ? [exact] : sessions.filter(item => target && item.id.startsWith(target));
+    if (matches.length !== 1 || !this.options.onExecutionPolicy) {
+      await this.safeSend(chatId, 'Select one known managed session; policy changes are unavailable for ambiguous targets.');
+      return;
+    }
+    if (matches[0].id.startsWith('tmux:')) {
+      await this.safeSend(chatId, 'Native tmux agents manage their own execution policy.');
+      return;
+    }
+    try {
+      await this.options.onExecutionPolicy(matches[0].id, args[0] as 'default' | 'bypass');
+      await this.safeSend(chatId, `Session ${matches[0].id}: policy ${args[0]}`);
+    } catch (error) {
+      await this.safeSend(chatId, `Policy change failed: ${error instanceof Error ? error.message : 'unknown error'}`);
     }
   }
 

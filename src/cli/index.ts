@@ -4,7 +4,7 @@ import { loadEnv } from '../config/env.js';
 
 loadEnv();
 
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
 import chalk from 'chalk';
 import { DaemonClient } from '../daemon/client.js';
 import { version } from '../utils/version.js';
@@ -156,6 +156,7 @@ program
   .option('-d, --detach', 'Detach from current session')
   .option('-n, --new [name]', 'Create new session')
   .option('-m, --model <model>', 'Claude model to use')
+  .addOption(new Option('--execution-policy <policy>', 'Session permission policy; bypass requires explicit opt-in').choices(['default', 'bypass']))
   .option('-k, --kill <id>', 'Kill/terminate session')
   .option('-w, --watch', 'Watch live output (tail -f style)')
   .option('-x, --select <id>', 'Select session, optionally submitting a prompt')
@@ -288,7 +289,7 @@ USE CASES — when to reach for which group of commands:
 
       if (options.new !== undefined) {
         const name = typeof options.new === 'string' ? options.new : undefined;
-        await createSession(client, name, options.model);
+        await createSession(client, name, options.model, options.executionPolicy);
         return;
       }
 
@@ -551,9 +552,9 @@ USE CASES — when to reach for which group of commands:
       // If we have a prompt, send it (or fire-and-forget).
       if (prompt !== undefined) {
         if (options.fire) {
-          await fireAndForgetPrompt(client, prompt, options.goal, options.model);
+          await fireAndForgetPrompt(client, prompt, options.goal, options.model, options.executionPolicy);
         } else {
-          await sendPrompt(client, prompt, options.model);
+          await sendPrompt(client, prompt, options.model, options.executionPolicy);
         }
         return;
       }
@@ -633,8 +634,8 @@ async function detachSession(client: DaemonClient): Promise<void> {
   process.exit(0);
 }
 
-async function createSession(client: DaemonClient, name?: string, model?: string): Promise<void> {
-  const result = await client.send({ method: 'session.create', params: { name, model } });
+async function createSession(client: DaemonClient, name?: string, model?: string, executionPolicy?: string): Promise<void> {
+  const result = await client.send({ method: 'session.create', params: { name, model, executionPolicy } });
   client.close();
   if (result.error) {
     console.error(chalk.red(result.error));
@@ -803,9 +804,9 @@ async function showLogs(): Promise<void> {
   else if (log.text) console.log(log.text);
 }
 
-async function sendPrompt(client: DaemonClient, prompt: string, model?: string): Promise<void> {
+async function sendPrompt(client: DaemonClient, prompt: string, model?: string, executionPolicy?: string): Promise<void> {
   console.log(chalk.gray('Sending prompt...'));
-  const result = await client.send({ method: 'prompt.send', params: { prompt, model } });
+  const result = await client.send({ method: 'prompt.send', params: { prompt, model, executionPolicy } });
   if (result.error) {
     console.error(chalk.red(result.error));
     client.close();
@@ -1223,10 +1224,10 @@ async function sendRemotePrompt(client: DaemonClient, hostId: string, prompt: st
 }
 
 // Fire-and-forget functions
-async function fireAndForgetPrompt(client: DaemonClient, prompt: string, goal?: string, model?: string): Promise<void> {
+async function fireAndForgetPrompt(client: DaemonClient, prompt: string, goal?: string, model?: string, executionPolicy?: string): Promise<void> {
   const result = await client.send({
     method: 'prompt.fire',
-    params: { prompt, goal, model }
+    params: { prompt, goal, model, executionPolicy }
   });
   client.close();
 
