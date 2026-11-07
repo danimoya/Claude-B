@@ -64,6 +64,7 @@ export class RestServer {
     this.app = Fastify({
       disableRequestLogging: process.env.CB_REST_REQUEST_LOGS !== '1',
       logger: {
+        redact: ['req.headers.authorization', 'req.headers["x-claude-b-key"]', 'req.body.api_key', 'req.body.refresh_token'],
         level: process.env.CB_REST_LOG_LEVEL || 'warn'
       }
     });
@@ -75,8 +76,7 @@ export class RestServer {
 
     // Register plugins
     await this.app.register(fastifyCors, {
-      origin: true,
-      credentials: true
+      origin: false
     });
 
     await this.app.register(fastifyRateLimit, {
@@ -100,7 +100,10 @@ export class RestServer {
     this.app.decorate('authenticate', async (request: FastifyRequest, reply: FastifyReply) => {
       try {
         await request.jwtVerify();
-      } catch (err) {
+        if (!this.authManager.validateTokenPayload(request.user, 'access')) {
+          throw new Error('Invalid access claims');
+        }
+      } catch {
         reply.status(401).send({ error: 'Unauthorized', message: 'Invalid or expired token' });
       }
     });

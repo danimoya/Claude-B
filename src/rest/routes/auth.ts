@@ -13,6 +13,23 @@ export async function registerAuthRoutes(
   app: FastifyInstance,
   authManager: AuthManager
 ): Promise<void> {
+  // Credentials are bootstrapped from the owner's api.key file / local IPC.
+  // Loopback alone is insufficient: other local users and forwarded requests
+  // must not be able to retrieve or rotate the daemon's credentials.
+  const authorizeCredentialAccess = async (request: FastifyRequest, reply: FastifyReply) => {
+    const isLocalhost = request.ip === '127.0.0.1' || request.ip === '::1' || request.ip === '::ffff:127.0.0.1';
+    if (!isLocalhost) {
+      return reply.status(403).send({ error: 'Forbidden', message: 'Credential access requires localhost' });
+    }
+    if (authManager.validateApiKey(request.headers['x-claude-b-key'])) return;
+    try {
+      await request.jwtVerify();
+      if (authManager.validateTokenPayload(request.user, 'access')) return;
+    } catch {
+      // Return the same response for missing and invalid credentials.
+    }
+    return reply.status(401).send({ error: 'Unauthorized', message: 'Current API key or access token required' });
+  };
 
   // Get token using API key
   app.post<{ Body: TokenRequest }>('/api/auth/token', {
@@ -64,9 +81,9 @@ export async function registerAuthRoutes(
     const { refresh_token } = request.body;
 
     try {
-      const decoded = app.jwt.verify(refresh_token) as { type: string; sub: string; exp: number };
+      const decoded = app.jwt.verify(refresh_token);
 
-      if (!authManager.validateTokenPayload(decoded as any, 'refresh')) {
+      if (!authManager.validateTokenPayload(decoded, 'refresh')) {
         return reply.status(401).send({
           error: 'Unauthorized',
           message: 'Invalid or expired refresh token'
@@ -99,37 +116,12 @@ export async function registerAuthRoutes(
     };
   });
 
-  // Get API key (requires existing auth or first-time setup)
-  app.get('/api/auth/key', async (request: FastifyRequest, reply: FastifyReply) => {
-    // Only allow from localhost for security
-    const isLocalhost = request.ip === '127.0.0.1' ||
-                        request.ip === '::1' ||
-                        request.ip === '::ffff:127.0.0.1';
-
-    if (!isLocalhost) {
-      return reply.status(403).send({
-        error: 'Forbidden',
-        message: 'API key can only be retrieved from localhost'
-      });
-    }
-
+  app.get('/api/auth/key', { preHandler: authorizeCredentialAccess }, async () => {
     const apiKey = await authManager.ensureApiKey();
     return { api_key: apiKey };
   });
 
-  // Regenerate API key (requires localhost)
-  app.post('/api/auth/key/regenerate', async (request: FastifyRequest, reply: FastifyReply) => {
-    const isLocalhost = request.ip === '127.0.0.1' ||
-                        request.ip === '::1' ||
-                        request.ip === '::ffff:127.0.0.1';
-
-    if (!isLocalhost) {
-      return reply.status(403).send({
-        error: 'Forbidden',
-        message: 'API key can only be regenerated from localhost'
-      });
-    }
-
+  app.post('/api/auth/key/regenerate', { preHandler: authorizeCredentialAccess }, async () => {
     const apiKey = await authManager.generateApiKey();
     return {
       api_key: apiKey,
