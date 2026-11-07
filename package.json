@@ -7,10 +7,20 @@
   "bin": {
     "cb": "bin/cb"
   },
+  "files": [
+    "bin/",
+    "dist/",
+    "scripts/install.sh",
+    "README.md",
+    "OPERATIONS.md",
+    "LICENSE"
+  ],
   "scripts": {
     "dev": "tsup src/cli/index.ts src/daemon/index.ts --watch --format esm",
     "build": "tsup src/cli/index.ts src/daemon/index.ts --format esm --dts --clean",
-    "test": "vitest",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check:artifact": "node scripts/check-artifact.mjs",
     "lint": "eslint src/",
     "typecheck": "tsc --noEmit",
     "start:daemon": "node dist/daemon/index.js"
