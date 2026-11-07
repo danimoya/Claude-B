@@ -1,13 +1,17 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { SessionManager } from '../../daemon/session-manager.js';
 import { WebSocket } from 'ws';
+import type { TaskSubmission } from '../../jobs/types.js';
+import { acceptedTask, submissionOptions, taskError, taskSubmissionProperties } from './tasks.js';
 
 interface CreateSessionBody {
   name?: string;
   model?: string;
+  workingDir?: string;
+  executionPolicy?: 'default' | 'bypass';
 }
 
-interface SendPromptBody {
+interface SendPromptBody extends TaskSubmission {
   prompt: string;
 }
 
@@ -39,18 +43,21 @@ export async function registerSessionRoutes(
         type: 'object',
         properties: {
           name: { type: 'string' },
-          model: { type: 'string' }
+          model: { type: 'string' },
+          workingDir: { type: 'string', minLength: 1 },
+          executionPolicy: { type: 'string', enum: ['default', 'bypass'] }
         }
       }
     }
   }, async (request: FastifyRequest<{ Body: CreateSessionBody }>) => {
-    const { name, model } = request.body || {};
-    const session = await sessionManager.create(name, model);
+    const { name, model, workingDir, executionPolicy } = request.body || {};
+    const session = await sessionManager.create(name, model, undefined, false, workingDir, executionPolicy);
 
     return {
       id: session.id,
       name: session.name,
       model: session.model,
+      executionPolicy: session.executionPolicy,
       status: session.status,
       createdAt: session.createdAt
     };
@@ -78,12 +85,26 @@ export async function registerSessionRoutes(
       status: state.status,
       createdAt: state.createdAt,
       workingDir: state.workingDir,
+      executionPolicy: state.executionPolicy,
       promptCount: state.promptCount,
       lastPromptId: state.lastPromptId
     };
   });
 
   // Delete/kill session
+  app.post<{ Params: SessionParams; Body: { executionPolicy: 'default' | 'bypass' } }>('/api/sessions/:id/policy', {
+    preHandler: [app.authenticate],
+    schema: { body: { type: 'object', required: ['executionPolicy'], properties: {
+      executionPolicy: { type: 'string', enum: ['default', 'bypass'] }
+    } } }
+  }, async (request, reply) => {
+    const session = sessionManager.get(request.params.id);
+    if (!session) return reply.status(404).send({ error: 'Session not found' });
+    try { await sessionManager.setExecutionPolicy(session.id, request.body.executionPolicy); }
+    catch { return reply.status(409).send({ error: 'Cannot change execution policy while tasks are pending or shutdown is in progress' }); }
+    return { sessionId: session.id, executionPolicy: session.executionPolicy };
+  });
+
   app.delete<{ Params: SessionParams }>('/api/sessions/:id', {
     preHandler: [app.authenticate]
   }, async (request: FastifyRequest<{ Params: SessionParams }>, reply: FastifyReply) => {
@@ -150,7 +171,8 @@ export async function registerSessionRoutes(
         type: 'object',
         required: ['prompt'],
         properties: {
-          prompt: { type: 'string', minLength: 1 }
+          prompt: { type: 'string', minLength: 1 },
+          ...taskSubmissionProperties
         }
       }
     }
@@ -168,18 +190,14 @@ export async function registerSessionRoutes(
     }
 
     try {
-      const promptId = await session.sendPrompt(prompt);
-      return {
-        sessionId: id,
-        promptId,
-        status: 'queued',
-        message: 'Prompt queued for processing'
-      };
+      const options = submissionOptions(request.body, request.headers['idempotency-key']);
+      const promptId = await session.sendPrompt(prompt, options);
+      const task = await sessionManager.getTask(promptId);
+      if (!task) throw new Error('Durable task receipt unavailable');
+      if (task.sessionId !== session.id) return reply.status(409).send({ error: 'Task belongs to a different session' });
+      return reply.status(202).send(acceptedTask(task));
     } catch (error) {
-      return reply.status(500).send({
-        error: 'Internal Server Error',
-        message: error instanceof Error ? error.message : 'Failed to send prompt'
-      });
+      return taskError(reply, error);
     }
   });
 
@@ -266,10 +284,16 @@ export async function registerSessionRoutes(
         }));
       }
     };
+    const errorHandler = (info: { promptId?: string; code?: number | null; error?: string }) => {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'prompt.error', promptId: info.promptId, exitCode: info.code, error: info.error }));
+      }
+    };
 
     // Subscribe to session events
     session.on('output', outputHandler);
     session.on('prompt.completed', completionHandler);
+    session.on('prompt.error', errorHandler);
 
     // Send buffered output
     const lastOutput = session.getLastOutput();
@@ -288,9 +312,11 @@ export async function registerSessionRoutes(
         if (msg.type === 'input' && msg.data) {
           session.writeStdin(msg.data);
         } else if (msg.type === 'prompt' && msg.prompt) {
-          session.sendPrompt(msg.prompt).then(promptId => {
+          session.sendPrompt(msg.prompt, { taskId: msg.taskId, idempotencyKey: msg.idempotencyKey }).then(promptId => {
             socket.send(JSON.stringify({
               type: 'prompt.queued',
+              status: 'accepted',
+              taskId: promptId,
               promptId
             }));
           }).catch(error => {
@@ -311,11 +337,13 @@ export async function registerSessionRoutes(
     socket.on('close', () => {
       session.off('output', outputHandler);
       session.off('prompt.completed', completionHandler);
+      session.off('prompt.error', errorHandler);
     });
 
     socket.on('error', () => {
       session.off('output', outputHandler);
       session.off('prompt.completed', completionHandler);
+      session.off('prompt.error', errorHandler);
     });
   });
 }

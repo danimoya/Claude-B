@@ -1,19 +1,26 @@
-import { loadEnv } from '../config/env.js';
+import { loadEnv, getDataDir } from '../config/env.js';
 
 loadEnv();
 
 import { createServer, Server, Socket } from 'net';
-import { homedir } from 'os';
-import { mkdir, writeFile, unlink, readFile } from 'fs/promises';
-import { existsSync } from 'fs';
 import { nanoid } from 'nanoid';
-import { spawn, spawnSync } from 'child_process';
 import { SessionManager } from './session-manager.js';
+import { DaemonInstanceLock } from './instance-lock.js';
+import { selectExecutionSession } from './execution-context.js';
+import { RemoteDeliveryMonitor } from './remote-delivery.js';
+import type { RemoteSendOptions } from '../orchestration/remote-client.js';
+import { TmuxRegistry } from './tmux-registry.js';
+import { readLastTurnsFromTranscript, type TranscriptTurn } from '../utils/transcript.js';
+import { Session, type ExecutionPolicy } from '../session/session.js';
+import { TERMINAL_TASK_STATUSES, type TaskRecord, type TaskSubmission } from '../jobs/types.js';
+import { submitPromptWithDelivery } from './prompt-delivery.js';
 import { RestServer } from '../rest/server.js';
 import { HookEngine } from '../hooks/engine.js';
 import { HookEventType } from '../hooks/events.js';
-import { OrchestrationManager, createHost } from '../orchestration/index.js';
-import { NotificationInbox, NotificationInput } from '../notifications/inbox.js';
+import { OrchestrationManager, createHost, redactRemoteHost } from '../orchestration/index.js';
+import { NotificationInbox } from '../notifications/inbox.js';
+import { NotificationOutbox } from '../notifications/outbox.js';
+import { createDeliveryOutbox } from '../notifications/delivery.js';
 import { ClaudeBTelegramBot } from '../telegram/bot.js';
 import { VoicePipeline } from '../telegram/voice.js';
 import { createAIProvider } from '../telegram/ai-provider.js';
@@ -35,10 +42,16 @@ interface RestConfig {
 class Daemon {
   private server: Server | null = null;
   private config: DaemonConfig;
+  private instanceLock: DaemonInstanceLock;
+  private tmuxRegistry: TmuxRegistry;
+  private tmuxInlineContext = new Map<string, { turns: TranscriptTurn[]; lastSeen: number }>();
+  private shuttingDown = false;
   private sessionManager: SessionManager;
   private hookEngine: HookEngine;
   private orchestrationManager: OrchestrationManager;
   private notificationInbox: NotificationInbox;
+  private notificationOutbox: NotificationOutbox;
+  private remoteDelivery: RemoteDeliveryMonitor;
   private telegramBot: ClaudeBTelegramBot;
   private clients: Set<Socket> = new Set();
   private startTime: number = Date.now();
@@ -49,22 +62,15 @@ class Daemon {
     port: parseInt(process.env.CB_REST_PORT || process.env.REST_PORT || '3847', 10)
   };
 
-  // Maps virtual tmux session ids ("tmux:general:1.0") → Claude Code transcript
+  // Maps canonical native invocation IDs to bounded transcript context.
   // path, populated by the cb-notify.sh hook via /api/notify. Used by the
   // voice pipeline's context lookup so `optimizePrompt` knows what the pane
   // was just working on. In-memory only, 24h TTL.
   private tmuxTranscriptCache = new Map<string, { transcriptPath: string; lastSeen: number }>();
   private static readonly TMUX_TRANSCRIPT_TTL_MS = 24 * 60 * 60 * 1000;
 
-  // Registry of Codex-backed tmux sessions, populated from /api/notify
-  // (codex-notify.sh sends `agent: "codex"`). Claude panes are discovered
-  // directly from tmux by `pane_current_command`, but Codex panes report
-  // `node`, so the daemon can only learn of them from these POSTs. Entries are
-  // listed in /sessions while their pane is still alive; pruned otherwise.
-  private codexTmuxSessions = new Map<string, { name?: string; goal?: string; lastSeen: number }>();
-
   constructor() {
-    const configDir = process.env.CB_DATA_DIR || `${homedir()}/.claude-b`;
+    const configDir = getDataDir();
     this.config = {
       socketPath: `${configDir}/daemon.sock`,
       pidFile: `${configDir}/daemon.pid`,
@@ -72,6 +78,8 @@ class Daemon {
       logFile: `${configDir}/daemon.log`,
       configDir
     };
+    this.instanceLock = new DaemonInstanceLock(configDir);
+    this.tmuxRegistry = new TmuxRegistry({ stateFile: `${configDir}/tmux-registry.json` });
     this.sessionManager = new SessionManager(configDir);
     this.hookEngine = new HookEngine(configDir);
     this.orchestrationManager = new OrchestrationManager(configDir);
@@ -84,14 +92,11 @@ class Daemon {
         const data = result.data as { sessionId: string; name?: string };
         return { sessionId: data.sessionId, name: data.name };
       },
-      onPrompt: async (sessionId: string, prompt: string) => {
-        // Virtual tmux-backed session: sessionId is "tmux:<target>" where
-        // <target> is a tmux target string like "general:1.0".
-        // Replies to notifications from external Claude Code panes land here;
-        // we type the reply directly into the pane via tmux send-keys.
+      onPrompt: async (sessionId: string, prompt: string, options?: { idempotencyKey?: string }) => {
+        // Native replies require the same verified foreground invocation.
         if (sessionId.startsWith('tmux:')) {
-          const target = sessionId.slice('tmux:'.length);
-          await this.sendToTmuxPane(target, prompt);
+          await this.tmuxRegistry.send(sessionId, prompt);
+          await this.tmuxRegistry.flush();
           return;
         }
 
@@ -99,29 +104,22 @@ class Daemon {
         if (!session) throw new Error('Session not found');
         this.sessionManager.select(sessionId);
 
-        // Register notification listener BEFORE sending prompt to avoid race condition
-        // (notification event fires synchronously right after prompt.completed)
-        const notificationHandler = (notifData: NotificationInput) => {
-          this.notificationInbox.addNotification(notifData).catch(() => {});
-          this.forwardToTelegram(notifData);
-          session.off('notification', notificationHandler);
-        };
-        session.on('notification', notificationHandler);
-
-        await session.sendPrompt(prompt);
+        const taskId = await submitPromptWithDelivery(session, prompt, {
+          outbox: this.notificationOutbox,
+          hooks: this.hookEngine,
+          inbox: this.notificationInbox,
+          forward: (notification) => this.forwardToTelegram(notification),
+        }, options);
+        return { taskId };
       },
-      getSessions: () => {
-        const claudePanes = this.listTmuxClaudePanes();
-        const claudeIds = new Set(claudePanes.map((p) => p.id));
-        // Codex panes are deduped against Claude panes by id (a given target is
-        // only ever one or the other, but guard anyway).
-        const codexPanes = this.listCodexTmuxPanes().filter((p) => !claudeIds.has(p.id));
-        return [
-          ...this.sessionManager.list(),
-          ...claudePanes,
-          ...codexPanes,
-        ];
+      onExecutionPolicy: async (sessionId, policy) => {
+        await this.sessionManager.setExecutionPolicy(sessionId, policy);
       },
+      getPromptReceipt: async (key) => {
+        const task = await this.sessionManager.getTaskStore().findByIdempotencyKey(key);
+        return task ? { taskId: task.id } : undefined;
+      },
+      getSessions: () => [...this.sessionManager.list(), ...this.tmuxRegistry.discover()],
       getInboxCount: () => this.notificationInbox.count(),
       getSessionContext: (sessionId: string) => {
         // tmux-hosted session: resolve from the cached transcript populated
@@ -140,6 +138,15 @@ class Daemon {
           status: session.status,
         };
       },
+    });
+    this.notificationOutbox = createDeliveryOutbox(configDir, {
+      inbox: this.notificationInbox, hooks: this.hookEngine, telegram: this.telegramBot,
+    });
+    this.remoteDelivery = new RemoteDeliveryMonitor(this.orchestrationManager, this.notificationOutbox, () => this.log('Remote task status remains recoverable from its durable receipt'));
+    this.sessionManager.on('task.terminal', (task: TaskRecord) => {
+      void this.notificationOutbox.enqueue(Session.notificationForTask(task)).then(() => this.notificationOutbox.drain()).catch(() => {
+        this.log('Task notification remains recoverable from its durable receipt');
+      });
     });
   }
 
@@ -160,34 +167,11 @@ class Daemon {
   }
 
   async start(): Promise<void> {
-    // Ensure config directory exists
-    await mkdir(this.config.configDir, { recursive: true });
-    await this.acquireLock();
-
-    // Check if daemon is already running
-    if (existsSync(this.config.pidFile)) {
-      const pid = parseInt(await readFile(this.config.pidFile, 'utf-8'), 10);
-      try {
-        process.kill(pid, 0); // Check if process exists
-        console.error(`Daemon already running (PID: ${pid})`);
-        await this.releaseLock();
-        process.exit(1);
-      } catch {
-        // Process doesn't exist, clean up stale files
-        await this.cleanup();
-      }
-    }
-
-    // Clean up old socket
-    if (existsSync(this.config.socketPath)) {
-      await unlink(this.config.socketPath);
-    }
-
-    // Write PID file
-    await writeFile(this.config.pidFile, process.pid.toString());
+    await this.instanceLock.acquire();
 
     // Load sessions, hooks, and orchestration
     await this.sessionManager.load();
+    await this.tmuxRegistry.restore();
     await this.hookEngine.load();
     await this.orchestrationManager.load();
     this.orchestrationManager.startHealthChecks();
@@ -219,14 +203,23 @@ class Daemon {
       this.log(`Telegram bot not started: ${err instanceof Error ? err.message : String(err)}`);
     }
 
+    for (const task of await this.sessionManager.listTasks()) {
+      if (TERMINAL_TASK_STATUSES.has(task.status)) await this.notificationOutbox.enqueue(Session.notificationForTask(task));
+    }
+    this.notificationOutbox.start();
+    this.remoteDelivery.start();
+
     // Create server
     this.server = createServer((socket) => this.handleConnection(socket));
 
-    this.server.listen(this.config.socketPath, () => {
-      this.log(`Daemon started on ${this.config.socketPath}`);
-      // Dispatch daemon.started hook
-      this.hookEngine.dispatch('daemon.started', { pid: process.pid }).catch(() => {});
+    await new Promise<void>((resolve, reject) => {
+      this.server!.once('error', reject);
+      this.server!.listen(this.config.socketPath, () => {
+        this.instanceLock.recordSocket().then(resolve, reject);
+      });
     });
+    this.log(`Daemon started on ${this.config.socketPath}`);
+    this.hookEngine.dispatch('daemon.started', { pid: process.pid }).catch(() => {});
 
     // Handle shutdown
     process.on('SIGTERM', () => this.shutdown());
@@ -239,6 +232,7 @@ class Daemon {
   }
 
   private handleConnection(socket: Socket): void {
+    socket.setEncoding('utf8');
     this.clients.add(socket);
     this.log(`Client connected (total: ${this.clients.size})`);
 
@@ -286,6 +280,7 @@ class Daemon {
     socket: Socket
   ): Promise<{ data?: Record<string, unknown>; error?: string }> {
     const { method, params } = message;
+    if (this.shuttingDown && !['daemon.status', 'task.get', 'task.find', 'task.list', 'session.list'].includes(method)) return { error: 'Daemon is shutting down; no new work was accepted' };
 
     switch (method) {
       case 'daemon.status':
@@ -295,7 +290,24 @@ class Daemon {
         return { data: { sessions: this.sessionManager.list() } };
 
       case 'session.create':
-        return this.createSession(params?.name as string | undefined, params?.model as string | undefined);
+        return this.createSession(params?.name as string | undefined, params?.model as string | undefined, params?.workingDir as string | undefined, params?.executionPolicy as ExecutionPolicy | undefined);
+
+      case 'session.policy': {
+        const session = params?.sessionId ? this.sessionManager.get(params.sessionId as string) : this.sessionManager.current();
+        if (!session) return { error: 'Session not found' };
+        if (params?.executionPolicy !== 'default' && params?.executionPolicy !== 'bypass') return { error: 'Execution policy must be default or bypass' };
+        await this.sessionManager.setExecutionPolicy(session.id, params.executionPolicy);
+        return { data: { sessionId: session.id, executionPolicy: session.executionPolicy } };
+      }
+
+      case 'task.get':
+        return { data: { task: await this.sessionManager.getTask(params?.taskId as string) } };
+      case 'task.find':
+        return { data: { task: await this.sessionManager.getTaskStore().findByIdempotencyKey(params?.idempotencyKey as string) } };
+      case 'task.list':
+        return { data: { tasks: await this.sessionManager.listTasks(params?.sessionId as string | undefined) } };
+      case 'task.cancel':
+        return { data: { task: await this.sessionManager.cancelTask(params?.taskId as string) } };
 
       case 'session.kill':
         return this.killSession(params?.sessionId as string);
@@ -316,13 +328,13 @@ class Daemon {
         return this.detachSession(socket);
 
       case 'session.watch':
-        return this.watchSession(socket);
+        return this.watchSession(socket, params?.sessionId as string | undefined);
 
       case 'session.unwatch':
         return this.unwatchSession(socket);
 
       case 'prompt.send':
-        return this.sendPrompt(params?.prompt as string, params?.model as string | undefined);
+        return this.sendPrompt(params?.prompt as string, params?.model as string | undefined, params?.executionPolicy as ExecutionPolicy | undefined, params?.workingDir as string | undefined, params?.sessionId as string | undefined, { taskId: params?.taskId as string | undefined, idempotencyKey: params?.idempotencyKey as string | undefined });
 
       case 'stdin':
         return this.handleStdin(params?.data as string, socket);
@@ -404,11 +416,25 @@ class Daemon {
         return this.getOrchestrationStats();
 
       case 'orchestration.prompt':
-        return this.sendRemotePrompt(
-          params?.prompt as string,
-          params?.hostId as string | undefined,
-          params?.sessionId as string | undefined
-        );
+        return this.sendRemotePrompt(params?.prompt as string, {
+          hostId: params?.hostId as string | undefined,
+          sessionId: params?.sessionId as string | undefined,
+          timeout: params?.timeout as number | undefined,
+          taskId: params?.taskId as string | undefined,
+          idempotencyKey: params?.idempotencyKey as string | undefined,
+          waitForCompletion: params?.waitForCompletion as boolean | undefined,
+        });
+      case 'orchestration.task.list':
+        return { data: { tasks: await this.orchestrationManager.listRemoteTasks() } };
+      case 'orchestration.task.get':
+        return { data: { task: await this.orchestrationManager.getRemoteTask(params?.receiptId as string) } };
+      case 'orchestration.task.resume': {
+        const result = await this.orchestrationManager.resumeRemoteTask(params?.receiptId as string, {
+          timeout: params?.timeout as number | undefined,
+          waitForCompletion: params?.waitForCompletion as boolean | undefined,
+        });
+        return { data: { ...result } };
+      }
 
       // Notification inbox
       case 'notification.list':
@@ -432,14 +458,16 @@ class Daemon {
           params?.prompt as string,
           params?.name as string | undefined,
           params?.goal as string | undefined,
-          params?.model as string | undefined
+          params?.model as string | undefined,
+          params?.executionPolicy as ExecutionPolicy | undefined,
+          params?.workingDir as string | undefined,
+          { taskId: params?.taskId as string | undefined, idempotencyKey: params?.idempotencyKey as string | undefined }
         );
 
       case 'orchestration.fire':
         return this.fireRemotePrompt(
           params?.prompt as string,
-          params?.hostId as string | undefined,
-          params?.goal as string | undefined
+          { hostId: params?.hostId as string | undefined, taskId: params?.taskId as string | undefined, idempotencyKey: params?.idempotencyKey as string | undefined, timeout: params?.timeout as number | undefined, goal: params?.goal as string | undefined }
         );
 
       // Telegram bot
@@ -448,6 +476,9 @@ class Daemon {
 
       case 'telegram.stop':
         return this.stopTelegram();
+
+      case 'telegram.pair':
+        return { data: await this.telegramBot.beginPairing(typeof params?.expectedSenderId === 'string' ? params.expectedSenderId : undefined) };
 
       case 'telegram.status':
         return this.getTelegramStatus();
@@ -494,9 +525,10 @@ class Daemon {
     };
   }
 
-  private async createSession(name?: string, model?: string): Promise<{ data?: Record<string, unknown>; error?: string }> {
+  private async createSession(name?: string, model?: string, workingDir?: string, executionPolicy: ExecutionPolicy = 'default'): Promise<{ data?: Record<string, unknown>; error?: string }> {
+    if (this.shuttingDown) return { error: 'Daemon is shutting down' };
     try {
-      const session = await this.sessionManager.create(name, model);
+      const session = await this.sessionManager.create(name, model, undefined, false, workingDir, executionPolicy);
       // Dispatch session.created hook
       this.hookEngine.dispatch('session.created', { sessionId: session.id, name: session.name }).catch(() => {});
       return { data: { sessionId: session.id, name: session.name, model: session.model } };
@@ -582,8 +614,8 @@ class Daemon {
     return { data: { success: true } };
   }
 
-  private watchSession(socket: Socket): { data?: Record<string, unknown>; error?: string } {
-    const session = this.sessionManager.current();
+  private watchSession(socket: Socket, sessionId?: string): { data?: Record<string, unknown>; error?: string } {
+    const session = sessionId ? this.sessionManager.get(sessionId) : this.sessionManager.current();
     if (!session) {
       return { error: 'No session selected' };
     }
@@ -599,59 +631,17 @@ class Daemon {
     return { data: { success: true } };
   }
 
-  private async sendPrompt(prompt: string, model?: string): Promise<{ data?: Record<string, unknown>; error?: string }> {
-    let session = this.sessionManager.current();
-
-    // Auto-create session if none exists
-    if (!session) {
-      const result = await this.createSession(undefined, model);
-      if (result.error) {
-        return result;
-      }
-      session = this.sessionManager.current();
-    }
-
-    if (!session) {
-      return { error: 'Failed to get or create session' };
-    }
-
-    // Apply model override if provided
-    if (model && session.model !== model) {
-      session.model = model;
-      this.sessionManager.save().catch(() => {});
-    }
-
+  private async sendPrompt(prompt: string, model?: string, executionPolicy?: ExecutionPolicy, workingDir?: string, sessionId?: string, submission?: TaskSubmission): Promise<{ data?: Record<string, unknown>; error?: string }> {
     try {
-      // Register listeners BEFORE sending prompt to avoid race conditions
-      // (notification fires synchronously right after prompt.completed in same tick)
-      const completionHandler = (info: { promptId?: string; code?: number }) => {
-        this.hookEngine.dispatch('prompt.completed', {
-          sessionId: session!.id,
-          promptId: info.promptId || '',
-          status: info.code === 0 || info.code === null ? 'success' : 'failed',
-          output: session!.getLastOutput()
-        }).catch(() => {});
-        session!.off('prompt.completed', completionHandler);
-      };
-      session.on('prompt.completed', completionHandler);
-
-      const notificationHandler = (notifData: NotificationInput) => {
-        this.notificationInbox.addNotification(notifData).catch(() => {});
-        this.forwardToTelegram(notifData);
-        session!.off('notification', notificationHandler);
-      };
-      session.on('notification', notificationHandler);
-
-      const promptId = await session.sendPrompt(prompt);
-
-      // Dispatch prompt.received hook
-      this.hookEngine.dispatch('prompt.received', {
-        sessionId: session.id,
-        promptId,
-        prompt
-      }).catch(() => {});
-
-      return { data: { promptId, sessionId: session.id } };
+      const session = await selectExecutionSession(this.sessionManager, { sessionId, workingDir, model, executionPolicy });
+      const promptId = await submitPromptWithDelivery(session, prompt, {
+        outbox: this.notificationOutbox,
+        hooks: this.hookEngine,
+        inbox: this.notificationInbox,
+        forward: (notification) => this.forwardToTelegram(notification),
+      }, submission);
+      const task = await this.sessionManager.getTask(promptId);
+      return { data: { promptId, taskId: promptId, sessionId: task?.sessionId ?? session.id, status: 'accepted' } };
     } catch (error) {
       return { error: error instanceof Error ? error.message : 'Failed to send prompt' };
     }
@@ -684,13 +674,18 @@ class Daemon {
         sessionManager: this.sessionManager,
         hookEngine: this.hookEngine,
         notificationInbox: this.notificationInbox,
+        notificationOutbox: this.notificationOutbox,
         telegramBot: this.telegramBot,
         orchestrationManager: this.orchestrationManager,
         configDir: this.config.configDir,
         onTmuxTranscript: (sessionId, transcriptPath) =>
           this.rememberTmuxTranscript(sessionId, transcriptPath),
-        onTmuxSession: (sessionId, sessionName, agent, goal) =>
-          this.rememberCodexTmuxSession(sessionId, sessionName, agent, goal),
+        onTmuxSession: async (sessionId, sessionName, agent, goal) => {
+          const canonical = this.tmuxRegistry.register(sessionId, sessionName, agent, goal);
+          if (canonical) await this.tmuxRegistry.flush();
+          return canonical;
+        },
+        onTmuxContext: (sessionId, turns) => this.rememberTmuxContext(sessionId, turns),
       });
 
       const address = await this.restServer.start();
@@ -820,6 +815,7 @@ class Daemon {
         headers: options.headers as Record<string, string> | undefined,
         timeout: options.timeout as number | undefined,
         retries: options.retries as number | undefined,
+        secret: options.secret as string | undefined,
         transform: options.transform as string | undefined,
         sessionFilter: options.sessionFilter as string | undefined
       });
@@ -874,7 +870,7 @@ class Daemon {
       });
 
       await this.orchestrationManager.addHost(host);
-      return { data: { host } };
+      return { data: { host: redactRemoteHost(host) } };
     } catch (error) {
       return { error: error instanceof Error ? error.message : 'Failed to add host' };
     }
@@ -926,32 +922,14 @@ class Daemon {
   }
 
   private async sendRemotePrompt(
-    prompt: string,
-    hostId?: string,
-    sessionId?: string
+    prompt: string, options: RemoteSendOptions & { hostId?: string; sessionId?: string } = {}
   ): Promise<{ data?: Record<string, unknown>; error?: string }> {
-    if (!prompt) {
-      return { error: 'Prompt is required' };
-    }
-
+    if (!prompt?.trim()) return { error: 'Prompt is required' };
+    if (options.timeout !== undefined && (!Number.isFinite(options.timeout) || options.timeout < 1 || options.timeout > 86400000)) return { error: 'Timeout must be between 1 and 86400000 milliseconds' };
     try {
-      const result = await this.orchestrationManager.sendPrompt(prompt, {
-        hostId,
-        sessionId,
-        timeout: 300000
-      });
-
-      return {
-        data: {
-          sessionId: result.sessionId,
-          promptId: result.promptId,
-          status: result.status,
-          output: result.output,
-          error: result.error,
-          host: result.host,
-          latency: result.latency
-        }
-      };
+      const result = await this.orchestrationManager.sendPrompt(prompt, options);
+      void this.remoteDelivery.reconcile().catch(() => {});
+      return { data: { ...result } };
     } catch (error) {
       return { error: error instanceof Error ? error.message : 'Failed to send remote prompt' };
     }
@@ -1095,355 +1073,42 @@ class Daemon {
     };
   }
 
-  /**
-   * Enumerate live tmux panes that are running `claude` and expose them
-   * as virtual sessions so they show up in the Telegram /sessions list and
-   * are targetable by /select.
-   *
-   * Virtual session id = "tmux:<session:window.pane>" — the same opaque
-   * identifier format used by the Stop hook's /api/notify payloads, so the
-   * Telegram bot's existing sessionMap (for reply-to-notification routing)
-   * and the /select handler line up with zero changes.
-   *
-   * Status is inferred from the first glyph of the pane title — Claude Code
-   * uses `✳` when idle/waiting and a braille spinner char (`⠂⠄⠠⠐⠈⠁⠃⠇`…)
-   * while working. Anything that isn't `✳` is treated as busy.
-   */
-  private listTmuxClaudePanes(): Array<{
-    id: string;
-    name: string;
-    status: string;
-    selected: boolean;
-    createdAt: string;
-    goal?: string;
-  }> {
-    try {
-      const out = spawnSync(
-        'tmux',
-        ['list-panes', '-a', '-F', '#{session_name}:#{window_index}.#{pane_index}|#{pane_current_command}|#{pane_title}'],
-        { encoding: 'utf8', timeout: 2000 }
-      );
-      if (out.status !== 0 || !out.stdout) return [];
-
-      const panes: ReturnType<Daemon['listTmuxClaudePanes']> = [];
-      for (const line of out.stdout.split('\n')) {
-        if (!line) continue;
-        const [target, cmd, rawTitle] = line.split('|', 3);
-        if (cmd !== 'claude') continue;
-
-        const title = (rawTitle || '').trim();
-        // First grapheme is the busy/idle glyph; everything after is the slug.
-        // We split on the first space after the glyph.
-        const spaceIdx = title.indexOf(' ');
-        const glyph = spaceIdx >= 0 ? title.slice(0, spaceIdx) : title;
-        const slug = spaceIdx >= 0 ? title.slice(spaceIdx + 1) : '';
-        const status = glyph === '✳' ? 'idle' : 'busy';
-
-        panes.push({
-          id: `tmux:${target}`,
-          name: title ? `${target} ${title}` : target,
-          status,
-          selected: false,
-          createdAt: '', // unknown for external panes
-          goal: slug || undefined,
-        });
-      }
-      return panes;
-    } catch {
-      return [];
-    }
-  }
-
-  /**
-   * Record a tmux session → Claude Code transcript mapping. Called from
-   * /api/notify when the cb-notify.sh hook forwards a Stop event with a
-   * transcriptPath. Prunes entries older than TMUX_TRANSCRIPT_TTL_MS.
-   */
   private rememberTmuxTranscript(sessionId: string, transcriptPath: string): void {
     if (!sessionId.startsWith('tmux:') || !transcriptPath) return;
-    const now = Date.now();
-    this.tmuxTranscriptCache.set(sessionId, { transcriptPath, lastSeen: now });
-
-    // Opportunistic TTL prune — cheap, runs at write time.
-    for (const [key, entry] of this.tmuxTranscriptCache) {
-      if (now - entry.lastSeen > Daemon.TMUX_TRANSCRIPT_TTL_MS) {
-        this.tmuxTranscriptCache.delete(key);
-      }
+    this.tmuxTranscriptCache.delete(sessionId);
+    this.tmuxTranscriptCache.set(sessionId, { transcriptPath, lastSeen: Date.now() });
+    for (const [id, cached] of this.tmuxTranscriptCache) {
+      if (Date.now() - cached.lastSeen > Daemon.TMUX_TRANSCRIPT_TTL_MS || this.tmuxTranscriptCache.size > 500) this.tmuxTranscriptCache.delete(id);
     }
   }
 
-  /**
-   * Record a Codex tmux session seen via /api/notify. Called when the payload
-   * carries `agent: "codex"`. Unlike Claude panes (enumerated from tmux), Codex
-   * panes report `node` as their current command, so this registry is the only
-   * way the daemon learns about them for the /sessions list.
-   */
-  private rememberCodexTmuxSession(
-    sessionId: string,
-    sessionName: string | undefined,
-    agent: string,
-    goal: string | undefined
-  ): void {
-    if (agent !== 'codex' || !sessionId.startsWith('tmux:')) return;
-    const now = Date.now();
-    this.codexTmuxSessions.set(sessionId, {
-      name: sessionName,
-      goal: goal ? goal.split('/').filter(Boolean).pop() : undefined,
-      lastSeen: now,
-    });
-
-    // Opportunistic TTL prune.
-    for (const [key, entry] of this.codexTmuxSessions) {
-      if (now - entry.lastSeen > Daemon.TMUX_TRANSCRIPT_TTL_MS) {
-        this.codexTmuxSessions.delete(key);
-      }
+  private rememberTmuxContext(sessionId: string, turns: TranscriptTurn[]): void {
+    if (!sessionId.startsWith('tmux:')) return;
+    this.tmuxInlineContext.delete(sessionId);
+    this.tmuxInlineContext.set(sessionId, { lastSeen: Date.now(), turns: turns.slice(-6).map(turn => ({ role: turn.role, text: turn.text.slice(0, 600) })) });
+    for (const [id, cached] of this.tmuxInlineContext) {
+      if (Date.now() - cached.lastSeen > Daemon.TMUX_TRANSCRIPT_TTL_MS || this.tmuxInlineContext.size > 500) this.tmuxInlineContext.delete(id);
     }
   }
 
-  /**
-   * Enumerate registered Codex tmux sessions whose pane is still alive, as
-   * virtual sessions for the Telegram /sessions list. Liveness is confirmed
-   * against the current set of tmux targets (one cheap `tmux list-panes -a`);
-   * dead entries are pruned from the registry. Status is always reported as
-   * "idle" — Codex only notifies at turn boundaries, so the daemon has no
-   * busy/idle signal between turns the way Claude's pane-title glyph provides.
-   */
-  private listCodexTmuxPanes(): Array<{
-    id: string;
-    name: string;
-    status: string;
-    selected: boolean;
-    createdAt: string;
-    goal?: string;
-  }> {
-    if (this.codexTmuxSessions.size === 0) return [];
-
-    // Build the set of live tmux targets so we don't list panes that have
-    // since closed. Targets only — cheaper than pulling command/title.
-    const live = new Set<string>();
-    try {
-      const out = spawnSync(
-        'tmux',
-        ['list-panes', '-a', '-F', '#{session_name}:#{window_index}.#{pane_index}'],
-        { encoding: 'utf8', timeout: 2000 }
-      );
-      if (out.status === 0 && out.stdout) {
-        for (const line of out.stdout.split('\n')) {
-          if (line) live.add(line.trim());
-        }
-      }
-    } catch {
-      // tmux unavailable — fall through, registry entries simply won't list
+  private buildTmuxSessionContext(sessionId: string) {
+    const pane = this.tmuxRegistry.aliveSessions().find(entry => entry.id === sessionId);
+    if (!pane) {
+      this.tmuxTranscriptCache.delete(sessionId);
+      this.tmuxInlineContext.delete(sessionId);
+      return undefined;
     }
-
-    const sessions: ReturnType<Daemon['listCodexTmuxPanes']> = [];
-    for (const [id, entry] of this.codexTmuxSessions) {
-      const target = id.slice('tmux:'.length);
-      if (!live.has(target)) {
-        this.codexTmuxSessions.delete(id); // pane closed — forget it
-        continue;
-      }
-      sessions.push({
-        id,
-        name: entry.name || `${target} codex`,
-        status: 'idle',
-        selected: false,
-        createdAt: '',
-        goal: entry.goal,
-      });
-    }
-    return sessions;
-  }
-
-  /**
-   * Build a SessionContext for a tmux-hosted session so the Telegram voice
-   * pipeline can ground `optimizePrompt` with real conversation history.
-   *
-   * Looks up the cached transcript, pulls the pane's current name/goal/status
-   * from a fresh tmux enumeration, and walks the JSONL backwards to extract
-   * the last N real user↔assistant turn pairs. Tool-result wrappers
-   * (<task-notification>, <system-reminder>, tool_result content arrays) are
-   * filtered out — they'd just confuse the optimizer with internal noise.
-   */
-  private buildTmuxSessionContext(sessionId: string): {
-    sessionName?: string;
-    goal?: string;
-    lastOutput: string;
-    status: string;
-  } | undefined {
-    const target = sessionId.slice('tmux:'.length);
-
-    // Find the current pane entry for labels/status. If the pane has gone
-    // away we still return context from the transcript if we have one.
-    const panes = this.listTmuxClaudePanes();
-    const pane = panes.find((p) => p.id === sessionId);
-    // Codex panes aren't in the Claude enumeration — fall back to the registry
-    // populated from /api/notify for their label/goal.
-    const codex = pane ? undefined : this.codexTmuxSessions.get(sessionId);
-
-    const cached = this.tmuxTranscriptCache.get(sessionId);
-    if (!cached && !pane && !codex) return undefined;
-
     let lastOutput = '';
-    if (cached) {
-      try {
-        lastOutput = this.readLastTurnsFromTranscript(cached.transcriptPath, 3);
-      } catch {
-        // transcript file moved/rotated — drop the cache entry so we don't
-        // keep retrying a dead path
-        this.tmuxTranscriptCache.delete(sessionId);
-      }
+    const transcript = this.tmuxTranscriptCache.get(sessionId);
+    if (transcript && Date.now() - transcript.lastSeen <= Daemon.TMUX_TRANSCRIPT_TTL_MS) {
+      try { lastOutput = readLastTurnsFromTranscript(transcript.transcriptPath, 3); }
+      catch { this.tmuxTranscriptCache.delete(sessionId); }
     }
-
-    return {
-      sessionName: pane?.name || codex?.name || target,
-      goal: pane?.goal ?? codex?.goal,
-      lastOutput,
-      status: pane?.status || (codex ? 'idle' : 'unknown'),
-    };
-  }
-
-  /**
-   * Read the last `turns` user↔assistant exchanges from a Claude Code OR
-   * Codex transcript JSONL file and render them as a compact text block that
-   * can be handed to `optimizePrompt`.
-   *
-   * Two on-disk formats are supported (detected per-line, so a mixed file is
-   * harmless):
-   *  Claude Code:
-   *   - a "real" user message has `.message.content` as a string and does
-   *     NOT start with "<" (a <task-notification>/<system-reminder> wrapper)
-   *   - an assistant message is `.type == "assistant"`; join `content[]` items
-   *     where `type == "text"`
-   *  Codex rollout:
-   *   - `.type == "event_msg"` with `.payload.type == "user_message"` →
-   *     `.payload.message` (string); skip `<…>` env-context wrappers
-   *   - `.type == "event_msg"` with `.payload.type == "agent_message"` →
-   *     `.payload.message` (string)
-   *
-   * Each captured turn is trimmed to ~600 chars so the total output stays well
-   * under the 2000-char budget the bot already uses.
-   */
-  private readLastTurnsFromTranscript(path: string, turns: number): string {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const fs = require('fs') as typeof import('fs');
-    const raw = fs.readFileSync(path, 'utf8');
-    const lines = raw.split('\n').filter((l) => l.length > 0);
-
-    type Turn = { role: 'user' | 'assistant'; text: string };
-    const collected: Turn[] = [];
-
-    // Walk backwards — most recent first. Stop once we have `turns` user
-    // messages AND `turns` assistant messages (or run out of file).
-    let userCount = 0;
-    let assistantCount = 0;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (userCount >= turns && assistantCount >= turns) break;
-
-      let parsed: Record<string, unknown>;
-      try {
-        parsed = JSON.parse(lines[i]);
-      } catch {
-        continue;
-      }
-
-      const type = parsed.type as string | undefined;
-      if (!type) continue;
-
-      // ── Codex rollout format ──────────────────────────────────────────
-      if (type === 'event_msg') {
-        const payload = parsed.payload as { type?: string; message?: unknown } | undefined;
-        if (!payload || typeof payload.message !== 'string') continue;
-        if (payload.type === 'user_message' && userCount < turns) {
-          const trimmed = payload.message.trim();
-          if (!trimmed || trimmed.startsWith('<')) continue; // skip env-context wrappers
-          collected.push({ role: 'user', text: trimmed.slice(0, 600) });
-          userCount++;
-        } else if (payload.type === 'agent_message' && assistantCount < turns) {
-          const trimmed = payload.message.trim();
-          if (!trimmed) continue;
-          collected.push({ role: 'assistant', text: trimmed.slice(0, 600) });
-          assistantCount++;
-        }
-        continue;
-      }
-
-      // ── Claude Code format ────────────────────────────────────────────
-      const message = parsed.message as { role?: string; content?: unknown } | undefined;
-      if (!message) continue;
-
-      if (type === 'user' && userCount < turns) {
-        const content = message.content;
-        if (typeof content !== 'string') continue; // skip tool_result arrays
-        const trimmed = content.trim();
-        if (!trimmed || trimmed.startsWith('<')) continue; // skip wrappers
-        collected.push({ role: 'user', text: trimmed.slice(0, 600) });
-        userCount++;
-      } else if (type === 'assistant' && assistantCount < turns) {
-        const content = message.content;
-        if (!Array.isArray(content)) continue;
-        const text = (content as Array<{ type?: string; text?: string }>)
-          .filter((block) => block.type === 'text' && typeof block.text === 'string')
-          .map((block) => (block.text as string).trim())
-          .filter((t) => t.length > 0)
-          .join('\n');
-        if (!text) continue;
-        collected.push({ role: 'assistant', text: text.slice(0, 600) });
-        assistantCount++;
-      }
+    const inline = this.tmuxInlineContext.get(sessionId);
+    if (!lastOutput && inline && Date.now() - inline.lastSeen <= Daemon.TMUX_TRANSCRIPT_TTL_MS) {
+      lastOutput = inline.turns.map(turn => `${turn.role.toUpperCase()}: ${turn.text}`).join('\n\n');
     }
-
-    // Reverse to chronological order and format.
-    collected.reverse();
-    return collected
-      .map((turn) => (turn.role === 'user' ? `USER: ${turn.text}` : `ASSISTANT: ${turn.text}`))
-      .join('\n\n');
-  }
-
-  /**
-   * Type a prompt into an external Claude Code pane via tmux send-keys.
-   * Used when Telegram replies target a "tmux:<target>" virtual session ID.
-   *
-   * Uses `send-keys -l` so the text is sent literally (no key-name expansion,
-   * no risk of a stray "Enter" in the middle of a prompt), followed by a
-   * separate Enter to submit. This is the equivalent of pasting + pressing
-   * Return inside the pane.
-   */
-  private async sendToTmuxPane(target: string, text: string): Promise<void> {
-    // Accept only sane tmux targets — session:window.pane style. Reject
-    // anything containing shell metacharacters to avoid process injection
-    // even though we're using argv (defense in depth).
-    if (!/^[A-Za-z0-9_./:%@+-]+$/.test(target)) {
-      throw new Error(`Invalid tmux target: ${target}`);
-    }
-
-    const runTmux = (args: string[], stdin?: string) => new Promise<void>((resolve, reject) => {
-      const proc = spawn('tmux', args, {
-        stdio: [stdin !== undefined ? 'pipe' : 'ignore', 'ignore', 'pipe'],
-      });
-      let stderr = '';
-      proc.stderr?.on('data', (c: Buffer) => { stderr += c.toString(); });
-      proc.on('error', reject);
-      proc.on('exit', (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(`tmux exited ${code}: ${stderr.trim()}`));
-      });
-      if (stdin !== undefined) proc.stdin?.end(stdin);
-    });
-
-    // Stage the text in a tmux paste buffer, then paste it with bracketed-
-    // paste markers (-p). Claude Code's TUI uses the explicit start/end
-    // markers to finalize the [Pasted N lines] block deterministically.
-    // Using send-keys -l instead races: characters arrive fast, the TUI
-    // detects a paste heuristically, and the trailing Enter can land
-    // inside the paste-settle window — pasted content visible, never
-    // submitted. The settle delay below covers any residual lag before
-    // Enter submits the input.
-    const bufferName = `cb-${process.pid}-${Date.now()}`;
-    await runTmux(['load-buffer', '-b', bufferName, '-'], text);
-    await runTmux(['paste-buffer', '-p', '-d', '-b', bufferName, '-t', target]);
-    await new Promise((r) => setTimeout(r, 150));
-    await runTmux(['send-keys', '-t', target, 'Enter']);
+    return { sessionName: pane.name, goal: pane.goal, status: pane.status, lastOutput: lastOutput.slice(-2000) };
   }
 
   private forwardToTelegram(notification: {
@@ -1475,7 +1140,10 @@ class Daemon {
     prompt: string,
     name?: string,
     goal?: string,
-    model?: string
+    model?: string,
+    executionPolicy: ExecutionPolicy = 'default',
+    workingDir?: string,
+    submission?: TaskSubmission
   ): Promise<{ data?: Record<string, unknown>; error?: string }> {
     if (!prompt) return { error: 'Prompt is required' };
 
@@ -1484,104 +1152,29 @@ class Daemon {
         name || `task-${nanoid(4)}`,
         model,
         goal || prompt.slice(0, 100),
-        true
+        true,
+        workingDir,
+        executionPolicy
       );
 
-      const promptId = await session.sendPrompt(prompt);
+      const promptId = await submitPromptWithDelivery(session, prompt, {
+        outbox: this.notificationOutbox,
+        hooks: this.hookEngine,
+        inbox: this.notificationInbox,
+        forward: (notification) => this.forwardToTelegram(notification),
+      }, submission);
 
-      // Listen for completion to write notification to inbox
-      const completionHandler = (info: { promptId?: string; code?: number }) => {
-        if (info.promptId === promptId) {
-          const structured = session.getStructuredResult();
-          const fullResult = structured?.result || session.getLastOutput();
-          this.notificationInbox.addNotification({
-            sessionId: session.id,
-            sessionName: session.name,
-            type: info.code === 0 || info.code === null ? 'prompt.completed' : 'prompt.error',
-            goal: session.goal,
-            exitCode: info.code ?? null,
-            durationMs: structured?.durationMs,
-            costUsd: structured?.costUsd,
-            resultPreview: fullResult.slice(0, 200),
-            resultFull: fullResult.slice(0, 50000),
-            claudeSessionId: session.getClaudeSessionId(),
-            viewCommand: `cb -l`,
-          }).catch(() => {});
-
-          // Forward to Telegram
-          this.forwardToTelegram({
-            sessionId: session.id,
-            sessionName: session.name,
-            type: info.code === 0 || info.code === null ? 'prompt.completed' : 'prompt.error',
-            goal: session.goal,
-            exitCode: info.code ?? null,
-            durationMs: structured?.durationMs,
-            costUsd: structured?.costUsd,
-            resultPreview: fullResult.slice(0, 200),
-            resultFull: fullResult,
-          });
-
-          this.hookEngine.dispatch('prompt.completed', {
-            sessionId: session.id,
-            promptId,
-            status: info.code === 0 || info.code === null ? 'success' : 'failed',
-            output: session.getLastOutput()
-          }).catch(() => {});
-
-          session.off('prompt.completed', completionHandler);
-        }
-      };
-      session.on('prompt.completed', completionHandler);
-
-      return { data: { sessionId: session.id, promptId, goal: session.goal } };
+      const task = await this.sessionManager.getTask(promptId);
+      return { data: { sessionId: task?.sessionId ?? session.id, promptId, taskId: promptId, goal: task?.goal ?? session.goal, status: 'accepted' } };
     } catch (error) {
       return { error: error instanceof Error ? error.message : 'Failed to fire task' };
     }
   }
 
   private async fireRemotePrompt(
-    prompt: string,
-    hostId?: string,
-    goal?: string
+    prompt: string, options: RemoteSendOptions & { hostId?: string } = {}
   ): Promise<{ data?: Record<string, unknown>; error?: string }> {
-    if (!prompt) return { error: 'Prompt is required' };
-
-    const trackingId = nanoid(8);
-    const taskGoal = goal || prompt.slice(0, 100);
-
-    // Fire asynchronously - don't await
-    this.orchestrationManager.sendPrompt(prompt, {
-      hostId,
-      timeout: 600000
-    }).then(async (result) => {
-      const notif = {
-        sessionId: result.sessionId,
-        sessionName: `remote:${result.host}`,
-        type: (result.status === 'completed' ? 'prompt.completed' : 'prompt.error') as 'prompt.completed' | 'prompt.error',
-        goal: taskGoal,
-        exitCode: result.status === 'completed' ? 0 : 1,
-        durationMs: result.latency,
-        resultPreview: result.output?.slice(0, 200),
-        resultFull: result.output?.slice(0, 50000),
-        viewCommand: `cb -i`,
-      };
-      await this.notificationInbox.addNotification(notif);
-      this.forwardToTelegram(notif);
-    }).catch(async (error) => {
-      const notif = {
-        sessionId: trackingId,
-        sessionName: `remote:${hostId || 'auto'}`,
-        type: 'prompt.error' as const,
-        goal: taskGoal,
-        exitCode: 1,
-        resultPreview: error instanceof Error ? error.message : String(error),
-        viewCommand: `cb -i`,
-      };
-      await this.notificationInbox.addNotification(notif);
-      this.forwardToTelegram(notif);
-    });
-
-    return { data: { trackingId, goal: taskGoal, status: 'dispatched' } };
+    return this.sendRemotePrompt(prompt, { ...options, timeout: options.timeout ?? 10000, waitForCompletion: false });
   }
 
   private log(message: string): void {
@@ -1590,119 +1183,55 @@ class Daemon {
     // In production, also write to log file
   }
 
-  private isProcessAlive(pid: number): boolean {
-    if (!Number.isInteger(pid) || pid <= 0) return false;
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
+  async cleanupFailedStart(): Promise<void> {
+    this.shuttingDown = true;
+    if (this.cleanupInterval) clearInterval(this.cleanupInterval);
+    await this.telegramBot.stop().catch(() => {});
+    await this.sessionManager.stopAll().catch(() => {});
+    this.remoteDelivery.stop();
+    await this.orchestrationManager.shutdown().catch(() => {});
+    await this.notificationOutbox.stop().catch(() => {});
+    if (this.server?.listening) {
+      for (const client of this.clients) client.destroy();
+      await new Promise<void>(resolve => this.server!.close(() => resolve()));
     }
-  }
-
-  private async acquireLock(): Promise<void> {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        await writeFile(this.config.lockFile, `${process.pid}\n`, { flag: 'wx' });
-        return;
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code;
-        if (code !== 'EEXIST') throw error;
-
-        let existingPid = NaN;
-        try {
-          existingPid = parseInt(await readFile(this.config.lockFile, 'utf-8'), 10);
-        } catch {
-          // If the lock cannot be read, remove it once and retry.
-        }
-
-        if (this.isProcessAlive(existingPid)) {
-          console.error(`Daemon already running (lock held by PID: ${existingPid})`);
-          process.exit(1);
-        }
-
-        await unlink(this.config.lockFile).catch(() => {});
-      }
-    }
-
-    throw new Error('Failed to acquire daemon lock');
-  }
-
-  private async releaseLock(): Promise<void> {
-    try {
-      const lockPid = parseInt(await readFile(this.config.lockFile, 'utf-8'), 10);
-      if (lockPid === process.pid) {
-        await unlink(this.config.lockFile);
-      }
-    } catch {
-      // Ignore cleanup errors
-    }
-  }
-
-  private async cleanup(releaseLock = false): Promise<void> {
-    try {
-      if (existsSync(this.config.pidFile)) {
-        await unlink(this.config.pidFile);
-      }
-      if (existsSync(this.config.socketPath)) {
-        await unlink(this.config.socketPath);
-      }
-      if (releaseLock) {
-        await this.releaseLock();
-      }
-    } catch {
-      // Ignore cleanup errors
-    }
+    await this.instanceLock.release();
   }
 
   private async shutdown(): Promise<void> {
-    this.log('Shutting down...');
-
-    // Dispatch daemon.stopped hook (don't await - best effort)
-    this.hookEngine.dispatch('daemon.stopped', { pid: process.pid }).catch(() => {});
-
-    // Stop REST server if running
-    if (this.restServer) {
-      await this.restServer.stop();
-      this.hookEngine.dispatch('rest.stopped', {}).catch(() => {});
-      this.restServer = null;
-    }
-
-    // Stop cleanup interval
-    if (this.cleanupInterval) {
-      clearInterval(this.cleanupInterval);
-    }
-
-    // Stop Telegram bot
-    if (this.telegramBot.isRunning()) {
-      await this.telegramBot.stop();
-    }
-
-    // Stop orchestration
-    await this.orchestrationManager.shutdown();
-
-    // Close all client connections
-    for (const client of this.clients) {
-      client.end();
-    }
-
-    // Stop all sessions
-    await this.sessionManager.stopAll();
-
-    // Close server
-    this.server?.close();
-
-    // Clean up files
-    await this.cleanup(true);
-
+    if (this.shuttingDown) return;
+    this.shuttingDown = true;
+    if (this.cleanupInterval) clearInterval(this.cleanupInterval);
+    let failed = false;
+    const settle = async (label: string, operation: Promise<unknown>) => {
+      try { await operation; }
+      catch { failed = true; this.log(`${label} could not finish; persisted state was preserved`); }
+    };
+    // Close acceptance before waiting for cancellation or network shutdown.
+    const sessionsStopped = settle('Task cancellation', this.sessionManager.stopAll());
+    this.remoteDelivery.stop();
+    const remoteStopped = settle('Remote request shutdown', this.orchestrationManager.shutdown());
+    const serverClosed = this.server?.listening
+      ? new Promise<void>(resolve => this.server!.close(() => resolve())) : Promise.resolve();
+    for (const client of this.clients) client.destroy();
+    await settle('REST shutdown', this.restServer?.stop() || Promise.resolve());
+    await settle('Telegram shutdown', this.telegramBot.stop());
+    await remoteStopped;
+    await sessionsStopped;
+    await settle('Notification shutdown', this.notificationOutbox.stop());
+    await settle('Native session identity persistence', this.tmuxRegistry.flush());
+    await settle('IPC shutdown', serverClosed);
+    await settle('Daemon ownership cleanup', this.instanceLock.release());
     this.log('Daemon stopped');
-    process.exit(0);
+    process.exit(failed ? 1 : 0);
   }
+
 }
 
 // Start daemon
 const daemon = new Daemon();
-daemon.start().catch((error) => {
+daemon.start().catch(async (error) => {
+  await daemon.cleanupFailedStart().catch(() => {});
   console.error('Failed to start daemon:', error);
   process.exit(1);
 });

@@ -1,0 +1,33 @@
+{
+  "kind": "claude-b-isolated-acceptance",
+  "version": 1,
+  "timestamp": "2026-11-07T19:20:35.096Z",
+  "node": "20.19.6",
+  "platform": "linux",
+  "arch": "x64",
+  "artifacts": {
+    "dist/chunk-Q6C5SGCC.js": "91db8973feb9bdc8dd32912e4d772ab2076065df4b955b704346650a85722a19",
+    "dist/cli/index.d.ts": "a59c47872b71f12589942892464e764c0db350c20b72228645615cc36e0a0725",
+    "dist/cli/index.js": "d38259fb29a18bbb5246cb3304d08e4e87dd8a2a3755672bc857881d1ebdc4c6",
+    "dist/daemon/index.d.ts": "6caa0b04bdc10582a3729dae9244f21c5bec0b9ffe7e2a84999c2f868f5dd9be",
+    "dist/daemon/index.js": "879cb1fce96298cebd995123fcd1c50010a20704114991c4517f80ec8f5b4a27"
+  },
+  "outcomes": {
+    "ipcTasks": "passed",
+    "restAcceptanceAndResults": "passed",
+    "callerDirectory": "passed",
+    "defaultAndExplicitPolicy": "passed",
+    "cancellation": "passed",
+    "exactCliResultAndExit": "passed",
+    "durableOutboxRestart": "passed",
+    "interruptedRecovery": "passed",
+    "ownedOrphanTermination": "passed",
+    "noExecutionReplay": "passed",
+    "isolatedStateRollback": "passed"
+  },
+  "liveServicesChanged": false,
+  "liveConfigurationChanged": false,
+  "externalProvidersUsed": false,
+  "publicationPerformed": false,
+  "sourceCommit": "900084705cc533b8ad70b9333762c2b563ab8beb"
+}

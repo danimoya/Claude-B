@@ -3,12 +3,28 @@ import { Socket } from 'net';
 import { randomUUID } from 'crypto';
 import { nanoid } from 'nanoid';
 import { EventEmitter } from 'events';
-import { mkdir, writeFile, readFile, appendFile } from 'fs/promises';
-import { existsSync } from 'fs';
+import { mkdir, readFile, appendFile, rm } from 'fs/promises';
+import { existsSync, realpathSync, statSync } from 'fs';
+import { resolve } from 'path';
 import { getClaudePath } from '../utils/claude-detector.js';
+import { TaskStore, isTerminalTask } from '../jobs/store.js';
+import type { TaskRecord, TaskSubmission, TaskStatus } from '../jobs/types.js';
+import type { NotificationInput } from '../notifications/inbox.js';
+import { atomicWriteFile, atomicWriteJson } from '../storage/atomic-json.js';
+import { captureTaskExecutor } from '../jobs/executor.js';
 import type * as NodePty from 'node-pty';
 // Node-pty types are kept for the NodePty.IPty branches in write/resize/kill,
 // but the active spawn path uses ChildProcess via `claude --print`.
+
+function ignoreLateError(): void { /* an already finalized child has no active task */ }
+
+function signalChild(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (process.platform !== 'win32' && child.pid) {
+    try { process.kill(-child.pid, signal); return; }
+    catch { /* fall back if the process group has already disappeared */ }
+  }
+  try { child.kill(signal); } catch { /* process already exited */ }
+}
 
 export interface StructuredResult {
   result: string;
@@ -17,6 +33,8 @@ export interface StructuredResult {
   numTurns: number;
   isError: boolean;
 }
+
+export type ExecutionPolicy = 'default' | 'bypass';
 
 export interface SessionState {
   id: string;
@@ -31,6 +49,7 @@ export interface SessionState {
   claudeSessionId?: string;  // Claude Code's own session UUID for conversation continuity
   goal?: string;             // Task objective for fire-and-forget
   fireAndForget?: boolean;   // Whether this is a fire-and-forget task
+  executionPolicy?: ExecutionPolicy;
 }
 
 interface PromptEntry {
@@ -50,6 +69,8 @@ export class Session extends EventEmitter {
   public goal?: string;
   public fireAndForget: boolean = false;
   public lastActivityAt: string;
+  public executionPolicy: ExecutionPolicy;
+  public readonly taskStore: TaskStore;
 
   private workingDir: string;
   private sessionDir: string;
@@ -61,7 +82,18 @@ export class Session extends EventEmitter {
   private promptCount: number = 0;
   private attachedSockets: Set<Socket> = new Set();
   private watchingSockets: Set<Socket> = new Set();
-  private promptQueue: Array<{ prompt: string; promptId: string }> = [];
+  private promptQueue: TaskRecord[] = [];
+  private activeTask: TaskRecord | null = null;
+  private finalization: Promise<void> | null = null;
+  private stopping = false;
+  private stopOperation: Promise<void> | null = null;
+  private submissions = new Set<Promise<string>>();
+  private cancelled = new Set<string>();
+  private publishedTasks = new Set<string>();
+  private outputCheckpoint: Promise<unknown> = Promise.resolve();
+  private lastError?: string;
+  private activeFailure?: string;
+  private cleanupProcess: (() => void) | null = null;
   private isProcessing = false;
   private isReady = false;
   private readyResolvers: Array<() => void> = [];
@@ -84,6 +116,8 @@ export class Session extends EventEmitter {
     this.goal = state.goal;
     this.fireAndForget = state.fireAndForget || false;
     this.lastActivityAt = state.lastActivityAt || state.createdAt;
+    this.executionPolicy = state.executionPolicy === 'bypass' ? 'bypass' : 'default';
+    this.taskStore = new TaskStore(configDir);
   }
 
   /**
@@ -96,6 +130,17 @@ export class Session extends EventEmitter {
         this.lastOutput = await readFile(outputPath, 'utf-8');
       }
     } catch { /* ignore */ }
+    const tasks = (await this.listTasks()).filter((task) => isTerminalTask(task.status));
+    tasks.sort((a, b) => (a.completedAt || a.updatedAt).localeCompare(b.completedAt || b.updatedAt));
+    const latest = tasks.at(-1);
+    if (latest) {
+      this.lastPromptId = latest.id;
+      this.lastOutput = latest.rawOutput;
+      this.lastStructuredResult = latest.structuredResult;
+      this.lastError = latest.error;
+      this.status = 'idle';
+      return;
+    }
 
     try {
       const resultPath = `${this.sessionDir}/last-result.json`;
@@ -110,18 +155,20 @@ export class Session extends EventEmitter {
    * Persist last output and structured result to disk.
    */
   private async persistOutput(): Promise<void> {
-    try {
-      await this.ensureSessionDir();
-      if (this.lastOutput) {
-        await writeFile(`${this.sessionDir}/last-output.txt`, this.lastOutput);
-      }
-      if (this.lastStructuredResult) {
-        await writeFile(`${this.sessionDir}/last-result.json`, JSON.stringify(this.lastStructuredResult));
-      }
-    } catch { /* ignore */ }
+    await this.ensureSessionDir();
+    // Empty output is meaningful: it must replace an earlier prompt's result.
+    await atomicWriteFile(`${this.sessionDir}/last-output.txt`, this.lastOutput);
+    if (this.lastStructuredResult) {
+      await atomicWriteJson(`${this.sessionDir}/last-result.json`, this.lastStructuredResult);
+    } else {
+      await rm(`${this.sessionDir}/last-result.json`, { force: true });
+    }
   }
 
-  static create(name: string | undefined, configDir: string, model?: string, goal?: string, fireAndForget?: boolean): Session {
+  static create(name: string | undefined, configDir: string, model?: string, goal?: string, fireAndForget?: boolean, workingDir = process.cwd(), executionPolicy: ExecutionPolicy = 'default'): Session {
+    const projectDir = realpathSync(resolve(workingDir));
+    if (!statSync(projectDir).isDirectory()) throw new Error('Working directory must be a directory');
+    if (executionPolicy !== 'default' && executionPolicy !== 'bypass') throw new Error('Invalid execution policy');
     const now = new Date().toISOString();
     const state: SessionState = {
       id: nanoid(8),
@@ -130,7 +177,8 @@ export class Session extends EventEmitter {
       status: 'idle',
       createdAt: now,
       lastActivityAt: now,
-      workingDir: process.cwd(),
+      workingDir: projectDir,
+      executionPolicy,
       promptCount: 0,
       goal,
       fireAndForget
@@ -151,7 +199,8 @@ export class Session extends EventEmitter {
       promptCount: this.promptCount,
       claudeSessionId: this.claudeSessionId,
       goal: this.goal,
-      fireAndForget: this.fireAndForget
+      fireAndForget: this.fireAndForget,
+      executionPolicy: this.executionPolicy
     };
   }
 
@@ -164,7 +213,7 @@ export class Session extends EventEmitter {
   }
 
   private async ensureSessionDir(): Promise<void> {
-    await mkdir(this.sessionDir, { recursive: true });
+    await mkdir(this.sessionDir, { recursive: true, mode: 0o700 });
   }
 
   private async savePromptToHistory(entry: PromptEntry): Promise<void> {
@@ -186,6 +235,13 @@ export class Session extends EventEmitter {
     this.outputBuffer.push(data);
     this.currentPromptOutput.push(data);
     this.broadcastOutput(data);
+    this.emitSafely('output', data);
+    const task = this.activeTask;
+    if (task) {
+      const output = this.currentPromptOutput.join('');
+      this.outputCheckpoint = this.outputCheckpoint.catch(() => {}).then(() => this.taskStore.update(task.id, { rawOutput: output, output }));
+      void this.outputCheckpoint.catch(() => {});
+    }
 
     // Check if Claude Code is ready (showing the input prompt "❯")
     // This indicates the startup is complete and it's ready for input
@@ -193,220 +249,243 @@ export class Session extends EventEmitter {
       this.markReady();
     }
 
-    // Check for completion markers (Claude's response ended)
-    // This is heuristic - we look for common patterns indicating the AI finished
-    const fullOutput = this.currentPromptOutput.join('');
-    if (this.isProcessing && this.detectPromptCompletion(fullOutput)) {
-      this.completeCurrentPrompt();
-    }
+    // --print output is arbitrary text. Only process close establishes a
+    // terminal result; prompt-looking text and separators are ordinary output.
   }
 
-  private detectPromptCompletion(output: string): boolean {
-    // Detection heuristics for when Claude finishes responding:
-    // 1. Output ends with a prompt indicator (>)
-    // 2. Output contains the typical Claude Code ending patterns
-    // 3. After a period of no new output (handled by timeout)
-
-    // For --print mode, completion is indicated by process exit
-    // For interactive mode, we look for patterns
-    const trimmed = output.trim();
-
-    // Check for common completion patterns
-    if (trimmed.endsWith('>') || trimmed.endsWith('> ')) {
-      return true;
-    }
-
-    // Check if output contains typical response end markers
-    if (trimmed.includes('─────') && trimmed.split('─────').length > 2) {
-      // Multiple separator lines often indicate end of response
-      return true;
-    }
-
-    return false;
-  }
-
-  private completeCurrentPrompt(): void {
-    if (!this.isProcessing) return;
-
-    this.isProcessing = false;
-    this.status = 'idle';
-    this.lastActivityAt = new Date().toISOString();
-    this.lastOutput = this.currentPromptOutput.join('');
-
-    // Save to history
-    if (this.lastPromptId) {
-      this.savePromptToHistory({
-        id: this.lastPromptId,
-        prompt: '', // We don't store the prompt here, it was logged when sent
-        timestamp: new Date().toISOString(),
-        status: 'completed',
-        output: this.lastOutput
-      }).catch(() => {});
-    }
-
-    // Persist output to disk for restart recovery
-    this.persistOutput().catch(() => {});
-
-    // Notify watchers that processing completed
-    this.broadcastStatus('completed', { promptId: this.lastPromptId });
-
-    this.emit('prompt.completed', { promptId: this.lastPromptId });
-    this.notifyCompletion(0);
-    this.currentPromptOutput = [];
-
-    // Process next prompt in queue
-    this.processNextPrompt();
-  }
-
-  private handleProcessExit(code: number | null): void {
+  private async finalizeActive(code: number | null, failureOverride?: string, statusOverride?: TaskStatus): Promise<void> {
+    if (this.finalization) return this.finalization;
+    const task = this.activeTask;
+    if (!task) return;
+    this.cleanupProcess?.();
+    this.cleanupProcess = null;
     this.process = null;
-    this.isReady = false; // Reset ready state for next process
-
-    if (this.isProcessing) {
-      this.status = 'idle';
-      this.lastOutput = this.currentPromptOutput.join('');
-
-      // Persist output to disk for restart recovery
-      this.persistOutput().catch(() => {});
-
-      // Notify watchers that processing completed
-      this.broadcastStatus('completed', { promptId: this.lastPromptId, exitCode: code });
-
-      this.emit('prompt.completed', { promptId: this.lastPromptId, code });
-      this.notifyCompletion(code);
+    this.isReady = false;
+    const operation = this.finishTask(task, code, failureOverride || this.activeFailure, statusOverride);
+    this.finalization = operation.finally(() => {
+      this.activeTask = null;
       this.currentPromptOutput = [];
       this.isProcessing = false;
-    }
-
-    // Process exited - for --print mode this is expected after each prompt
-    // Restart for next prompt if needed
-    this.processNextPrompt();
-  }
-
-  private handleProcessError(error: Error): void {
-    this.status = 'idle';
-    this.lastOutput = `Error: ${error.message}`;
-    this.emit('prompt.error', { promptId: this.lastPromptId, error: error.message });
-    this.process = null;
-    this.isProcessing = false;
-
-    // Emit errors for any queued prompts and clear the queue
-    while (this.promptQueue.length > 0) {
-      const queued = this.promptQueue.shift();
-      if (queued) {
-        this.emit('prompt.error', { promptId: queued.promptId, error: error.message });
-      }
-    }
-  }
-
-  async sendPrompt(prompt: string): Promise<string> {
-    // Generate promptId immediately and return it
-    // The actual processing happens asynchronously
-    const promptId = nanoid(8);
-    this.promptQueue.push({ prompt, promptId });
-
-    // Start processing asynchronously (don't await)
-    this.processNextPrompt().catch((err) => {
-      console.error('Error processing prompt:', err);
+      this.status = 'idle';
+      this.finalization = null;
+      void this.processNextPrompt().catch((error) => console.error('Failed to start queued task:', error));
     });
+    return this.finalization;
+  }
 
-    return promptId;
+  private async finishTask(task: TaskRecord, code: number | null, failureOverride?: string, statusOverride?: TaskStatus): Promise<void> {
+    await this.outputCheckpoint.catch(() => {});
+    this.lastOutput = this.currentPromptOutput.join('');
+    this.lastActivityAt = new Date().toISOString();
+    let failure = failureOverride || (code !== 0 || this.lastStructuredResult?.isError
+      ? this.lastStructuredResult?.result || this.lastOutput || `Process terminated (exit ${code})`
+      : undefined);
+    const cancelled = this.cancelled.has(task.id) || statusOverride === 'cancelled';
+    if (cancelled) failure = failureOverride || 'Task cancelled';
+    try {
+      await this.persistOutput();
+      await this.savePromptToHistory({ id: task.id, prompt: '', timestamp: this.lastActivityAt,
+        status: failure ? 'error' : 'completed', output: this.lastOutput });
+    } catch (error) {
+      failure = `Failed to persist result: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    const status = cancelled ? 'cancelled' : statusOverride || (failure ? 'error' : 'completed');
+    const terminal = await this.taskStore.update(task.id, {
+      status, completedAt: this.lastActivityAt,
+      output: this.lastStructuredResult?.result ?? this.lastOutput,
+      rawOutput: this.lastOutput, structuredResult: this.lastStructuredResult,
+      error: failure, exitCode: code, claudeSessionId: this.claudeSessionId,
+    });
+    this.lastError = terminal.error;
+    this.status = 'idle';
+    this.publishTask(terminal);
+  }
+
+  private async handleProcessError(error: Error): Promise<void> {
+    await this.finalizeActive(null, error.message);
+  }
+
+  async sendPrompt(prompt: string, options: TaskSubmission = {}): Promise<string> {
+    if (this.stopping) throw new Error('Session is stopping');
+    const operation = this.acceptTask(prompt, options);
+    this.submissions.add(operation);
+    try { return await operation; }
+    finally { this.submissions.delete(operation); }
+  }
+
+  private async acceptTask(prompt: string, options: TaskSubmission): Promise<string> {
+    const { task, created } = await this.taskStore.accept({
+      ...options, sessionId: this.id, sessionName: this.name, goal: this.goal,
+      prompt, workingDir: this.workingDir, model: this.model, executionPolicy: this.executionPolicy,
+    });
+    if (!created) return task.id;
+    this.promptCount++;
+    if (this.stopping) {
+      const cancelled = await this.taskStore.update(task.id, { status: 'cancelled', error: 'Session stopped before execution', completedAt: new Date().toISOString() });
+      this.publishTask(cancelled);
+      return task.id;
+    }
+    this.promptQueue.push(task);
+    this.emitSafely('task.accepted', task);
+    void this.processNextPrompt().catch((error) => console.error('Error processing task:', error));
+    return task.id;
+  }
+
+  async getTask(taskId: string): Promise<TaskRecord | null> {
+    const task = await this.taskStore.get(taskId);
+    return task?.sessionId === this.id ? task : null;
+  }
+
+  async listTasks(): Promise<TaskRecord[]> { return this.taskStore.list(this.id); }
+
+  hasPendingTasks(): boolean { return this.status === 'busy' || this.isProcessing || this.promptQueue.length > 0 || this.submissions.size > 0; }
+
+  async setExecutionPolicy(policy: ExecutionPolicy): Promise<void> {
+    if (policy !== 'default' && policy !== 'bypass') throw new Error('Invalid execution policy');
+    if (this.hasPendingTasks()) throw new Error('Execution policy cannot change while the session is busy or tasks are pending');
+    this.executionPolicy = policy;
+  }
+
+  async cancelTask(taskId: string): Promise<TaskRecord | null> {
+    const task = await this.getTask(taskId);
+    if (!task || isTerminalTask(task.status)) return task;
+    this.cancelled.add(taskId);
+    this.promptQueue = this.promptQueue.filter((queued) => queued.id !== taskId);
+    if (this.activeTask?.id === taskId) {
+      const child = this.process;
+      if (child) await this.terminateChild(child);
+      if (this.activeTask?.id === taskId) await this.finalizeActive(null, 'Task cancelled', 'cancelled');
+      if (this.finalization) await this.finalization;
+    } else {
+      const terminal = await this.taskStore.update(taskId, { status: 'cancelled', error: 'Task cancelled before execution', completedAt: new Date().toISOString() });
+      this.publishTask(terminal);
+    }
+    return this.getTask(taskId);
   }
 
   private async processNextPrompt(): Promise<void> {
-    if (this.isProcessing || this.promptQueue.length === 0) {
-      return;
-    }
-
-    const { prompt, promptId } = this.promptQueue.shift()!;
-
-    // promptId is now passed in from sendPrompt
-    this.lastPromptId = promptId;
-    this.promptCount++;
+    if (this.stopping || this.isProcessing || this.promptQueue.length === 0) return;
+    const task = this.promptQueue.shift()!;
+    this.activeTask = task;
+    this.lastPromptId = task.id;
     this.status = 'busy';
     this.lastActivityAt = new Date().toISOString();
     this.isProcessing = true;
     this.currentPromptOutput = [];
     this.jsonBuffer = '';
-
-    // Log the prompt
-    await this.savePromptToHistory({
-      id: promptId,
-      prompt,
-      timestamp: new Date().toISOString(),
-      status: 'pending'
-    });
-
-    // Notify watchers that processing started
-    this.broadcastStatus('processing', { promptId, prompt: prompt.slice(0, 100) });
-
+    this.lastStructuredResult = undefined;
+    this.lastOutput = '';
+    this.lastError = undefined;
+    this.activeFailure = undefined;
+    this.outputCheckpoint = Promise.resolve();
     try {
-      const claudePath = getClaudePath();
-      const args = ['--print', '--dangerously-skip-permissions', '--output-format', 'json'];
-      if (this.model) {
-        args.push('--model', this.model);
+      await this.savePromptToHistory({ id: task.id, prompt: task.prompt, timestamp: this.lastActivityAt, status: 'pending' });
+      if (this.activeTask?.id !== task.id) return;
+      if (this.cancelled.has(task.id) || this.stopping) {
+        await this.finalizeActive(null, 'Task cancelled before execution', 'cancelled');
+        return;
       }
-
-      // Conversation continuity: resume existing Claude session or create new one
-      if (this.claudeSessionId) {
-        args.push('--resume', this.claudeSessionId);
-      } else {
-        const newSessionId = randomUUID();
-        args.push('--session-id', newSessionId);
+      await this.taskStore.update(task.id, { status: 'running', startedAt: new Date().toISOString() });
+      if (this.activeTask?.id !== task.id) return;
+      if (this.cancelled.has(task.id) || this.stopping) {
+        await this.finalizeActive(null, 'Task cancelled before execution', 'cancelled');
+        return;
       }
-
-      const proc = spawn(claudePath, args, {
-        cwd: this.workingDir,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env }
-      });
-
+      this.broadcastStatus('processing', { promptId: task.id, prompt: task.prompt.slice(0, 100) });
+      const args = ['--print', '--output-format', 'json'];
+      if (task.executionPolicy === 'bypass') args.push('--dangerously-skip-permissions');
+      if (task.model) args.push('--model', task.model);
+      if (this.claudeSessionId) args.push('--resume', this.claudeSessionId);
+      else args.push('--session-id', randomUUID());
+      const proc = spawn(getClaudePath(), args, { cwd: task.workingDir, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env }, detached: process.platform !== 'win32' });
       this.process = proc;
-
-      proc.stdout?.on('data', (chunk: Buffer) => {
+      // Pipe chunk boundaries can split a Unicode code point. Let each stream
+      // retain partial UTF-8 bytes instead of decoding individual Buffers.
+      proc.stdout?.setEncoding('utf8');
+      proc.stderr?.setEncoding('utf8');
+      let promptDispatched = false;
+      const onStdout = (chunk: Buffer) => {
+        if (this.process !== proc) return;
         const text = chunk.toString();
         this.jsonBuffer += text;
         this.handleOutput(text);
-      });
-
-      proc.stderr?.on('data', (chunk: Buffer) => {
-        this.handleOutput(chunk.toString());
-      });
-
-      proc.on('exit', (code) => {
-        // Parse JSON output before handling exit to extract session_id and structured result
+      };
+      const onStderr = (chunk: Buffer) => {
+        if (this.process === proc) this.handleOutput(chunk.toString());
+      };
+      const onClose = (code: number | null) => {
+        if (this.process !== proc) return;
         this.parseClaudeJsonOutput(this.jsonBuffer);
-        this.handleProcessExit(code);
-      });
-
-      proc.on('error', (error) => {
-        this.handleProcessError(error);
-      });
-
-      // Write prompt and close stdin
-      proc.stdin?.write(prompt);
-      proc.stdin?.end();
+        const failure = this.activeFailure || (typeof proc.pid === 'number' && !promptDispatched ? 'Executor exited before its prompt was dispatched' : undefined);
+        void this.finalizeActive(code, failure).catch((error) => console.error('Failed to persist terminal task:', error));
+      };
+      const onError = (error: Error) => {
+        if (this.process !== proc) return;
+        void this.handleProcessError(error).catch((failure) => console.error('Failed to persist failed task:', failure));
+      };
+      const onInputError = (error: Error) => {
+        if (this.process !== proc) return;
+        this.activeFailure = `Task input failed: ${error.message}`;
+        void this.terminateChild(proc).then(async () => {
+          if (this.activeTask?.id === task.id) await this.finalizeActive(null, this.activeFailure);
+        }).catch((failure) => console.error('Failed to persist task input error:', failure));
+      };
+      const onSpawn = () => {
+        void (async () => {
+          if (this.process !== proc || this.activeTask?.id !== task.id || this.cancelled.has(task.id) || this.stopping) return;
+          if (!proc.pid) throw new Error('Spawned executor has no process identity');
+          const executor = captureTaskExecutor(proc.pid);
+          await this.taskStore.update(task.id, { executor });
+          if (this.process !== proc || this.activeTask?.id !== task.id || this.cancelled.has(task.id) || this.stopping) return;
+          // The ownership proof must be durable before the executor gets input.
+          promptDispatched = true;
+          proc.stdin?.end(task.prompt);
+        })().catch(async (error) => {
+          if (this.process !== proc) return;
+          this.activeFailure = `Executor ownership receipt failed: ${error instanceof Error ? error.message : String(error)}`;
+          await this.terminateChild(proc);
+          if (this.activeTask?.id === task.id) await this.finalizeActive(null, this.activeFailure);
+        }).catch((error) => console.error('Failed to finalize undispatched executor:', error));
+      };
+      proc.stdout?.on('data', onStdout);
+      proc.stderr?.on('data', onStderr);
+      proc.once('close', onClose);
+      proc.once('error', onError);
+      proc.once('spawn', onSpawn);
+      proc.stdin?.on('error', onInputError);
+      this.cleanupProcess = () => {
+        proc.stdout?.off('data', onStdout);
+        proc.stderr?.off('data', onStderr);
+        proc.off('close', onClose);
+        proc.off('error', onError);
+        proc.off('spawn', onSpawn);
+        proc.stdin?.off('error', onInputError);
+        // Late stream/process errors remain harmless after detaching the task.
+        proc.on('error', ignoreLateError);
+        proc.stdin?.on('error', ignoreLateError);
+      };
     } catch (error) {
-      this.isProcessing = false;
-      this.status = 'idle';
-      this.emit('prompt.error', { promptId, error: error instanceof Error ? error.message : String(error) });
+      if (this.activeTask?.id !== task.id) return;
+      await this.handleProcessError(error instanceof Error ? error : new Error(String(error)));
     }
   }
 
   private parseClaudeJsonOutput(jsonStr: string): void {
     try {
       const parsed = JSON.parse(jsonStr.trim());
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) ||
+          (typeof parsed.result !== 'string' && typeof parsed.is_error !== 'boolean')) return;
       // Extract and store Claude's session ID for conversation continuity
-      if (parsed.session_id) {
+      if (typeof parsed.session_id === 'string' && parsed.session_id) {
         this.claudeSessionId = parsed.session_id;
       }
       // Store structured result for richer notifications
       this.lastStructuredResult = {
-        result: parsed.result || '',
-        durationMs: parsed.duration_ms || 0,
-        costUsd: parsed.total_cost_usd || 0,
-        numTurns: parsed.num_turns || 0,
-        isError: parsed.is_error || false,
+        result: typeof parsed.result === 'string' ? parsed.result : '',
+        durationMs: typeof parsed.duration_ms === 'number' && Number.isFinite(parsed.duration_ms) && parsed.duration_ms >= 0 ? parsed.duration_ms : 0,
+        costUsd: typeof parsed.total_cost_usd === 'number' && Number.isFinite(parsed.total_cost_usd) && parsed.total_cost_usd >= 0 ? parsed.total_cost_usd : 0,
+        numTurns: Number.isSafeInteger(parsed.num_turns) && parsed.num_turns >= 0 ? parsed.num_turns : 0,
+        isError: parsed.is_error === true,
       };
     } catch {
       // Not valid JSON or partial output - ignore, use raw output
@@ -457,68 +536,42 @@ export class Session extends EventEmitter {
     }
   }
 
-  private notifyCompletion(code: number | null): void {
-    const sessionLabel = this.name || this.id;
-    const isSuccess = code === 0 || code === null;
-    const status = isSuccess ? 'completed' : `failed (exit ${code})`;
-    const viewCmd = `cb -l`;
+  static notificationForTask(task: TaskRecord): NotificationInput {
+    const resultFull = task.error && task.error !== task.output ? `${task.output}\n${task.error}`.trim() : task.output;
+    return {
+      sessionId: task.sessionId, promptId: task.id, sessionName: task.sessionName,
+      type: task.status === 'completed' ? 'prompt.completed' : 'prompt.error',
+      goal: task.goal, exitCode: task.exitCode ?? null,
+      durationMs: task.structuredResult?.durationMs, costUsd: task.structuredResult?.costUsd,
+      resultPreview: resultFull.slice(0, 200), resultFull: resultFull.slice(0, 50000),
+      claudeSessionId: task.claudeSessionId, viewCommand: `cb --task ${task.id}`,
+    };
+  }
 
-    const durationStr = this.lastStructuredResult?.durationMs
-      ? `${(this.lastStructuredResult.durationMs / 1000).toFixed(1)}s`
-      : '';
-    const costStr = this.lastStructuredResult?.costUsd
-      ? `$${this.lastStructuredResult.costUsd.toFixed(4)}`
-      : '';
+  private emitSafely(event: string, data: unknown): void {
+    for (const listener of this.rawListeners(event)) {
+      try { listener.call(this, data); }
+      catch (error) { console.error(`Task ${event} observer failed:`, error); }
+    }
+  }
 
-    const resultPreview = this.lastStructuredResult?.result?.slice(0, 200)
-      || this.lastOutput?.slice(0, 200)
-      || '';
-
-    // Channel 1: Terminal bell
-    try { process.stdout.write('\x07'); } catch { /* ignore */ }
-
-    // Channel 2: notify-send (desktop, fails silently)
-    try {
-      const desktopMsg = `${sessionLabel}: ${status}\nView: ${viewCmd}`;
-      const proc = spawn('notify-send', ['Claude-B', desktopMsg], { detached: true, stdio: 'ignore' });
-      proc.on('error', () => {});
-      proc.unref();
-    } catch { /* ignore */ }
-
-    // Full result (capped at 50KB)
-    const fullResult = this.lastStructuredResult?.result || this.lastOutput || '';
-    const resultFull = fullResult.slice(0, 50000);
-
-    // Channel 3: Emit structured notification event (daemon writes to inbox)
-    this.emit('notification', {
-      sessionId: this.id,
-      sessionName: this.name,
-      type: isSuccess ? 'prompt.completed' as const : 'prompt.error' as const,
-      goal: this.goal,
-      exitCode: code,
-      durationMs: this.lastStructuredResult?.durationMs,
-      costUsd: this.lastStructuredResult?.costUsd,
-      resultPreview,
-      resultFull,
-      claudeSessionId: this.claudeSessionId,
-      viewCommand: viewCmd,
-    });
-
-    // Channel 4: Daemon log with copy-paste command
-    const logParts = [`[Claude-B] ${sessionLabel} ${status}`];
-    if (durationStr) logParts.push(durationStr);
-    if (costStr) logParts.push(costStr);
-    logParts.push(`| View: ${viewCmd}`);
-    console.log(logParts.join(' | '));
+  private publishTask(task: TaskRecord): void {
+    if (this.publishedTasks.has(task.id)) return;
+    this.publishedTasks.add(task.id);
+    this.broadcastStatus(task.status === 'completed' ? 'completed' : 'error', { promptId: task.id, taskId: task.id, taskStatus: task.status, exitCode: task.exitCode, error: task.error });
+    this.emitSafely(task.status === 'completed' ? 'prompt.completed' : 'prompt.error', { promptId: task.id, taskId: task.id, code: task.exitCode, error: task.error, status: task.status });
+    this.emitSafely('task.terminal', task);
+    this.emitSafely('notification', Session.notificationForTask(task));
   }
 
   getLastOutput(): string {
-    // Return parsed result if available (from --output-format json)
-    if (this.lastStructuredResult?.result) {
-      return this.lastStructuredResult.result;
+    if (!this.isProcessing && this.lastError) {
+      const output = this.lastStructuredResult?.result ?? this.lastOutput;
+      return output === this.lastError ? output : `${output}\n${this.lastError}`.trim();
     }
+    if (this.lastStructuredResult) return this.lastStructuredResult.result;
     // Fall back to raw output, attempting JSON parse
-    const raw = this.lastOutput || this.outputBuffer.join('');
+    const raw = this.isProcessing ? this.currentPromptOutput.join('') : this.lastOutput;
     try {
       const parsed = JSON.parse(raw.trim());
       if (parsed.result !== undefined) return parsed.result;
@@ -527,7 +580,7 @@ export class Session extends EventEmitter {
   }
 
   getLastRawOutput(): string {
-    return this.lastOutput || this.outputBuffer.join('');
+    return this.isProcessing ? this.currentPromptOutput.join('') : this.lastOutput;
   }
 
   getFullTranscript(): string {
@@ -589,62 +642,44 @@ export class Session extends EventEmitter {
     }
   }
 
+  private async terminateChild(child: ChildProcess | NodePty.IPty): Promise<void> {
+    if (!('once' in child)) {
+      try { child.kill(); } catch { /* already stopped */ }
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        child.off('close', done);
+        child.off('error', done);
+        resolve();
+      };
+      child.once('close', done);
+      child.once('error', done);
+      const timer = setTimeout(() => {
+        signalChild(child, 'SIGKILL');
+        done();
+      }, 2000);
+      try { signalChild(child, 'SIGTERM'); } catch { done(); }
+    });
+  }
+
   async stop(): Promise<void> {
-    if (this.process) {
-      if ('kill' in this.process && typeof this.process.kill === 'function') {
-        if ('pid' in this.process) {
-          // PTY
-          (this.process as NodePty.IPty).kill();
-        } else {
-          // ChildProcess
-          (this.process as ChildProcess).kill('SIGTERM');
-        }
-      }
-
-      // Wait for exit with timeout
-      await Promise.race([
-        new Promise<void>((resolve) => {
-          const checkInterval = setInterval(() => {
-            if (!this.process) {
-              clearInterval(checkInterval);
-              resolve();
-            }
-          }, 100);
-        }),
-        new Promise<void>((resolve) => setTimeout(() => {
-          // Force kill after 5 seconds
-          if (this.process && 'kill' in this.process) {
-            try {
-              if ('pid' in this.process) {
-                process.kill((this.process as NodePty.IPty).pid, 'SIGKILL');
-              } else {
-                (this.process as ChildProcess).kill('SIGKILL');
-              }
-            } catch {
-              // Already dead
-            }
-          }
-          this.process = null;
-          resolve();
-        }, 5000))
-      ]);
-
-      this.process = null;
-    }
-
-    // Close all sockets
-    for (const socket of this.attachedSockets) {
-      socket.end();
-    }
-    for (const socket of this.watchingSockets) {
-      socket.end();
-    }
-
-    this.attachedSockets.clear();
-    this.watchingSockets.clear();
-
-    // Remove all external event listeners to prevent memory leaks
-    this.removeAllListeners();
+    if (this.stopOperation) return this.stopOperation;
+    this.stopping = true;
+    this.stopOperation = (async () => {
+      await Promise.allSettled([...this.submissions]);
+      const queued = this.promptQueue.splice(0);
+      for (const task of queued) await this.cancelTask(task.id);
+      if (this.activeTask) await this.cancelTask(this.activeTask.id);
+      if (this.finalization) await this.finalization;
+      for (const socket of this.attachedSockets) socket.end();
+      for (const socket of this.watchingSockets) socket.end();
+      this.attachedSockets.clear();
+      this.watchingSockets.clear();
+      this.removeAllListeners();
+    })();
+    return this.stopOperation;
   }
 
   async exportTranscript(): Promise<string> {

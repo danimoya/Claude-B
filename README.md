@@ -89,11 +89,11 @@ curl -fsSL https://cb.danimoya.com | bash
 # Or via npm
 npm i -g claude-b
 
-# Or via Docker
-docker run -d \
-  -v ~/.claude-b:/root/.claude-b \
-  --env-file ~/.claude-b/.env \
-  ghcr.io/danimoya/claude-b:latest
+# Or build the verified Docker source and install its persistent CLI
+git clone https://github.com/danimoya/Claude-B.git
+cd Claude-B
+docker build -t claude-b:local .
+CB_DOCKER_IMAGE=claude-b:local scripts/install.sh --method=docker --skip-init
 ```
 
 Then configure everything interactively:
@@ -114,7 +114,7 @@ Claude-B reads from environment variables with this precedence:
 |----------|----------|---------|
 | `ANTHROPIC_API_KEY` | yes | Claude Code authentication |
 | `TELEGRAM_BOT_TOKEN` | no | Enables Telegram remote control |
-| `TELEGRAM_ALLOWED_CHAT_IDS` | no | Comma-separated chat ids allowed to use the bot |
+| `TELEGRAM_ALLOWED_CHAT_IDS` | for new Telegram registrations | Comma-separated private chat IDs; empty denies new registration |
 | `OPENAI_API_KEY` | no | Whisper STT + TTS for voice notes |
 | `SPEECHMATICS_API_KEY` / `DEEPGRAM_API_KEY` | no | Alternative STT providers |
 | `CB_DATA_DIR` | no | Override `~/.claude-b` (useful in containers) |
@@ -174,6 +174,12 @@ cb -a main
 | `cb --watch` | `-w` | Watch live output |
 | `cb --select <id>` | `-x` | Select session for commands |
 | `cb --current` | `-c` | Show current session |
+| `cb --tasks` | | List durable task receipts |
+| `cb --task ID` | | Read one exact task result; `--json` returns its receipt |
+| `cb --task-key KEY` | | Find the original task by idempotency key |
+| `cb --cancel ID` | | Cancel one queued or running task |
+| `cb --timeout 5000 "prompt"` | | Bound the wait without cancelling accepted work |
+| `cb --execution-policy bypass "prompt"` | | Explicitly opt the target session into permission bypass |
 
 ### Fire-and-Forget & Inbox
 
@@ -221,6 +227,8 @@ cb -a main
 | `cb --remote <hostId> <prompt>` | Send prompt to remote host |
 | `cb --remote-fire <hostId> <prompt>` | Fire-and-forget to remote host |
 | `cb --remote-stats` | Orchestration statistics |
+| `cb --remote-task ID` | Resume a saved remote receipt through status reads |
+| `cb --remote-tasks` | List durable remote receipts |
 
 ## Guides
 
@@ -285,16 +293,23 @@ Get notifications on your phone and reply to sessions from Telegram.
 
 ```bash
 cb --telegram 123456789:ABCdefGHIjklMNO
+cb --telegram-pair 123456789
 
 # Output:
 #   Telegram bot started!
 #   Bot: @my_claudeb_bot
-#   Send /start to your bot in Telegram to register.
+#   Send /start CODE from the expected private sender before the challenge expires.
 ```
 
 **Step 3: Register in Telegram**
 
-Open your bot in Telegram and send `/start`. You're now registered for notifications.
+Send `/start CODE` in the private bot chat using the expiring, single-use code
+created by the local owner with `cb --telegram-pair [expected-sender-id]`.
+Alternatively, configure your private chat ID in `TELEGRAM_ALLOWED_CHAT_IDS` in
+the daemon's environment before starting it and send `/start` privately.
+Groups and unauthorized senders cannot enroll. Existing owner-paired private
+chats remain usable when the variable is unset. `cb init` also supports local
+owner-authorized enrollment.
 
 **Step 4: Use it**
 
@@ -602,7 +617,7 @@ ln -sf ~/Claude-B/bin/opencode-notify.js ~/.config/opencode/plugins/claude-b-not
 - Only top-level sessions notify — subagent/task child sessions (those with a `parentID`) are skipped.
 - Works for both the interactive TUI and `opencode run`, as long as the process runs inside tmux.
 - Like Claude Code and Codex, plugins are read at startup: OpenCode processes already running won't notify until restarted.
-- OpenCode panes are not yet listed in `/sessions`, and replying to an OpenCode notification from Telegram is untested.
+- Registered OpenCode panes appear in `/sessions` while the same foreground invocation is alive. Replies verify that invocation before pasting literal text. Native agent and real Telegram/provider acceptance is part of the release procedure in [OPERATIONS.md](OPERATIONS.md).
 
 **Troubleshooting:**
 
@@ -660,6 +675,56 @@ cb --webhook "https://hooks.slack.com/services/T.../B.../xxx" --webhook-event "p
 cb --hooks
 cb --webhooks
 ```
+
+### Webhook signing and delivery
+
+`POST /api/hooks/webhook` accepts a per-webhook `secret` along with `event`,
+`url`, and optional `retries` (for example,
+`{"event":"prompt.completed","url":"https://receiver.example/hooks","secret":"<random shared secret>","retries":2}`).
+Configure the same secret at the receiver. Secrets are stored in the daemon's
+`hooks.json`; protect that file as a credential. Hooks without a secret remain
+unsigned for compatibility.
+
+Every delivery includes an `eventId` and ISO-8601 `timestamp` in the JSON body,
+even with a payload transform. `X-Claude-B-Event-Id` and `X-Claude-B-Timestamp`
+repeat those values. When a secret is configured, `X-Claude-B-Signature` contains
+`sha256=<hex HMAC-SHA256 of the exact UTF-8 request body>`. Custom headers cannot
+override these reserved headers. A receiver should retain the raw request bytes,
+verify the signature with a constant-time comparison, require matching body/header
+metadata, reject timestamps outside its replay window, and atomically deduplicate
+`eventId` before applying effects. For example, in a Node receiver:
+
+```js
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
+function verifyWebhook(rawBody, headers, secret) {
+  const expected = createHmac('sha256', secret).update(rawBody).digest();
+  const supplied = headers['x-claude-b-signature'] ?? '';
+  if (!/^sha256=[a-f0-9]{64}$/.test(supplied)) throw new Error('Invalid signature');
+  if (!timingSafeEqual(expected, Buffer.from(supplied.slice(7), 'hex'))) {
+    throw new Error('Invalid signature');
+  }
+  const event = JSON.parse(rawBody.toString('utf8'));
+  const timestamp = Date.parse(event.timestamp);
+  if (!event.eventId || event.eventId !== headers['x-claude-b-event-id'] ||
+      event.timestamp !== headers['x-claude-b-timestamp'] ||
+      !Number.isFinite(timestamp) || Math.abs(Date.now() - timestamp) > 300000) {
+    throw new Error('Invalid or stale event');
+  }
+  return event; // Atomically record eventId before processing; acknowledge duplicates.
+}
+```
+
+Delivery retries network errors, HTTP 429, and HTTP 5xx twice by default;
+`retries: 0` disables retries, and the maximum is five. Backoff starts at one
+second and doubles. `Retry-After` seconds or HTTP dates can extend the delay,
+with each delay capped at ten seconds. Each request has a ten-second default
+timeout (configurable up to sixty seconds), including response-body reading.
+All attempts reuse the same event ID, timestamp, body and signature. Ordinary
+4xx and redirects are not retried; only 2xx counts as success, and redirects
+are not followed. Delivery is bounded and in memory: retries do not survive a
+daemon restart. Receivers should reply promptly and process accepted events
+asynchronously.
 
 ### Quick Start: REST API
 
@@ -792,113 +857,92 @@ Config file: `~/.claude-b/config.json`
 
 ## Docker
 
-### Multi-Host Orchestration Testing
+The image runs the daemon as an unprivileged user, includes a pinned Claude Code
+executable, and checks both IPC and `/api/health` before declaring readiness.
+State lives in `/home/node/.claude-b`; the target repository lives in `/workspace`.
+Credentials belong in runtime environment variables or the mounted state directory.
 
-Run multiple Claude-B instances for testing orchestration features:
+### Persistent CLI and repository mounts
 
 ```bash
-# Set your API key
+# Build the current checkout without touching a host daemon
+# Run from this repository; the build cleans only its container output.
+docker build -t claude-b:0.8.0 .
+
+# Enter the repository you want Claude to work on
+cd /path/to/your/project
+
+# Use the persistent launcher from the Claude-B checkout
+CB_DOCKER_IMAGE=claude-b:0.8.0 /path/to/Claude-B/scripts/docker-launcher.sh --new work
+CB_DOCKER_IMAGE=claude-b:0.8.0 /path/to/Claude-B/scripts/docker-launcher.sh 'Analyze this repository'
+```
+
+The launcher uses your UID/GID for bind-mount access and preserves the caller's
+subdirectory under `/workspace`. Repeated calls enter the same container. Set
+`CB_DOCKER_CONTAINER` for another workspace and `CB_DOCKER_DATA_DIR` for separate
+state; a caller outside an existing container's workspace is rejected. Set
+`CB_DOCKER_PORT` to publish REST on that localhost port. The installer's Docker
+method installs this launcher in `~/.local/bin/cb` and requires an explicit
+`CB_DOCKER_IMAGE`: use a verified local build or a separately published immutable
+release image. This source branch does not update any registry tag.
+
+### Three isolated instances
+
+```bash
+# Use a separate Compose project and repository, with matching workspace ownership
+export CB_UID=$(id -u) CB_GID=$(id -g)
+export CB_WORKSPACE=/path/to/your/project
 export ANTHROPIC_API_KEY=your-key-here
 
-# Start 3 instances
-docker-compose up -d
+docker compose -p claude-b-test up --build -d
 
-# Instances available at:
-#   host1: http://localhost:3847
-#   host2: http://localhost:3848
-#   host3: http://localhost:3849
+# IPC and REST must both pass; published ports are localhost-only
+curl --fail http://127.0.0.1:3847/api/health
+curl --fail http://127.0.0.1:3848/api/health
+curl --fail http://127.0.0.1:3849/api/health
 
-# Configure orchestration from primary host
-cb -r                                           # Start REST API
-cb --remote-add http://localhost:3848 --remote-key <api-key> --remote-name host2
-cb --remote-add http://localhost:3849 --remote-key <api-key> --remote-name host3
+# Execute the CLI inside a particular repository-aware daemon
+docker compose -p claude-b-test exec -T -w /workspace host1 cb --new work
 
-# Send prompts to remote hosts
-cb --remote host2 "Analyze this codebase"
-cb --remote-health                              # Check health status
-
-# Stop containers
-docker-compose down
+# Stop this project; keep its named state volumes for reuse
+docker compose -p claude-b-test down
 ```
 
-### Single Instance
+A short initializer owns only this project's three state volumes as root; it
+never mounts or changes the host repository. Each daemon then runs as
+`CB_UID:CB_GID` (defaults `1000:1000`). Stop the whole project before changing
+those IDs. This example enables no Telegram poller. Provide separate authorized
+bot configuration only when intentionally assigning polling ownership.
+
+### Single instance and REST credentials
 
 ```bash
-# Build image
-docker build -t claude-b .
+mkdir -p /path/to/private-state
+docker run -d --name claudeb-test \
+  --user "$(id -u):$(id -g)" \
+  --mount type=bind,source=/path/to/private-state,target=/home/node/.claude-b \
+  --mount type=bind,source=/path/to/your/project,target=/workspace \
+  --env ANTHROPIC_API_KEY \
+  -p 127.0.0.1:3850:3847 claude-b:0.8.0
 
-# Run container
-docker run -d \
-  -e ANTHROPIC_API_KEY=your-key \
-  -p 3847:3847 \
-  --name claude-b \
-  claude-b
-```
+# Check health without exposing a credential
+curl --fail http://127.0.0.1:3850/api/health
 
-### Testing REST API and Hooks
-
-Build and run a test container:
-
-```bash
-# Build the image
-docker build -t claudeb-test:latest .
-
-# Run container with API key
-docker run -d \
-  --name claudeb-test \
-  -e ANTHROPIC_API_KEY=your-key-here \
-  -p 3850:3847 \
-  claudeb-test:latest
-
-# Wait for startup and get API key from logs
-sleep 3
-docker logs claudeb-test
-# Look for: API Key: cb_xxxxx...
-```
-
-Test the REST API:
-
-```bash
-# Set your API key (from docker logs output)
-API_KEY="cb_your_api_key_here"
-
-# Get JWT token
-TOKEN=$(curl -4 -s -X POST http://127.0.0.1:3850/api/auth/token \
-  -H "Content-Type: application/json" \
+# Read the owner-only bootstrap key into a variable; keys are not logged
+API_KEY=$(docker exec claudeb-test node -e 'process.stdout.write(require("fs").readFileSync(process.env.CB_DATA_DIR+"/api.key","utf8").trim())')
+TOKEN=$(curl --fail -s -X POST http://127.0.0.1:3850/api/auth/token \
+  -H 'Content-Type: application/json' \
   -d "{\"api_key\": \"$API_KEY\"}" | jq -r '.access_token')
-
-# Test health endpoint
-curl -4 -s http://127.0.0.1:3850/api/health | jq
-
-# List sessions
-curl -4 -s http://127.0.0.1:3850/api/sessions \
+curl --fail -s http://127.0.0.1:3850/api/sessions \
   -H "Authorization: Bearer $TOKEN" | jq
 
-# Create a session with model selection
-curl -4 -s -X POST http://127.0.0.1:3850/api/sessions \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"name": "test-session", "model": "sonnet"}' | jq
-
-# Add a shell hook
-curl -4 -s -X POST http://127.0.0.1:3850/api/hooks/shell \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"event": "prompt.completed", "command": "echo Done!"}' | jq
-
-# Add a webhook with session filter
-curl -4 -s -X POST http://127.0.0.1:3850/api/hooks/webhook \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"event": "session.created", "url": "https://httpbin.org/post", "sessionFilter": "test-session"}' | jq
-
-# List all hooks
-curl -4 -s http://127.0.0.1:3850/api/hooks/shell -H "Authorization: Bearer $TOKEN" | jq
-curl -4 -s http://127.0.0.1:3850/api/hooks/webhook -H "Authorization: Bearer $TOKEN" | jq
-
-# Cleanup
-docker stop claudeb-test && docker rm claudeb-test
+# Stop and remove only this container; its bind-mounted state remains
+docker stop claudeb-test
+docker rm claudeb-test
 ```
+
+See [CB-06 validation](docs/backlog/CB-06.md) for the pinned image/executable
+versions, isolated smoke checks, and deployment limits.
 
 ## Development
 
@@ -920,6 +964,9 @@ pnpm test
 ```
 
 ## Potential Features
+
+The examples below are proposals, not implemented CLI commands. Use `cb --help`
+for the current command interface.
 
 ### Workflow Pipelines
 Chain AI tasks together like GitHub Actions for AI. Define multi-step workflows where output flows between sessions.

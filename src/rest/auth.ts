@@ -1,6 +1,6 @@
-import { readFile, writeFile, mkdir } from 'fs/promises';
+import { readFile, writeFile, mkdir, chmod } from 'fs/promises';
 import { existsSync } from 'fs';
-import { randomBytes, createHash } from 'crypto';
+import { randomBytes, createHash, timingSafeEqual } from 'crypto';
 
 export interface TokenPayload {
   type: 'access' | 'refresh';
@@ -29,11 +29,12 @@ export class AuthManager {
   }
 
   async load(): Promise<void> {
-    await mkdir(this.configDir, { recursive: true });
+    await mkdir(this.configDir, { recursive: true, mode: 0o700 });
 
     if (existsSync(this.apiKeyPath)) {
       try {
-        this.apiKey = (await readFile(this.apiKeyPath, 'utf-8')).trim();
+        await chmod(this.apiKeyPath, 0o600);
+        this.apiKey = (await readFile(this.apiKeyPath, 'utf-8')).trim() || null;
       } catch {
         // Will generate new key
       }
@@ -42,8 +43,10 @@ export class AuthManager {
 
   async generateApiKey(): Promise<string> {
     this.apiKey = 'cb_' + randomBytes(32).toString('hex');
-    await mkdir(this.configDir, { recursive: true });
+    await mkdir(this.configDir, { recursive: true, mode: 0o700 });
     await writeFile(this.apiKeyPath, this.apiKey, { mode: 0o600 });
+    // writeFile's mode only applies when creating a file.
+    await chmod(this.apiKeyPath, 0o600);
     return this.apiKey;
   }
 
@@ -58,8 +61,11 @@ export class AuthManager {
     return this.apiKey;
   }
 
-  validateApiKey(key: string): boolean {
-    return this.apiKey !== null && key === this.apiKey;
+  validateApiKey(key: unknown): boolean {
+    if (!this.apiKey || typeof key !== 'string') return false;
+    const expected = Buffer.from(this.apiKey);
+    const provided = Buffer.from(key);
+    return expected.length === provided.length && timingSafeEqual(expected, provided);
   }
 
   hashApiKey(): string {
@@ -87,12 +93,14 @@ export class AuthManager {
     };
   }
 
-  validateTokenPayload(payload: TokenPayload, expectedType: 'access' | 'refresh'): boolean {
+  validateTokenPayload(payload: unknown, expectedType: 'access' | 'refresh'): boolean {
     const now = Math.floor(Date.now() / 1000);
-
-    if (payload.type !== expectedType) return false;
-    if (payload.exp < now) return false;
-    if (payload.sub !== this.hashApiKey()) return false;
+    if (!this.apiKey || !payload || typeof payload !== 'object') return false;
+    const claims = payload as Partial<TokenPayload>;
+    if (claims.type !== expectedType) return false;
+    if (typeof claims.iat !== 'number' || !Number.isSafeInteger(claims.iat) || claims.iat < 0 || claims.iat > now) return false;
+    if (typeof claims.exp !== 'number' || !Number.isSafeInteger(claims.exp) || claims.exp <= now || claims.exp <= claims.iat) return false;
+    if (claims.sub !== this.hashApiKey()) return false;
 
     return true;
   }

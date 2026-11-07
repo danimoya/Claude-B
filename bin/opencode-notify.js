@@ -43,6 +43,26 @@ function tmux(format) {
   }
 }
 
+// Native OpenCode message envelopes already contain visible turn history.
+// Keep a small local context window; never forward tool/reasoning/synthetic parts.
+function recentVisibleTurns(messages) {
+  const turns = [];
+  const counts = { user: 0, assistant: 0 };
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    const role = message?.info?.role;
+    if ((role !== "user" && role !== "assistant") || counts[role] >= 3) continue;
+    const text = (Array.isArray(message.parts) ? message.parts : [])
+      .filter(part => part?.type === "text" && !part.synthetic && typeof part.text === "string")
+      .map(part => part.text).join("\n").trim();
+    if (!text || (role === "user" && /^<(?:environment_context|system-reminder|task-notification|tool_result)\b/.test(text))) continue;
+    counts[role]++;
+    turns.push({ role, text: Array.from(text).slice(0, 600).join("") });
+    if (counts.user === 3 && counts.assistant === 3) break;
+  }
+  return turns.reverse();
+}
+
 export const ClaudeBNotify = async ({ client, directory }) => {
   return {
     event: async ({ event }) => {
@@ -93,6 +113,7 @@ export const ClaudeBNotify = async ({ client, directory }) => {
           goal: cwd,
           exitCode: 0,
           resultPreview: lastAssistant,
+          contextTurns: recentVisibleTurns(messages),
         };
 
         const res = await fetch(CB_URL, {

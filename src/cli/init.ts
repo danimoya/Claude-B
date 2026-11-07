@@ -5,6 +5,7 @@ import { join } from 'path';
 import chalk from 'chalk';
 import { envTemplate, getDataDir } from '../config/env.js';
 import { TelegramConfigManager } from '../telegram/config.js';
+import { waitForTelegramPairing } from './telegram-pairing.js';
 
 interface Prompts {
   ask(question: string, opts?: { mask?: boolean; default?: string }): Promise<string>;
@@ -47,55 +48,6 @@ async function pingTelegramBot(token: string): Promise<{ ok: boolean; username?:
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
-}
-
-/**
- * Polls getUpdates until the user sends /start (or any message) to the bot,
- * returning the chat id of the first private chat seen. Resolves to null
- * on timeout. Uses long-polling so we don't burn API quota.
- */
-async function waitForFirstChat(token: string, timeoutMs: number): Promise<string | null> {
-  const deadline = Date.now() + timeoutMs;
-  let offset = 0;
-
-  // Drain any old updates so we only react to fresh /start messages
-  try {
-    const drain = await fetch(`https://api.telegram.org/bot${token}/getUpdates?offset=-1`);
-    const drainJson = (await drain.json()) as { ok: boolean; result?: Array<{ update_id: number }> };
-    if (drainJson.ok && drainJson.result && drainJson.result.length > 0) {
-      offset = drainJson.result[drainJson.result.length - 1].update_id + 1;
-    }
-  } catch {
-    // Network blip — continue with offset 0
-  }
-
-  while (Date.now() < deadline) {
-    const remaining = Math.max(1, Math.floor((deadline - Date.now()) / 1000));
-    const pollSeconds = Math.min(25, remaining);
-    try {
-      const res = await fetch(
-        `https://api.telegram.org/bot${token}/getUpdates?offset=${offset}&timeout=${pollSeconds}`
-      );
-      const json = (await res.json()) as {
-        ok: boolean;
-        result?: Array<{
-          update_id: number;
-          message?: { chat?: { id: number; type: string } };
-        }>;
-      };
-      if (!json.ok || !json.result) continue;
-      for (const update of json.result) {
-        offset = update.update_id + 1;
-        const chat = update.message?.chat;
-        if (chat && (chat.type === 'private' || chat.type === 'group' || chat.type === 'supergroup')) {
-          return String(chat.id);
-        }
-      }
-    } catch {
-      // Ignore transient errors, keep polling until deadline
-    }
-  }
-  return null;
 }
 
 async function sendTelegramMessage(token: string, chatId: string, text: string): Promise<void> {
@@ -213,12 +165,13 @@ export async function runInit(): Promise<void> {
 
         console.log('');
         console.log(chalk.bold('  Step 2: register your chat'));
-        console.log(chalk.gray(`    Open @${ping.username} in Telegram and send ${chalk.yellow('/start')}.`));
-        console.log(chalk.gray('    Waiting up to 3 minutes for your first message...'));
-        console.log('');
-        const chatId = await waitForFirstChat(token, 3 * 60 * 1000);
+        console.log(chalk.gray('    Pairing uses a private, single-use challenge valid for three minutes.'));
+        const chatId = await waitForTelegramPairing(token, code => {
+          console.log(chalk.gray(`    Open @${ping.username} in a private chat and send:`));
+          console.log(chalk.yellow(`    /start ${code}`));
+        });
         if (!chatId) {
-          console.log(chalk.yellow('    Timed out waiting for /start.'));
+          console.log(chalk.yellow('    Pairing challenge expired without a matching private reply.'));
           console.log(chalk.gray('    You can run `cb --telegram <token>` later to retry.'));
           break;
         }

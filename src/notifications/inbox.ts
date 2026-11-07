@@ -1,11 +1,19 @@
-import { appendFile, readFile, writeFile, mkdir, unlink, rename } from 'fs/promises';
+import { readFile, mkdir, unlink, open } from 'node:fs/promises';
 import { existsSync } from 'fs';
 import { nanoid } from 'nanoid';
+import { resolve } from 'path';
+import { atomicWriteFile } from '../storage/atomic-json.js';
+
+const directoryWrites = new Map<string, Promise<unknown>>();
 
 export interface Notification {
   id: string;
+  deliveryId?: string;
+  agent?: string;
+  transcriptPath?: string;
   timestamp: string;
   sessionId: string;
+  promptId?: string;
   sessionName?: string;
   type: 'prompt.completed' | 'prompt.error' | 'remote.completed';
   goal?: string;
@@ -21,6 +29,18 @@ export interface Notification {
 
 export type NotificationInput = Omit<Notification, 'id' | 'timestamp' | 'read'>;
 
+function validStoredNotification(value: unknown): value is Notification {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.id === 'string' && !!record.id &&
+    typeof record.timestamp === 'string' && Number.isFinite(Date.parse(record.timestamp)) &&
+    typeof record.sessionId === 'string' && !!record.sessionId &&
+    ['prompt.completed', 'prompt.error', 'remote.completed'].includes(record.type as string) &&
+    (record.exitCode === null || Number.isSafeInteger(record.exitCode)) &&
+    typeof record.read === 'boolean' && typeof record.viewCommand === 'string' &&
+    (record.deliveryId === undefined || (typeof record.deliveryId === 'string' && !!record.deliveryId));
+}
+
 /**
  * NotificationInbox — JSONL-backed message store.
  *
@@ -28,10 +48,10 @@ export type NotificationInput = Omit<Notification, 'id' | 'timestamp' | 'read'>;
  *
  * 1. **Concurrent writes can't corrupt the file.** Every read-modify-write
  *    operation (markRead, markAllRead, deleteNotification, deleteAll, …)
- *    runs inside a per-instance promise chain (a tiny mutex). Two callers
+ *    runs inside a per-directory promise chain (a tiny mutex). Two callers
  *    cannot interleave their `readAll → filter → writeAll` cycles.
  *
- * 2. **Writes are atomic.** `writeAll` writes to `notifications.jsonl.tmp`
+ * 2. **Writes are atomic.** `writeAll` writes to a unique temporary file
  *    and renames it over the destination — readers see either the old
  *    file or the new file, never a partial.
  *
@@ -44,27 +64,36 @@ export type NotificationInput = Omit<Notification, 'id' | 'timestamp' | 'read'>;
 export class NotificationInbox {
   private configDir: string;
   private inboxPath: string;
-  private tmpPath: string;
-  /** Tail of the per-instance write chain. Each mutating op chains onto it. */
-  private writeChain: Promise<unknown> = Promise.resolve();
 
   constructor(configDir: string) {
-    this.configDir = configDir;
-    this.inboxPath = `${configDir}/notifications.jsonl`;
-    this.tmpPath = `${configDir}/notifications.jsonl.tmp`;
+    this.configDir = resolve(configDir);
+    this.inboxPath = `${this.configDir}/notifications.jsonl`;
   }
 
   /** Run an async fn under the write mutex; resolves with its result. */
   private withLock<T>(fn: () => Promise<T>): Promise<T> {
-    const next = this.writeChain.then(fn, fn);
-    // Make sure a rejection in `fn` doesn't break the chain for the next caller.
-    this.writeChain = next.catch(() => undefined);
+    const previous = directoryWrites.get(this.configDir) || Promise.resolve();
+    const next = previous.then(fn, fn);
+    const settled = next.then(() => undefined, () => undefined);
+    directoryWrites.set(this.configDir, settled);
+    void settled.then(() => { if (directoryWrites.get(this.configDir) === settled) directoryWrites.delete(this.configDir); });
     return next;
   }
 
   async addNotification(input: NotificationInput): Promise<Notification> {
     return this.withLock(async () => {
       await mkdir(this.configDir, { recursive: true });
+      if (input.deliveryId) {
+        const existing = (await this.readAll()).find(notification => notification.deliveryId === input.deliveryId);
+        if (existing) {
+          // A prior append may have reached the page cache before its fsync
+          // failed. Flush a duplicate receipt too before acknowledging it.
+          const file = await open(this.inboxPath, 'a', 0o600);
+          try { await file.sync(); } finally { await file.close(); }
+          await this.syncDirectory();
+          return existing;
+        }
+      }
       const notification: Notification = {
         ...input,
         id: nanoid(8),
@@ -74,7 +103,12 @@ export class NotificationInbox {
       // Append is already atomic at the OS level — single short write — so
       // we don't need the rename trick here. Lock still serialises against
       // any concurrent rewrite to avoid a writer truncating mid-append.
-      await appendFile(this.inboxPath, JSON.stringify(notification) + '\n');
+      const file = await open(this.inboxPath, 'a', 0o600);
+      try {
+        await file.writeFile(JSON.stringify(notification) + '\n');
+        await file.sync();
+      } finally { await file.close(); }
+      await this.syncDirectory();
       await this.writeMarker(notification);
       return notification;
     });
@@ -86,16 +120,18 @@ export class NotificationInbox {
       const label = notification.sessionName || notification.sessionId;
       const status = notification.type === 'prompt.completed' ? 'completed' : 'failed';
       const goal = notification.goal ? `: ${notification.goal.slice(0, 60)}` : '';
-      await writeFile(markerPath, `${label} ${status}${goal}\n`);
+      await atomicWriteFile(markerPath, `${label} ${status}${goal}\n`);
     } catch { /* best effort */ }
   }
 
   async getUnread(): Promise<Notification[]> {
+    await directoryWrites.get(this.configDir);
     const all = await this.readAll();
     return all.filter(n => !n.read);
   }
 
   async getAll(limit?: number): Promise<Notification[]> {
+    await directoryWrites.get(this.configDir);
     const all = await this.readAll();
     return limit ? all.slice(-limit) : all;
   }
@@ -164,6 +200,7 @@ export class NotificationInbox {
   }
 
   async count(): Promise<{ total: number; unread: number }> {
+    await directoryWrites.get(this.configDir);
     const all = await this.readAll();
     return {
       total: all.length,
@@ -198,7 +235,9 @@ export class NotificationInbox {
     let badLines = 0;
     for (const line of lines) {
       try {
-        out.push(JSON.parse(line) as Notification);
+        const value: unknown = JSON.parse(line);
+        if (validStoredNotification(value)) out.push(value);
+        else badLines++;
       } catch {
         badLines++;
       }
@@ -218,12 +257,18 @@ export class NotificationInbox {
    * sees either the pre-write file or the post-write file — never a
    * partial / truncated state.
    */
+  private async syncDirectory(): Promise<void> {
+    const directory = await open(this.configDir, 'r');
+    try { await directory.sync(); }
+    catch (error) {
+      if (!['EINVAL', 'ENOTSUP', 'EBADF'].includes((error as NodeJS.ErrnoException).code || '')) throw error;
+    } finally { await directory.close(); }
+  }
+
   private async writeAll(notifications: Notification[]): Promise<void> {
-    await mkdir(this.configDir, { recursive: true });
     const content = notifications.length === 0
       ? ''
       : notifications.map(n => JSON.stringify(n)).join('\n') + '\n';
-    await writeFile(this.tmpPath, content);
-    await rename(this.tmpPath, this.inboxPath);
+    await atomicWriteFile(this.inboxPath, content);
   }
 }

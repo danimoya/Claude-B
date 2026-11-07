@@ -2,6 +2,7 @@
 
 import { EventEmitter } from 'events';
 import { RemoteClient, RemoteClientManager, RemoteHostStatus } from './remote-client.js';
+import { RemoteRequestError } from './receipts.js';
 
 export interface RetryConfig {
   maxRetries: number;
@@ -42,13 +43,15 @@ export class RetryHandler {
 
   async execute<T>(
     operation: () => Promise<T>,
-    shouldRetry?: (error: unknown, attempt: number) => boolean
+    shouldRetry?: (error: unknown, attempt: number) => boolean,
+    deadline?: number
   ): Promise<T> {
     let lastError: unknown;
     let delay = this.config.initialDelay;
 
     for (let attempt = 0; attempt <= this.config.maxRetries; attempt++) {
       try {
+        if (deadline !== undefined && Date.now() >= deadline) throw new RemoteRequestError('Remote operation deadline expired', 'unavailable');
         return await operation();
       } catch (error) {
         lastError = error;
@@ -58,12 +61,12 @@ export class RetryHandler {
           break;
         }
 
-        if (shouldRetry && !shouldRetry(error, attempt)) {
+        if (shouldRetry ? !shouldRetry(error, attempt) : !(error && typeof error === 'object' && (error as { retrySafe?: boolean }).retrySafe === true)) {
           break;
         }
 
         // Wait before retrying
-        await this.wait(delay);
+        await this.wait(deadline === undefined ? delay : Math.max(0, Math.min(delay, deadline - Date.now())));
 
         // Calculate next delay with exponential backoff
         delay = Math.min(
@@ -102,12 +105,13 @@ export class FailoverHandler extends EventEmitter {
     options?: {
       preferredHost?: string;
       excludeHosts?: string[];
+      deadline?: number;
     }
   ): Promise<{ result: T; host: string; attempts: number }> {
     const hosts = this.selectHosts(options?.preferredHost, options?.excludeHosts);
     const maxAttempts = Math.min(hosts.length, this.config.maxAttempts);
 
-    let lastError: unknown;
+    let lastError: unknown = new RemoteRequestError('No eligible remote hosts available', 'unavailable');
     let attempts = 0;
 
     for (let i = 0; i < maxAttempts; i++) {
@@ -135,7 +139,7 @@ export class FailoverHandler extends EventEmitter {
               error: error instanceof Error ? error.message : String(error)
             });
             return this.shouldRetry(error);
-          }
+          }, options?.deadline
         );
 
         this.emit('success', {
@@ -150,8 +154,9 @@ export class FailoverHandler extends EventEmitter {
         this.emit('host.failed', {
           hostId: host.id,
           error: error instanceof Error ? error.message : String(error),
-          willTryNext: i < maxAttempts - 1
+          willTryNext: i < maxAttempts - 1 && this.shouldRetry(error)
         });
+        if (!this.shouldRetry(error)) break;
       }
     }
 
@@ -219,39 +224,9 @@ export class FailoverHandler extends EventEmitter {
   }
 
   private shouldRetry(error: unknown): boolean {
-    if (error instanceof Error) {
-      const message = error.message.toLowerCase();
-
-      // Don't retry on auth errors
-      if (message.includes('unauthorized') || message.includes('forbidden')) {
-        return false;
-      }
-
-      // Don't retry on bad requests
-      if (message.includes('bad request') || message.includes('invalid')) {
-        return false;
-      }
-
-      // Retry on network/timeout errors
-      if (
-        message.includes('timeout') ||
-        message.includes('network') ||
-        message.includes('connection') ||
-        message.includes('econnrefused') ||
-        message.includes('enotfound')
-      ) {
-        return true;
-      }
-
-      // Retry on server errors (5xx)
-      if (message.includes('500') || message.includes('502') ||
-          message.includes('503') || message.includes('504')) {
-        return true;
-      }
-    }
-
-    return true; // Default to retry
+    return !!error && typeof error === 'object' && (error as { retrySafe?: boolean }).retrySafe === true;
   }
+
 }
 
 // Load balancer for distributing requests across hosts

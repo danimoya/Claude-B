@@ -1,16 +1,27 @@
 {
   "name": "claude-b",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Background-capable Claude Code with async workflows and REST API",
   "type": "module",
   "main": "dist/cli/index.js",
   "bin": {
     "cb": "bin/cb"
   },
+  "files": [
+    "bin/",
+    "dist/",
+    "scripts/install.sh",
+    "scripts/docker-launcher.sh",
+    "README.md",
+    "OPERATIONS.md",
+    "LICENSE"
+  ],
   "scripts": {
     "dev": "tsup src/cli/index.ts src/daemon/index.ts --watch --format esm",
     "build": "tsup src/cli/index.ts src/daemon/index.ts --format esm --dts --clean",
-    "test": "vitest",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check:artifact": "node scripts/check-artifact.mjs",
     "lint": "eslint src/",
     "typecheck": "tsc --noEmit",
     "start:daemon": "node dist/daemon/index.js"
@@ -18,19 +29,19 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.74.0",
     "@fastify/cors": "^10.0.0",
-    "@fastify/jwt": "^9.0.0",
+    "@fastify/jwt": "^10.2.7",
     "@fastify/rate-limit": "^10.0.0",
     "@fastify/websocket": "^11.0.0",
     "@speechmatics/batch-client": "^5.1.0",
     "chalk": "^5.3.0",
     "commander": "^12.1.0",
-    "fastify": "^5.0.0",
-    "nanoid": "^5.0.7",
+    "fastify": "^5.12.8",
+    "nanoid": "^5.1.16",
     "node-pty": "^1.0.0",
     "node-telegram-bot-api": "^0.67.0",
     "ora": "^8.1.0",
     "strip-ansi": "^7.1.0",
-    "ws": "^8.18.0"
+    "ws": "^8.22.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

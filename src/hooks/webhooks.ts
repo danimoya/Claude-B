@@ -1,5 +1,6 @@
 // Webhook HTTP calls
 
+import { createHmac, randomUUID } from 'node:crypto';
 import { HookEvent, HookEventType } from './events.js';
 
 export interface Webhook {
@@ -9,7 +10,8 @@ export interface Webhook {
   method?: 'POST' | 'PUT';  // default POST
   headers?: Record<string, string>;
   timeout?: number;  // milliseconds, default 10000
-  retries?: number;  // default 0
+  retries?: number;  // default 2, maximum 5
+  secret?: string;  // optional per-webhook HMAC-SHA256 signing secret
   transform?: string;  // JavaScript expression to transform payload
   sessionFilter?: string;  // only trigger for this sessionId
   enabled: boolean;
@@ -17,6 +19,8 @@ export interface Webhook {
 }
 
 export interface WebhookResult {
+  retryable?: boolean;
+  retryAfterMs?: number;
   webhookId: string;
   success: boolean;
   statusCode: number | null;
@@ -91,94 +95,150 @@ function transformPayload(event: HookEvent, transform?: string): Record<string, 
   }
 }
 
+const MAX_RETRIES = 5;
+const MAX_BACKOFF_MS = 10000;
+
+function retryDelay(retryAfter: string | null, attempt: number): number {
+  let delay = 1000 * Math.pow(2, attempt);
+  if (retryAfter !== null) {
+    const seconds = Number(retryAfter);
+    const requested = Number.isFinite(seconds)
+      ? seconds * 1000
+      : Date.parse(retryAfter) - Date.now();
+    if (Number.isFinite(requested) && requested >= 0) delay = Math.max(delay, requested);
+  }
+  return Math.min(delay, MAX_BACKOFF_MS);
+}
+
 async function makeRequest(
   webhook: Webhook,
-  body: Record<string, unknown>,
-  timeout: number
-): Promise<{ statusCode: number; response: string }> {
+  body: string,
+  headers: Headers,
+  timeout: number,
+  signal?: AbortSignal
+): Promise<{ statusCode: number; response: string; retryAfter: string | null }> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
+  const abort = () => controller.abort(signal?.reason);
+  signal?.addEventListener('abort', abort, { once: true });
+  if (signal?.aborted) abort();
 
   try {
     const response = await fetch(webhook.url, {
       method: webhook.method || 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': 'Claude-B/0.1.0',
-        ...webhook.headers
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal
+      headers,
+      body,
+      signal: controller.signal,
+      // Do not forward payloads or signing credentials to redirect destinations.
+      redirect: 'manual'
     });
 
-    clearTimeout(timeoutId);
-
-    let responseText = '';
-    try {
-      responseText = await response.text();
-      // Limit response size
-      if (responseText.length > 10000) {
-        responseText = responseText.slice(0, 10000) + '...(truncated)';
-      }
-    } catch {
-      responseText = '';
+    // Keep the deadline active while consuming the response body too.
+    let responseText: string;
+    try { responseText = await response.text(); }
+    catch (error) {
+      // A known terminal HTTP rejection stays terminal even if reading its
+      // diagnostic body fails. Never turn HTTP 400 into a network retry.
+      if (response.status >= 300 && response.status < 500 && response.status !== 429) responseText = 'Response body unavailable';
+      else throw error;
+    }
+    if (responseText.length > 10000) {
+      responseText = responseText.slice(0, 10000) + '...(truncated)';
     }
 
     return {
       statusCode: response.status,
-      response: responseText
+      response: responseText,
+      retryAfter: response.headers.get('retry-after')
     };
-  } catch (error) {
+  } finally {
     clearTimeout(timeoutId);
-    throw error;
+    signal?.removeEventListener('abort', abort);
   }
+}
+
+function waitForRetry(delay: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new Error('Webhook delivery aborted'));
+  return new Promise((resolve, reject) => {
+    const abort = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort); reject(new Error('Webhook delivery aborted')); };
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve(); }, delay);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+  });
 }
 
 export async function executeWebhook(
   webhook: Webhook,
-  event: HookEvent
+  event: HookEvent,
+  signal?: AbortSignal
 ): Promise<WebhookResult> {
   const startTime = Date.now();
-  const timeout = webhook.timeout || 10000;
-  const maxRetries = webhook.retries || 0;
+  const timeout = Number.isFinite(webhook.timeout) && webhook.timeout! > 0
+    ? Math.min(webhook.timeout!, 60000) : 10000;
+  const requestedRetries = webhook.retries ?? 2;
+  const maxRetries = Number.isFinite(requestedRetries)
+    ? Math.max(0, Math.min(MAX_RETRIES, Math.floor(requestedRetries))) : 2;
 
-  const body = transformPayload(event, webhook.transform);
-
-  let lastError: Error | null = null;
-  let retryCount = 0;
-
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      const { statusCode, response } = await makeRequest(webhook, body, timeout);
-
-      // Consider 2xx and 3xx as success
-      const success = statusCode >= 200 && statusCode < 400;
-
-      return {
-        webhookId: webhook.id,
-        success,
-        statusCode,
-        response,
-        duration: Date.now() - startTime,
-        retryCount
-      };
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error(String(error));
-      retryCount = attempt;
-
-      // Wait before retry (exponential backoff)
-      if (attempt < maxRetries) {
-        await new Promise(resolve => setTimeout(resolve, Math.min(1000 * Math.pow(2, attempt), 10000)));
-      }
-    }
+  // Serialize once: metadata, signature and exact transmitted bytes stay stable
+  // across attempts, including when a payload transform is configured.
+  const eventId = event.id ?? randomUUID();
+  const body = JSON.stringify({
+    ...transformPayload(event, webhook.transform),
+    eventId,
+    timestamp: event.timestamp
+  });
+  const headers = new Headers(webhook.headers);
+  headers.set('Content-Type', 'application/json');
+  headers.set('User-Agent', 'Claude-B/0.7.0');
+  headers.set('X-Claude-B-Event-Id', eventId);
+  headers.set('X-Claude-B-Timestamp', event.timestamp);
+  // Reserved metadata cannot be overridden through custom headers, even with
+  // differently cased names. Unsigned webhooks never carry a static signature.
+  headers.delete('X-Claude-B-Signature');
+  if (webhook.secret) {
+    headers.set('X-Claude-B-Signature',
+      `sha256=${createHmac('sha256', webhook.secret).update(body).digest('hex')}`);
   }
 
-  return {
-    webhookId: webhook.id,
-    success: false,
-    statusCode: null,
-    response: lastError?.message || 'Unknown error',
-    duration: Date.now() - startTime,
-    retryCount
-  };
+  const aborted = (attempt: number): WebhookResult => ({ webhookId: webhook.id,
+    success: false, retryable: true, statusCode: null, response: 'Webhook delivery aborted',
+    duration: Date.now() - startTime, retryCount: attempt });
+  for (let attempt = 0; ; attempt++) {
+    if (signal?.aborted) return aborted(attempt);
+    let retryAfter: string | null = null;
+    try {
+      const result = await makeRequest(webhook, body, headers, timeout, signal);
+      const retryable = result.statusCode === 429 || result.statusCode >= 500;
+      if (!retryable || attempt === maxRetries) {
+        return {
+          webhookId: webhook.id,
+          success: result.statusCode >= 200 && result.statusCode < 300,
+          retryable,
+          retryAfterMs: retryable ? retryDelay(result.retryAfter, attempt) : undefined,
+          statusCode: result.statusCode,
+          response: result.response,
+          duration: Date.now() - startTime,
+          retryCount: attempt
+        };
+      }
+      retryAfter = result.retryAfter;
+    } catch (error) {
+      if (signal?.aborted) return aborted(attempt);
+      if (attempt === maxRetries) {
+        return {
+          webhookId: webhook.id,
+          success: false,
+          retryable: true,
+          retryAfterMs: retryDelay(null, attempt),
+          statusCode: null,
+          response: error instanceof Error ? error.message : String(error),
+          duration: Date.now() - startTime,
+          retryCount: attempt
+        };
+      }
+    }
+
+    try { await waitForRetry(retryDelay(retryAfter, attempt), signal); }
+    catch { return aborted(attempt); }
+  }
 }

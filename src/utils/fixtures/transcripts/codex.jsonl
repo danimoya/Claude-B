@@ -1,0 +1,6 @@
+{"type":"event_msg","payload":{"type":"user_message","message":"Test the deadline"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Test the deadline"}]}}
+{"type":"response_item","payload":{"type":"function_call_output","output":"private tool output"}}
+{"type":"event_msg","payload":{"type":"agent_reasoning","text":"private reasoning"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"The deadline test passes."}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The deadline test passes."}]}}

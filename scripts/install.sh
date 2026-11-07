@@ -6,12 +6,12 @@
 #
 # Methods (auto-detected, override with --method):
 #   npm     — requires node >= 20
-#   docker  — pulls ghcr.io/danimoya/claude-b:latest
+#   docker  — installs a persistent container CLI (pinned release image)
 #   auto    — prefers npm, falls back to docker (default)
 set -euo pipefail
 
 REPO="${CLAUDE_B_REPO:-danimoya/Claude-B}"
-GHCR_IMAGE="ghcr.io/${REPO,,}"
+GHCR_IMAGE="ghcr.io/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')"
 METHOD="auto"
 SKIP_INIT=0
 
@@ -70,36 +70,33 @@ install_npm() {
 }
 
 install_docker() {
-  say "Pulling Docker image ${GHCR_IMAGE}:latest"
-  docker pull "${GHCR_IMAGE}:latest"
-
-  local shim="/usr/local/bin/cb"
-  local data_dir="${HOME}/.claude-b"
-  mkdir -p "$data_dir"
-
-  say "Writing shim to ${shim}"
-  local shim_content
-  shim_content=$(cat <<EOF
-#!/usr/bin/env bash
-# Claude-B docker shim
-exec docker run --rm -it \\
-  -v "\${HOME}/.claude-b:/root/.claude-b" \\
-  --env-file "\${HOME}/.claude-b/.env" 2>/dev/null || \\
-exec docker run --rm -it \\
-  -v "\${HOME}/.claude-b:/root/.claude-b" \\
-  ${GHCR_IMAGE}:latest "\$@"
-EOF
-)
-  if [ -w "$(dirname "$shim")" ]; then
-    printf '%s\n' "$shim_content" > "$shim"
-    chmod +x "$shim"
-  elif have sudo; then
-    printf '%s\n' "$shim_content" | sudo tee "$shim" >/dev/null
-    sudo chmod +x "$shim"
-  else
-    fail "cannot write to $shim (no sudo). try --method npm or run as root."
+  local version="${CLAUDE_B_VERSION:-0.8.0}"
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]] || fail "invalid CLAUDE_B_VERSION"
+  [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "invalid CLAUDE_B_REPO"
+  local image="${CB_DOCKER_IMAGE:-}"
+  [ -n "$image" ] || fail "set CB_DOCKER_IMAGE to a verified local build or immutable published image"
+  if ! docker image inspect "$image" >/dev/null 2>&1; then
+    say "Pulling explicitly selected Docker image ${image}"
+    docker pull "$image"
   fi
-  say "${GREEN}✓ installed${RESET}: $shim"
+
+  local bin_dir="${CLAUDE_B_BIN_DIR:-$HOME/.local/bin}"
+  mkdir -p "$bin_dir"
+  local helper_file
+  helper_file=$(mktemp)
+  if [ -f "$(dirname -- "${BASH_SOURCE[0]}")/docker-launcher.sh" ]; then
+    cp "$(dirname -- "${BASH_SOURCE[0]}")/docker-launcher.sh" "$helper_file"
+  else
+    curl -fsSL "https://raw.githubusercontent.com/${REPO}/v${version}/scripts/docker-launcher.sh" -o "$helper_file" || { rm -f "$helper_file"; fail "cannot download versioned Docker launcher"; }
+  fi
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'export CB_DOCKER_IMAGE=%q\n' "$image"
+    tail -n +2 "$helper_file"
+  } > "$bin_dir/cb"
+  rm -f "$helper_file"
+  chmod +x "$bin_dir/cb"
+  say "${GREEN}✓ installed${RESET}: $bin_dir/cb (ensure this directory is on PATH)"
 }
 
 main() {
