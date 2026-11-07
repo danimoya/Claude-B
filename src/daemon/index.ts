@@ -12,7 +12,7 @@ import { submitPromptWithDelivery } from './prompt-delivery.js';
 import { RestServer } from '../rest/server.js';
 import { HookEngine } from '../hooks/engine.js';
 import { HookEventType } from '../hooks/events.js';
-import { OrchestrationManager, createHost } from '../orchestration/index.js';
+import { OrchestrationManager, createHost, redactRemoteHost } from '../orchestration/index.js';
 import { NotificationInbox } from '../notifications/inbox.js';
 import { ClaudeBTelegramBot } from '../telegram/bot.js';
 import { VoicePipeline } from '../telegram/voice.js';
@@ -847,7 +847,7 @@ class Daemon {
       });
 
       await this.orchestrationManager.addHost(host);
-      return { data: { host } };
+      return { data: { host: redactRemoteHost(host) } };
     } catch (error) {
       return { error: error instanceof Error ? error.message : 'Failed to add host' };
     }

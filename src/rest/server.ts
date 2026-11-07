@@ -26,6 +26,7 @@ export interface RestServerOptions {
   telegramBot?: ClaudeBTelegramBot;
   orchestrationManager?: OrchestrationManager;
   configDir: string;
+  allowedOrigins?: string[];
   // Optional hook invoked by /api/notify when the payload carries a
   // transcriptPath. Daemon uses this to cache tmux session → transcript
   // mappings for the voice pipeline's context lookup.
@@ -48,10 +49,21 @@ export class RestServer {
   private onTmuxSession: ((sessionId: string, sessionName: string | undefined, agent: string, goal: string | undefined) => void) | null;
   private host: string;
   private port: number;
+  private allowedOrigins: string[];
 
   constructor(options: RestServerOptions) {
     this.host = options.host;
     this.port = options.port;
+    this.allowedOrigins = [...new Set(options.allowedOrigins || [])];
+    for (const origin of this.allowedOrigins) {
+      let valid = false;
+      try {
+        const parsed = new URL(origin);
+        valid = ['http:', 'https:'].includes(parsed.protocol) && parsed.origin === origin &&
+          !parsed.username && !parsed.password;
+      } catch { /* rejected below without echoing a possibly secret URL */ }
+      if (!valid) throw new Error('Allowed browser origins must be exact HTTP(S) origins');
+    }
     this.sessionManager = options.sessionManager;
     this.hookEngine = options.hookEngine || null;
     this.notificationInbox = options.notificationInbox || null;
@@ -64,7 +76,7 @@ export class RestServer {
     this.app = Fastify({
       disableRequestLogging: process.env.CB_REST_REQUEST_LOGS !== '1',
       logger: {
-        redact: ['req.headers.authorization', 'req.headers["x-claude-b-key"]', 'req.body.api_key', 'req.body.refresh_token'],
+        redact: ['req.headers.authorization', 'req.headers["x-claude-b-key"]', 'req.body.api_key', 'req.body.refresh_token', 'req.body.apiKey', 'req.body.token', 'req.body.secret', 'req.url'],
         level: process.env.CB_REST_LOG_LEVEL || 'warn'
       }
     });
@@ -76,7 +88,8 @@ export class RestServer {
 
     // Register plugins
     await this.app.register(fastifyCors, {
-      origin: false
+      origin: this.allowedOrigins.length > 0 ? this.allowedOrigins : false,
+      credentials: false
     });
 
     await this.app.register(fastifyRateLimit, {

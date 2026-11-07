@@ -1,5 +1,5 @@
 import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
-import { OrchestrationManager, createHost } from '../../orchestration/index.js';
+import { OrchestrationManager, createHost, redactRemoteHost } from '../../orchestration/index.js';
 
 interface HostParams {
   id: string;
@@ -54,7 +54,7 @@ export async function registerOrchestrationRoutes(
     const { url, apiKey, name, priority } = request.body;
     const host = createHost(url, apiKey, { name, priority });
     await orchestrationManager.addHost(host);
-    return { host };
+    return { host: redactRemoteHost(host) };
   });
 
   // Remove host

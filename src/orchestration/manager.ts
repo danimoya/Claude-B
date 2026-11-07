@@ -1,10 +1,10 @@
 // Orchestration manager - coordinates multi-host AI workflows
 
 import { EventEmitter } from 'events';
-import { readFile, writeFile, mkdir } from 'fs/promises';
+import { readFile, writeFile, mkdir, chmod } from 'fs/promises';
 import { existsSync } from 'fs';
 import { nanoid } from 'nanoid';
-import { RemoteHost, RemoteClient, RemoteClientManager, RemotePromptResult } from './remote-client.js';
+import { RemoteHost, PublicRemoteHost, redactRemoteHost, RemoteClient, RemoteClientManager, RemotePromptResult } from './remote-client.js';
 import { PipelineExecutor, PipelineDefinition, PipelineResult } from './pipeline.js';
 import { HealthMonitor, AggregateHealthMonitor, HealthMetrics } from './health.js';
 import { FailoverHandler, LoadBalancer, CircuitBreaker, CircuitState, FailoverConfig } from './failover.js';
@@ -84,7 +84,7 @@ export class OrchestrationManager extends EventEmitter {
     super();
     this.configDir = configDir;
     this.configPath = `${configDir}/orchestration.json`;
-    this.config = { ...DEFAULT_CONFIG };
+    this.config = structuredClone(DEFAULT_CONFIG);
     this.clientManager = new RemoteClientManager();
     this.healthMonitor = new AggregateHealthMonitor();
     this.failoverHandler = new FailoverHandler(this.clientManager);
@@ -120,7 +120,7 @@ export class OrchestrationManager extends EventEmitter {
   }
 
   async load(): Promise<void> {
-    await mkdir(this.configDir, { recursive: true });
+    await mkdir(this.configDir, { recursive: true, mode: 0o700 });
 
     if (!existsSync(this.configPath)) {
       await this.save();
@@ -128,9 +128,10 @@ export class OrchestrationManager extends EventEmitter {
     }
 
     try {
+      await chmod(this.configPath, 0o600);
       const data = await readFile(this.configPath, 'utf-8');
       const loaded = JSON.parse(data) as Partial<OrchestrationConfig>;
-      this.config = { ...DEFAULT_CONFIG, ...loaded };
+      this.config = { ...structuredClone(DEFAULT_CONFIG), ...loaded };
 
       // Initialize hosts
       for (const host of this.config.hosts) {
@@ -142,8 +143,9 @@ export class OrchestrationManager extends EventEmitter {
   }
 
   async save(): Promise<void> {
-    await mkdir(this.configDir, { recursive: true });
-    await writeFile(this.configPath, JSON.stringify(this.config, null, 2));
+    await mkdir(this.configDir, { recursive: true, mode: 0o700 });
+    await writeFile(this.configPath, JSON.stringify(this.config, null, 2), { mode: 0o600 });
+    await chmod(this.configPath, 0o600);
   }
 
   // Host management
@@ -214,8 +216,8 @@ export class OrchestrationManager extends EventEmitter {
     return true;
   }
 
-  listHosts(): RemoteHost[] {
-    return [...this.config.hosts];
+  listHosts(): PublicRemoteHost[] {
+    return this.config.hosts.map(redactRemoteHost);
   }
 
   getHostStatus(hostId: string): HealthMetrics | undefined {
@@ -397,6 +399,10 @@ export function createHost(
     };
   }
 ): RemoteHost {
+  const parsed = new URL(url);
+  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error('Remote URL must use HTTP(S) without embedded credentials, query or fragment');
+  }
   const hc = options?.healthCheck;
   return {
     id: nanoid(8),

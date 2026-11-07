@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir } from 'fs/promises';
+import { readFile, writeFile, mkdir, chmod } from 'fs/promises';
 import { existsSync } from 'fs';
 
 export interface AIProviderConfig {
@@ -83,6 +83,7 @@ export class TelegramConfigManager {
       return this.config;
     }
     try {
+      await chmod(this.configPath, 0o600);
       const content = await readFile(this.configPath, 'utf-8');
       this.config = { ...defaultConfig(), ...JSON.parse(content) };
       // Telegram message IDs are only unique inside a chat. Legacy bare IDs
@@ -102,8 +103,9 @@ export class TelegramConfigManager {
   }
 
   async save(): Promise<void> {
-    await mkdir(this.configDir, { recursive: true });
-    await writeFile(this.configPath, JSON.stringify(this.config, null, 2) + '\n');
+    await mkdir(this.configDir, { recursive: true, mode: 0o700 });
+    await writeFile(this.configPath, JSON.stringify(this.config, null, 2) + '\n', { mode: 0o600 });
+    await chmod(this.configPath, 0o600);
   }
 
   get(): TelegramConfig {

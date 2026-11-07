@@ -61,4 +61,31 @@ describe('REST credential boundaries', () => {
     expect(response.headers['access-control-allow-origin']).toBeUndefined();
     expect(response.headers['access-control-allow-credentials']).toBeUndefined();
   });
+  it('allows only exact configured origins without ambient credentials', async () => {
+    await server.stop();
+    server = new RestServer({ host: '127.0.0.1', port: 0, configDir: dir,
+      sessionManager: new SessionManager(dir), allowedOrigins: ['https://dashboard.example'] });
+    await server.initialize();
+    const app = server.getApp();
+    for (const origin of ['https://dashboard.example.evil', 'http://dashboard.example', 'null', 'https://other.example']) {
+      const result = await app.inject({ method: 'GET', url: '/api/health', headers: { origin } });
+      expect(result.headers['access-control-allow-origin']).toBeUndefined();
+    }
+    const allowed = await app.inject({ method: 'OPTIONS', url: '/api/sessions', headers: {
+      origin: 'https://dashboard.example', 'access-control-request-method': 'GET',
+      'access-control-request-headers': 'authorization'
+    } });
+    expect(allowed.headers['access-control-allow-origin']).toBe('https://dashboard.example');
+    expect(allowed.headers['access-control-allow-credentials']).toBeUndefined();
+    const protectedRoute = await app.inject({ method: 'GET', url: '/api/sessions', headers: { origin: 'https://dashboard.example' } });
+    expect(protectedRoute.statusCode).toBe(401);
+  });
+
+  it.each(['*', 'null', 'https://user:secret@example.test', 'https://example.test/path', 'https://example.test/'])
+  ('rejects non-origin allowlist entries without echoing their contents', origin => {
+    expect(() => new RestServer({ host: '127.0.0.1', port: 0, configDir: dir,
+      sessionManager: new SessionManager(dir), allowedOrigins: [origin] }))
+      .toThrow('Allowed browser origins must be exact HTTP(S) origins');
+  });
+
 });

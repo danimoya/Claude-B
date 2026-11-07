@@ -16,7 +16,30 @@ export interface RemoteHost {
   };
 }
 
-export interface RemoteHostStatus extends RemoteHost {
+export type PublicRemoteHost = Omit<RemoteHost, 'apiKey'>;
+
+function publicUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    url.username = '';
+    url.password = '';
+    url.search = '';
+    url.hash = '';
+    return url.toString().replace(/\/$/, '');
+  } catch {
+    return '[invalid remote URL]';
+  }
+}
+
+/** Serialize host metadata without credentials, including legacy URL secrets. */
+export function redactRemoteHost(host: RemoteHost): PublicRemoteHost {
+  return {
+    id: host.id, name: host.name, url: publicUrl(host.url), enabled: host.enabled,
+    priority: host.priority, healthCheck: host.healthCheck ? { ...host.healthCheck } : undefined
+  };
+}
+
+export interface RemoteHostStatus extends PublicRemoteHost {
   healthy: boolean;
   lastCheck?: string;
   lastError?: string;
@@ -41,6 +64,8 @@ export interface RemotePromptResult {
   latency: number;
 }
 
+export type PublicRemoteHostStatus = RemoteHostStatus;
+
 interface TokenCache {
   accessToken: string;
   refreshToken: string;
@@ -56,14 +81,19 @@ export class RemoteClient extends EventEmitter {
     super();
     this.host = host;
     this.status = {
-      ...host,
+      ...redactRemoteHost(host),
       healthy: true,
       consecutiveFailures: 0
     };
   }
 
   getStatus(): RemoteHostStatus {
-    return { ...this.status };
+    let lastError = this.status.lastError;
+    for (const secret of [this.host.apiKey, this.tokenCache?.accessToken, this.tokenCache?.refreshToken]) {
+      if (secret && lastError) lastError = lastError.split(secret).join('[redacted]');
+    }
+    if (lastError) lastError = lastError.replace(/https?:\/\/[^\s]+/g, value => publicUrl(value));
+    return { ...this.status, lastError, healthCheck: this.status.healthCheck ? { ...this.status.healthCheck } : undefined };
   }
 
   private async getToken(signal: AbortSignal): Promise<string> {
